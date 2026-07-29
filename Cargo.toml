@@ -1,6 +1,10 @@
 [package]
 name = "dorfromantik_remake"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
+
+[[bin]]
+name = "check"
+path = "bin/check.rs"
