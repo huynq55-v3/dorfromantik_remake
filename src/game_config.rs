@@ -86,20 +86,20 @@ pub struct SegmentPresetConfigurations {
 }
 
 impl SegmentPresetConfigurations {
-    fn normalize_raws(raws: Vec<(GroupType, f32)>) -> Vec<GroupTypeConfiguration> {
-        let total: f32 = raws.iter().map(|(_, r)| r).sum();
-        raws.into_iter().map(|(gt, raw)| {
-            let pct = if total > 0.0 { raw / total } else { 0.0 };
-            GroupTypeConfiguration {
-                group_type: gt,
-                raw_probability: raw,
-                probability_in_percent: pct,
-                display_probability: (pct * 100.0 * 10.0).round() / 10.0,
-            }
-        }).collect()
+    /// Compute pct for a group from a list of GroupTypeConfiguration
+    fn pct_for(list: &[GroupTypeConfiguration], gt: GroupType) -> f32 {
+        list.iter().find(|g| g.group_type == gt).map(|g| g.probability_in_percent).unwrap_or(0.0)
     }
 
     pub fn default() -> Self {
+        let global = GlobalGroupTypeConfiguration::default_table();
+        let global_pcts: Vec<(GroupType, f32)> = global.global_group_type_probabilities.iter()
+            .map(|g| (g.group_type, g.probability_in_percent)).collect();
+
+        fn global_pct_for(list: &[(GroupType, f32)], gt: GroupType) -> f32 {
+            list.iter().find(|(g, _)| *g == gt).map(|(_, p)| *p).unwrap_or(0.0)
+        }
+
         let raw_collections = vec![
             (
                 "Segment Collection 1X",
@@ -169,11 +169,65 @@ impl SegmentPresetConfigurations {
             ),
         ];
 
+        // ── Layer 1: compute collection-level probabilityInPercent ──
+        // weighted by globalPct: collPct[g] = raw[g] * globalPct[g] / sum(raw[i] * globalPct[i])
         let mut collections: Vec<SegmentPresetCollection> = Vec::new();
         for (name, raws, presets) in raw_collections {
-            let total: f32 = raws.iter().map(|(_, r)| r).sum();
-            let gtp: Vec<GroupTypeConfiguration> = raws.into_iter().map(|(gt, raw)| {
-                let pct = if total > 0.0 { raw / total } else { 0.0 };
+            let weighted_sum: f32 = raws.iter()
+                .map(|(gt, r)| r * global_pct_for(&global_pcts, *gt))
+                .sum();
+            let gtp: Vec<GroupTypeConfiguration> = raws.iter().map(|(gt, raw)| {
+                let w = *raw * global_pct_for(&global_pcts, *gt);
+                let pct = if weighted_sum > 0.0 { w / weighted_sum } else { 0.0 };
+                GroupTypeConfiguration {
+                    group_type: *gt,
+                    raw_probability: *raw,
+                    probability_in_percent: pct,
+                    display_probability: (pct * 100.0 * 10.0).round() / 10.0,
+                }
+            }).collect();
+
+            collections.push(SegmentPresetCollection {
+                collection_name: name.into(),
+                group_type_probabilities: gtp,
+                segment_presets: presets,
+            });
+        }
+
+        // ── Layer 2: compute segment-level probabilityInPercent ──
+        // using collectionPct as weight:
+        //   segPct[g] = raw[g] * collPct[g] / sum(raw[i] * collPct[i])
+        fn coll_pcts_for<'a>(collections: &'a [SegmentPresetCollection], st: SegmentType) -> &'a [GroupTypeConfiguration] {
+            collections.iter()
+                .find(|c| c.segment_presets.contains(&st))
+                .map(|c| c.group_type_probabilities.as_slice())
+                .unwrap_or(&[])
+        }
+
+        let all_possible_types_raws: Vec<(SegmentType, Vec<(GroupType, f32)>)> = vec![
+            (SegmentType::ST1A, vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 10.0), (GroupType::Water, 0.0)]),
+            (SegmentType::ST2A, vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 2.0), (GroupType::Water, 3.0)]),
+            (SegmentType::ST2B, vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 15.0), (GroupType::Water, 15.0)]),
+            (SegmentType::ST2C, vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 20.0), (GroupType::Water, 15.0)]),
+            (SegmentType::ST3A, vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 5.0), (GroupType::Water, 35.0)]),
+            (SegmentType::ST3B, vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 10.0), (GroupType::Water, 10.0)]),
+            (SegmentType::ST3C, vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 10.0), (GroupType::Water, 10.0)]),
+            (SegmentType::ST3D, vec![(GroupType::Agriculture, 3.0), (GroupType::Forest, 3.0), (GroupType::Village, 2.0), (GroupType::TrainTracks, 20.0), (GroupType::Water, 10.0)]),
+            (SegmentType::ST4A, vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 10.0), (GroupType::Water, 40.0)]),
+            (SegmentType::ST4B, vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 10.0), (GroupType::Water, 10.0)]),
+            (SegmentType::ST4C, vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 10.0), (GroupType::Water, 10.0)]),
+            (SegmentType::ST5A, vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 10.0), (GroupType::Water, 20.0)]),
+            (SegmentType::ST6A, vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 10.0), (GroupType::Water, 10.0)]),
+        ];
+
+        let all_segment_presets: Vec<SegmentPresetConfiguration> = all_possible_types_raws.into_iter().map(|(st, raws)| {
+            let coll_pcts = coll_pcts_for(&collections, st);
+            let num2: f32 = raws.iter().map(|(gt, raw)| {
+                raw * Self::pct_for(coll_pcts, *gt)
+            }).sum();
+            let possible_types = raws.into_iter().map(|(gt, raw)| {
+                let cp = Self::pct_for(coll_pcts, gt);
+                let pct = if num2 > 0.0 { raw * cp / num2 } else { 0.0 };
                 GroupTypeConfiguration {
                     group_type: gt,
                     raw_probability: raw,
@@ -181,32 +235,12 @@ impl SegmentPresetConfigurations {
                     display_probability: (pct * 100.0 * 10.0).round() / 10.0,
                 }
             }).collect();
-            
-            
-            collections.push(SegmentPresetCollection {
-                collection_name: name.into(),
-                group_type_probabilities: gtp,
-                segment_presets: presets,
-            });
-        }
-        
+            SegmentPresetConfiguration { segment_type: st, possible_types }
+        }).collect();
+
         SegmentPresetConfigurations {
             segment_preset_collections: collections,
-            all_segment_presets: vec![
-                SegmentPresetConfiguration { segment_type: SegmentType::ST1A, possible_types: Self::normalize_raws(vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 10.0), (GroupType::Water, 0.0)]) },
-                SegmentPresetConfiguration { segment_type: SegmentType::ST2A, possible_types: Self::normalize_raws(vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 2.0), (GroupType::Water, 3.0)]) },
-                SegmentPresetConfiguration { segment_type: SegmentType::ST2B, possible_types: Self::normalize_raws(vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 15.0), (GroupType::Water, 15.0)]) },
-                SegmentPresetConfiguration { segment_type: SegmentType::ST2C, possible_types: Self::normalize_raws(vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 20.0), (GroupType::Water, 15.0)]) },
-                SegmentPresetConfiguration { segment_type: SegmentType::ST3A, possible_types: Self::normalize_raws(vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 5.0), (GroupType::Water, 35.0)]) },
-                SegmentPresetConfiguration { segment_type: SegmentType::ST3B, possible_types: Self::normalize_raws(vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 10.0), (GroupType::Water, 10.0)]) },
-                SegmentPresetConfiguration { segment_type: SegmentType::ST3C, possible_types: Self::normalize_raws(vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 10.0), (GroupType::Water, 10.0)]) },
-                SegmentPresetConfiguration { segment_type: SegmentType::ST3D, possible_types: Self::normalize_raws(vec![(GroupType::Agriculture, 3.0), (GroupType::Forest, 3.0), (GroupType::Village, 2.0), (GroupType::TrainTracks, 20.0), (GroupType::Water, 10.0)]) },
-                SegmentPresetConfiguration { segment_type: SegmentType::ST4A, possible_types: Self::normalize_raws(vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 10.0), (GroupType::Water, 40.0)]) },
-                SegmentPresetConfiguration { segment_type: SegmentType::ST4B, possible_types: Self::normalize_raws(vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 10.0), (GroupType::Water, 10.0)]) },
-                SegmentPresetConfiguration { segment_type: SegmentType::ST4C, possible_types: Self::normalize_raws(vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 10.0), (GroupType::Water, 10.0)]) },
-                SegmentPresetConfiguration { segment_type: SegmentType::ST5A, possible_types: Self::normalize_raws(vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 10.0), (GroupType::Water, 20.0)]) },
-                SegmentPresetConfiguration { segment_type: SegmentType::ST6A, possible_types: Self::normalize_raws(vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 10.0), (GroupType::Water, 10.0)]) },
-            ],
+            all_segment_presets,
         }
     }
 }
