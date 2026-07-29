@@ -75,10 +75,30 @@ pub struct SegmentPresetCollection {
 
 #[derive(Debug, Clone)]
 pub struct SegmentPresetConfiguration {
-    pub segment_preset_collections: Vec<SegmentPresetCollection>,
+    pub segment_type: SegmentType,
+    pub possible_types: Vec<GroupTypeConfiguration>,
 }
 
-impl SegmentPresetConfiguration {
+#[derive(Debug, Clone)]
+pub struct SegmentPresetConfigurations {
+    pub segment_preset_collections: Vec<SegmentPresetCollection>,
+    pub all_segment_presets: Vec<SegmentPresetConfiguration>,
+}
+
+impl SegmentPresetConfigurations {
+    fn normalize_raws(raws: Vec<(GroupType, f32)>) -> Vec<GroupTypeConfiguration> {
+        let total: f32 = raws.iter().map(|(_, r)| r).sum();
+        raws.into_iter().map(|(gt, raw)| {
+            let pct = if total > 0.0 { raw / total } else { 0.0 };
+            GroupTypeConfiguration {
+                group_type: gt,
+                raw_probability: raw,
+                probability_in_percent: pct,
+                display_probability: (pct * 100.0 * 10.0).round() / 10.0,
+            }
+        }).collect()
+    }
+
     pub fn default() -> Self {
         let raw_collections = vec![
             (
@@ -149,23 +169,44 @@ impl SegmentPresetConfiguration {
             ),
         ];
 
-        SegmentPresetConfiguration {
-            segment_preset_collections: raw_collections.into_iter().map(|(name, raws, presets)| {
-                let total: f32 = raws.iter().map(|(_, r)| r).sum();
-                SegmentPresetCollection {
-                    collection_name: name.into(),
-                    group_type_probabilities: raws.into_iter().map(|(gt, raw)| {
-                        let pct = if total > 0.0 { raw / total } else { 0.0 };
-                        GroupTypeConfiguration {
-                            group_type: gt,
-                            raw_probability: raw,
-                            probability_in_percent: pct,
-                            display_probability: (pct * 100.0 * 10.0).round() / 10.0,
-                        }
-                    }).collect(),
-                    segment_presets: presets,
+        let mut collections: Vec<SegmentPresetCollection> = Vec::new();
+        for (name, raws, presets) in raw_collections {
+            let total: f32 = raws.iter().map(|(_, r)| r).sum();
+            let gtp: Vec<GroupTypeConfiguration> = raws.into_iter().map(|(gt, raw)| {
+                let pct = if total > 0.0 { raw / total } else { 0.0 };
+                GroupTypeConfiguration {
+                    group_type: gt,
+                    raw_probability: raw,
+                    probability_in_percent: pct,
+                    display_probability: (pct * 100.0 * 10.0).round() / 10.0,
                 }
-            }).collect(),
+            }).collect();
+            
+            
+            collections.push(SegmentPresetCollection {
+                collection_name: name.into(),
+                group_type_probabilities: gtp,
+                segment_presets: presets,
+            });
+        }
+        
+        SegmentPresetConfigurations {
+            segment_preset_collections: collections,
+            all_segment_presets: vec![
+                SegmentPresetConfiguration { segment_type: SegmentType::ST1A, possible_types: Self::normalize_raws(vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 10.0), (GroupType::Water, 0.0)]) },
+                SegmentPresetConfiguration { segment_type: SegmentType::ST2A, possible_types: Self::normalize_raws(vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 2.0), (GroupType::Water, 3.0)]) },
+                SegmentPresetConfiguration { segment_type: SegmentType::ST2B, possible_types: Self::normalize_raws(vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 15.0), (GroupType::Water, 15.0)]) },
+                SegmentPresetConfiguration { segment_type: SegmentType::ST2C, possible_types: Self::normalize_raws(vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 20.0), (GroupType::Water, 15.0)]) },
+                SegmentPresetConfiguration { segment_type: SegmentType::ST3A, possible_types: Self::normalize_raws(vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 5.0), (GroupType::Water, 35.0)]) },
+                SegmentPresetConfiguration { segment_type: SegmentType::ST3B, possible_types: Self::normalize_raws(vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 10.0), (GroupType::Water, 10.0)]) },
+                SegmentPresetConfiguration { segment_type: SegmentType::ST3C, possible_types: Self::normalize_raws(vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 10.0), (GroupType::Water, 10.0)]) },
+                SegmentPresetConfiguration { segment_type: SegmentType::ST3D, possible_types: Self::normalize_raws(vec![(GroupType::Agriculture, 3.0), (GroupType::Forest, 3.0), (GroupType::Village, 2.0), (GroupType::TrainTracks, 20.0), (GroupType::Water, 10.0)]) },
+                SegmentPresetConfiguration { segment_type: SegmentType::ST4A, possible_types: Self::normalize_raws(vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 10.0), (GroupType::Water, 40.0)]) },
+                SegmentPresetConfiguration { segment_type: SegmentType::ST4B, possible_types: Self::normalize_raws(vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 10.0), (GroupType::Water, 10.0)]) },
+                SegmentPresetConfiguration { segment_type: SegmentType::ST4C, possible_types: Self::normalize_raws(vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 10.0), (GroupType::Water, 10.0)]) },
+                SegmentPresetConfiguration { segment_type: SegmentType::ST5A, possible_types: Self::normalize_raws(vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 10.0), (GroupType::Water, 20.0)]) },
+                SegmentPresetConfiguration { segment_type: SegmentType::ST6A, possible_types: Self::normalize_raws(vec![(GroupType::Agriculture, 10.0), (GroupType::Forest, 10.0), (GroupType::Village, 10.0), (GroupType::TrainTracks, 10.0), (GroupType::Water, 10.0)]) },
+            ],
         }
     }
 }
@@ -199,9 +240,10 @@ pub struct TilePresetCollection {
 #[derive(Debug, Clone)]
 pub struct TilePresetConfigurations {
     pub all_tile_presets: Vec<TilePresetCollection>,
+    pub all_tiles_flat: Vec<TilePresetConfiguration>,
 }
 
-fn parse_segments(name: &str) -> Vec<SegmentType> {
+pub fn parse_segments(name: &str) -> Vec<SegmentType> {
     name.split('_').filter_map(|s| match s {
         "1A" => Some(SegmentType::ST1A),
         "2A" => Some(SegmentType::ST2A),
@@ -220,40 +262,40 @@ fn parse_segments(name: &str) -> Vec<SegmentType> {
     }).collect()
 }
 
+const TOTAL_COLLECTION_RAW: f32 = 1669.68;
+
 // helper function to create a TilePresetConfiguration
-fn tp_c(name: &str, raw: f32, total: f32, occupied: usize) -> TilePresetConfiguration {
+fn tp_c(name: &str, raw: f32, occupied: usize) -> TilePresetConfiguration {
     TilePresetConfiguration {
         name: name.into(),
         raw_probability: raw,
-        final_probability: raw / total,
+        final_probability: raw / TOTAL_COLLECTION_RAW,
         occupied_edges: occupied,
         segments: parse_segments(name),
     }
 }
 
 // helper function to create a TilePresetSubCollection
-fn tp_sub(name: &str, raw: f32, tiles: Vec<(&str, f32, usize)>, total: f32) -> TilePresetSubCollection {
-    let sub_total: f32 = tiles.iter().map(|(_, r, _)| r).sum();
+fn tp_sub(name: &str, raw: f32, tiles: Vec<(&str, f32, usize)>) -> TilePresetSubCollection {
     TilePresetSubCollection {
         name: name.into(),
         raw_probability: raw,
-        sub_probability: raw / total,
-        tile_presets: tiles.into_iter().map(|(n, r, o)| tp_c(n, r, sub_total, o)).collect(),
+        sub_probability: raw / TOTAL_COLLECTION_RAW,
+        tile_presets: tiles.into_iter().map(|(n, r, o)| tp_c(n, r, o)).collect(),
     }
 }
 
 impl TilePresetConfigurations {
     pub fn default() -> Self {
-        let total_collection_raw: f32 = 1669.68;
+        let total_collection_raw: f32 = TOTAL_COLLECTION_RAW;
 
-        TilePresetConfigurations {
-            all_tile_presets: vec![
+        let collections = vec![
                 // ── Collection 0X ──
                 TilePresetCollection {
                     name: "Collection 0X".into(),
                     raw_probability: 35.1,
                     collection_probability: 35.1 / total_collection_raw,
-                    tile_presets: vec![tp_c("0A", 35.1, 35.1, 0)],
+                    tile_presets: vec![tp_c("0A", 35.1, 0)],
                     sub_collections: vec![],
                 },
 
@@ -263,12 +305,12 @@ impl TilePresetConfigurations {
                     raw_probability: 189.52,
                     collection_probability: 189.52 / total_collection_raw,
                     tile_presets: vec![
-                        tp_c("1A", 70.2, 189.52, 1),
-                        tp_c("1A_1A", 58.5, 189.52, 2),
-                        tp_c("1A_1A_1A", 40.27, 189.52, 3),
-                        tp_c("1A_1A_1A_1A", 14.77, 189.52, 4),
-                        tp_c("1A_1A_1A_1A_1A", 3.76, 189.52, 5),
-                        tp_c("1A_1A_1A_1A_1A_1A", 2.02, 189.52, 6),
+                        tp_c("1A", 70.2, 1),
+                        tp_c("1A_1A", 58.5, 2),
+                        tp_c("1A_1A_1A", 40.27, 3),
+                        tp_c("1A_1A_1A_1A", 14.77, 4),
+                        tp_c("1A_1A_1A_1A_1A", 3.76, 5),
+                        tp_c("1A_1A_1A_1A_1A_1A", 2.02, 6),
                     ],
                     sub_collections: vec![],
                 },
@@ -290,7 +332,7 @@ impl TilePresetConfigurations {
                             ("2A_2A_1A", 18.46, 5),
                             ("2A_2A_1A_1A", 2.31, 6),
                             ("2A_2A_2A", 8.78, 6),
-                        ], total_collection_raw),
+                        ]),
                         tp_sub("Collection 2B", 175.4, vec![
                             ("2B", 49.55, 2),
                             ("2B_1A", 41.29, 3),
@@ -300,7 +342,7 @@ impl TilePresetConfigurations {
                             ("2B_2A", 34.65, 4),
                             ("2B_2A_1A", 14.12, 5),
                             ("2B_2A_1A_1A", 5.29, 6),
-                        ], total_collection_raw),
+                        ]),
                         tp_sub("Collection 2C", 102.94, vec![
                             ("2C", 28.08, 2),
                             ("2C_1A", 23.4, 3),
@@ -311,7 +353,7 @@ impl TilePresetConfigurations {
                             ("2C_2A_1A", 8.0, 5),
                             ("2C_2A_1A_1A", 1.0, 6),
                             ("2C_2A_2A", 5.54, 6),
-                        ], total_collection_raw),
+                        ]),
                     ],
                 },
 
@@ -332,7 +374,7 @@ impl TilePresetConfigurations {
                             ("3A_2B", 20.65, 5),
                             ("3A_2B_1A", 8.6, 6),
                             ("3A_3A", 16.45, 6),
-                        ], total_collection_raw),
+                        ]),
                         tp_sub("Collection 3B", 144.12, vec![
                             ("3B", 49.55, 3),
                             ("3B_1A", 37.54, 4),
@@ -340,7 +382,7 @@ impl TilePresetConfigurations {
                             ("3B_1A_1A_1A", 5.74, 6),
                             ("3B_2A", 25.41, 5),
                             ("3B_2A_1A", 10.59, 6),
-                        ], total_collection_raw),
+                        ]),
                         tp_sub("Collection 3C", 144.12, vec![
                             ("3C", 49.55, 3),
                             ("3C_1A", 37.54, 4),
@@ -348,13 +390,13 @@ impl TilePresetConfigurations {
                             ("3C_1A_1A_1A", 5.74, 6),
                             ("3C_2A", 25.41, 5),
                             ("3C_2A_1A", 10.59, 6),
-                        ], total_collection_raw),
+                        ]),
                         tp_sub("Collection 3D", 45.95, vec![
                             ("3D", 21.06, 3),
                             ("3D_1A", 15.95, 4),
                             ("3D_1A_1A", 6.5, 5),
                             ("3D_1A_1A_1A", 2.44, 6),
-                        ], total_collection_raw),
+                        ]),
                     ],
                 },
 
@@ -370,17 +412,17 @@ impl TilePresetConfigurations {
                             ("4A_1A", 36.0, 5),
                             ("4A_1A_1A", 15.0, 6),
                             ("4A_2A", 24.92, 6),
-                        ], total_collection_raw),
+                        ]),
                         tp_sub("Collection 4B", 71.44, vec![
                             ("4B", 38.29, 4),
                             ("4B_1A", 23.4, 5),
                             ("4B_1A_1A", 9.75, 6),
-                        ], total_collection_raw),
+                        ]),
                         tp_sub("Collection 4C", 79.38, vec![
                             ("4C", 42.55, 4),
                             ("4C_1A", 26.0, 5),
                             ("4C_1A_1A", 10.83, 6),
-                        ], total_collection_raw),
+                        ]),
                     ],
                 },
 
@@ -390,8 +432,8 @@ impl TilePresetConfigurations {
                     raw_probability: 70.2,
                     collection_probability: 70.2 / total_collection_raw,
                     tile_presets: vec![
-                        tp_c("5A", 43.2, 70.2, 5),
-                        tp_c("5A_1A", 27.0, 70.2, 6),
+                        tp_c("5A", 43.2, 5),
+                        tp_c("5A_1A", 27.0, 6),
                     ],
                     sub_collections: vec![],
                 },
@@ -401,10 +443,28 @@ impl TilePresetConfigurations {
                     name: "Collection 6X".into(),
                     raw_probability: 60.17,
                     collection_probability: 60.17 / total_collection_raw,
-                    tile_presets: vec![tp_c("6A", 60.17, 60.17, 6)],
+                    tile_presets: vec![tp_c("6A", 60.17, 6)],
                     sub_collections: vec![],
                 },
-            ],
+            ];
+        
+        
+        let mut all_tiles_flat = Vec::new();
+        for coll in &collections {
+            for tile in &coll.tile_presets {
+                all_tiles_flat.push(tile.clone());
+            }
+            for sub in &coll.sub_collections {
+                for tile in &sub.tile_presets {
+                    all_tiles_flat.push(tile.clone());
+                }
+            }
+        }
+        
+        TilePresetConfigurations {
+            all_tile_presets: collections,
+            all_tiles_flat,
         }
     }
 }
+/* ==================================================================================================== */
