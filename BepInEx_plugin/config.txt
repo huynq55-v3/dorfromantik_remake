@@ -1,0 +1,39 @@
+=== QuestTileProbabilityCurve ===
+keys:
+  0.0000	1.000000	-0.1357	-0.7735
+  1.0000	0.500000	-0.2932	-0.2932
+  1.9682	0.330000	-0.0628	-0.0628
+  8.0000	0.050000	-0.0464	-0.0464
+multiplier: 1
+questSpawnTileLimit: -1
+
+=== GroupType Config ===
+Found 5 GroupType instances
+
+GroupType: Agriculture
+  constraining: False
+  hybridSegmentVariants: none
+
+GroupType: TrainTracks
+  constraining: True
+  hybridSegmentVariants: none
+
+GroupType: Water
+  constraining: True
+  hybridSegmentVariants (4):
+    1_SegmentType_2A (SegmentType) -> h1_SegmentType_2A_Hybrid (SegmentType) (prob=0.5)
+    4_SegmentType_3A (SegmentType) -> h4_SegmentType_3A_Hybrid (SegmentType) (prob=0.9)
+    8_SegmentType_4A (SegmentType) -> h8_SegmentType_4A_Hybrid (SegmentType) (prob=0.9)
+    11_SegmentType_5A (SegmentType) -> h11_SegmentType_5A_Hybrid (SegmentType) (prob=0.95)
+
+GroupType: Forest
+  constraining: False
+  hybridSegmentVariants: none
+
+GroupType: Village
+  constraining: False
+  hybridSegmentVariants: none
+
+=== TilePreset generateSegmentsWithoutSpaces ===
+Found 0 TilePreset instances
+  generateSegmentsWithoutSpaces = true: 0/0

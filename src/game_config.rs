@@ -1,3 +1,6 @@
+use std::fs;
+use std::path::Path;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GroupType {
     Village,
@@ -35,12 +38,12 @@ impl GlobalGroupTypeConfiguration {
         let global_group_type_probabilities: Vec<GroupTypeConfiguration> = raws
             .into_iter()
             .map(|(gt, raw)| {
-                let prob_in_percent = raw / total; // 0.238..., 0.166... etc
+                let prob_in_percent = raw / total;
                 GroupTypeConfiguration {
                     group_type: gt,
                     raw_probability: raw,
                     probability_in_percent: prob_in_percent,
-                    display_probability: (prob_in_percent * 100.0 * 10.0).round() / 10.0, // 23.8, 16.7 etc
+                    display_probability: (prob_in_percent * 100.0 * 10.0).round() / 10.0,
                 }
             })
             .collect();
@@ -48,6 +51,7 @@ impl GlobalGroupTypeConfiguration {
         GlobalGroupTypeConfiguration { global_group_type_probabilities }
     }
 }
+
 /* ==================================================================================================== */
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SegmentType {
@@ -65,6 +69,7 @@ pub enum SegmentType {
     ST5A,
     ST6A,
 }
+
 /* ==================================================================================================== */
 #[derive(Debug, Clone)]
 pub struct SegmentPresetCollection {
@@ -86,7 +91,6 @@ pub struct SegmentPresetConfigurations {
 }
 
 impl SegmentPresetConfigurations {
-    /// Compute pct for a group from a list of GroupTypeConfiguration
     fn pct_for(list: &[GroupTypeConfiguration], gt: GroupType) -> f32 {
         list.iter().find(|g| g.group_type == gt).map(|g| g.probability_in_percent).unwrap_or(0.0)
     }
@@ -169,8 +173,6 @@ impl SegmentPresetConfigurations {
             ),
         ];
 
-        // ── Layer 1: compute collection-level probabilityInPercent ──
-        // weighted by globalPct: collPct[g] = raw[g] * globalPct[g] / sum(raw[i] * globalPct[i])
         let mut collections: Vec<SegmentPresetCollection> = Vec::new();
         for (name, raws, presets) in raw_collections {
             let weighted_sum: f32 = raws.iter()
@@ -194,9 +196,6 @@ impl SegmentPresetConfigurations {
             });
         }
 
-        // ── Layer 2: compute segment-level probabilityInPercent ──
-        // using collectionPct as weight:
-        //   segPct[g] = raw[g] * collPct[g] / sum(raw[i] * collPct[i])
         fn coll_pcts_for<'a>(collections: &'a [SegmentPresetCollection], st: SegmentType) -> &'a [GroupTypeConfiguration] {
             collections.iter()
                 .find(|c| c.segment_presets.contains(&st))
@@ -244,6 +243,7 @@ impl SegmentPresetConfigurations {
         }
     }
 }
+
 /* ==================================================================================================== */
 #[derive(Debug, Clone)]
 pub struct TilePresetConfiguration {
@@ -298,7 +298,6 @@ pub fn parse_segments(name: &str) -> Vec<SegmentType> {
 
 const TOTAL_COLLECTION_RAW: f32 = 1669.68;
 
-// helper function to create a TilePresetConfiguration
 fn tp_c(name: &str, raw: f32, occupied: usize) -> TilePresetConfiguration {
     TilePresetConfiguration {
         name: name.into(),
@@ -309,7 +308,6 @@ fn tp_c(name: &str, raw: f32, occupied: usize) -> TilePresetConfiguration {
     }
 }
 
-// helper function to create a TilePresetSubCollection
 fn tp_sub(name: &str, raw: f32, tiles: Vec<(&str, f32, usize)>) -> TilePresetSubCollection {
     TilePresetSubCollection {
         name: name.into(),
@@ -324,165 +322,151 @@ impl TilePresetConfigurations {
         let total_collection_raw: f32 = TOTAL_COLLECTION_RAW;
 
         let collections = vec![
-                // ── Collection 0X ──
-                TilePresetCollection {
-                    name: "Collection 0X".into(),
-                    raw_probability: 35.1,
-                    collection_probability: 35.1 / total_collection_raw,
-                    tile_presets: vec![tp_c("0A", 35.1, 0)],
-                    sub_collections: vec![],
-                },
+            TilePresetCollection {
+                name: "Collection 0X".into(),
+                raw_probability: 35.1,
+                collection_probability: 35.1 / total_collection_raw,
+                tile_presets: vec![tp_c("0A", 35.1, 0)],
+                sub_collections: vec![],
+            },
+            TilePresetCollection {
+                name: "Collection 1X".into(),
+                raw_probability: 189.52,
+                collection_probability: 189.52 / total_collection_raw,
+                tile_presets: vec![
+                    tp_c("1A", 70.2, 1),
+                    tp_c("1A_1A", 58.5, 2),
+                    tp_c("1A_1A_1A", 40.27, 3),
+                    tp_c("1A_1A_1A_1A", 14.77, 4),
+                    tp_c("1A_1A_1A_1A_1A", 3.76, 5),
+                    tp_c("1A_1A_1A_1A_1A_1A", 2.02, 6),
+                ],
+                sub_collections: vec![],
+            },
+            TilePresetCollection {
+                name: "Collection 2X".into(),
+                raw_probability: 496.02,
+                collection_probability: 496.02 / total_collection_raw,
+                tile_presets: vec![],
+                sub_collections: vec![
+                    tp_sub("Collection 2A", 217.68, vec![
+                        ("2A", 64.8, 2),
+                        ("2A_1A", 54.0, 3),
+                        ("2A_1A_1A", 27.27, 4),
+                        ("2A_1A_1A_1A", 10.0, 5),
+                        ("2A_1A_1A_1A_1A", 2.6, 6),
+                        ("2A_2A", 29.46, 4),
+                        ("2A_2A_1A", 18.46, 5),
+                        ("2A_2A_1A_1A", 2.31, 6),
+                        ("2A_2A_2A", 8.78, 6),
+                    ]),
+                    tp_sub("Collection 2B", 175.4, vec![
+                        ("2B", 49.55, 2),
+                        ("2B_1A", 41.29, 3),
+                        ("2B_1A_1A", 20.86, 4),
+                        ("2B_1A_1A_1A", 7.65, 5),
+                        ("2B_1A_1A_1A_1A", 1.99, 6),
+                        ("2B_2A", 34.65, 4),
+                        ("2B_2A_1A", 14.12, 5),
+                        ("2B_2A_1A_1A", 5.29, 6),
+                    ]),
+                    tp_sub("Collection 2C", 102.94, vec![
+                        ("2C", 28.08, 2),
+                        ("2C_1A", 23.4, 3),
+                        ("2C_1A_1A", 11.82, 4),
+                        ("2C_1A_1A_1A", 4.33, 5),
+                        ("2C_1A_1A_1A_1A", 1.13, 6),
+                        ("2C_2A", 19.64, 4),
+                        ("2C_2A_1A", 8.0, 5),
+                        ("2C_2A_1A_1A", 1.0, 6),
+                        ("2C_2A_2A", 5.54, 6),
+                    ]),
+                ],
+            },
+            TilePresetCollection {
+                name: "Collection 3X".into(),
+                raw_probability: 533.02,
+                collection_probability: 533.02 / total_collection_raw,
+                tile_presets: vec![],
+                sub_collections: vec![
+                    tp_sub("Collection 3A", 198.83, vec![
+                        ("3A", 52.65, 3),
+                        ("3A_1A", 39.89, 4),
+                        ("3A_1A_1A", 16.25, 5),
+                        ("3A_1A_1A_1A", 6.09, 6),
+                        ("3A_2A", 27.0, 5),
+                        ("3A_2A_1A", 11.25, 6),
+                        ("3A_2B", 20.65, 5),
+                        ("3A_2B_1A", 8.6, 6),
+                        ("3A_3A", 16.45, 6),
+                    ]),
+                    tp_sub("Collection 3B", 144.12, vec![
+                        ("3B", 49.55, 3),
+                        ("3B_1A", 37.54, 4),
+                        ("3B_1A_1A", 15.29, 5),
+                        ("3B_1A_1A_1A", 5.74, 6),
+                        ("3B_2A", 25.41, 5),
+                        ("3B_2A_1A", 10.59, 6),
+                    ]),
+                    tp_sub("Collection 3C", 144.12, vec![
+                        ("3C", 49.55, 3),
+                        ("3C_1A", 37.54, 4),
+                        ("3C_1A_1A", 15.29, 5),
+                        ("3C_1A_1A_1A", 5.74, 6),
+                        ("3C_2A", 25.41, 5),
+                        ("3C_2A_1A", 10.59, 6),
+                    ]),
+                    tp_sub("Collection 3D", 45.95, vec![
+                        ("3D", 21.06, 3),
+                        ("3D_1A", 15.95, 4),
+                        ("3D_1A_1A", 6.5, 5),
+                        ("3D_1A_1A_1A", 2.44, 6),
+                    ]),
+                ],
+            },
+            TilePresetCollection {
+                name: "Collection 4X".into(),
+                raw_probability: 285.65,
+                collection_probability: 285.65 / total_collection_raw,
+                tile_presets: vec![],
+                sub_collections: vec![
+                    tp_sub("Collection 4A", 134.83, vec![
+                        ("4A", 58.91, 4),
+                        ("4A_1A", 36.0, 5),
+                        ("4A_1A_1A", 15.0, 6),
+                        ("4A_2A", 24.92, 6),
+                    ]),
+                    tp_sub("Collection 4B", 71.44, vec![
+                        ("4B", 38.29, 4),
+                        ("4B_1A", 23.4, 5),
+                        ("4B_1A_1A", 9.75, 6),
+                    ]),
+                    tp_sub("Collection 4C", 79.38, vec![
+                        ("4C", 42.55, 4),
+                        ("4C_1A", 26.0, 5),
+                        ("4C_1A_1A", 10.83, 6),
+                    ]),
+                ],
+            },
+            TilePresetCollection {
+                name: "Collection 5X".into(),
+                raw_probability: 70.2,
+                collection_probability: 70.2 / total_collection_raw,
+                tile_presets: vec![
+                    tp_c("5A", 43.2, 5),
+                    tp_c("5A_1A", 27.0, 6),
+                ],
+                sub_collections: vec![],
+            },
+            TilePresetCollection {
+                name: "Collection 6X".into(),
+                raw_probability: 60.17,
+                collection_probability: 60.17 / total_collection_raw,
+                tile_presets: vec![tp_c("6A", 60.17, 6)],
+                sub_collections: vec![],
+            },
+        ];
 
-                // ── Collection 1X ──
-                TilePresetCollection {
-                    name: "Collection 1X".into(),
-                    raw_probability: 189.52,
-                    collection_probability: 189.52 / total_collection_raw,
-                    tile_presets: vec![
-                        tp_c("1A", 70.2, 1),
-                        tp_c("1A_1A", 58.5, 2),
-                        tp_c("1A_1A_1A", 40.27, 3),
-                        tp_c("1A_1A_1A_1A", 14.77, 4),
-                        tp_c("1A_1A_1A_1A_1A", 3.76, 5),
-                        tp_c("1A_1A_1A_1A_1A_1A", 2.02, 6),
-                    ],
-                    sub_collections: vec![],
-                },
-
-                // ── Collection 2X ──
-                TilePresetCollection {
-                    name: "Collection 2X".into(),
-                    raw_probability: 496.02,
-                    collection_probability: 496.02 / total_collection_raw,
-                    tile_presets: vec![],
-                    sub_collections: vec![
-                        tp_sub("Collection 2A", 217.68, vec![
-                            ("2A", 64.8, 2),
-                            ("2A_1A", 54.0, 3),
-                            ("2A_1A_1A", 27.27, 4),
-                            ("2A_1A_1A_1A", 10.0, 5),
-                            ("2A_1A_1A_1A_1A", 2.6, 6),
-                            ("2A_2A", 29.46, 4),
-                            ("2A_2A_1A", 18.46, 5),
-                            ("2A_2A_1A_1A", 2.31, 6),
-                            ("2A_2A_2A", 8.78, 6),
-                        ]),
-                        tp_sub("Collection 2B", 175.4, vec![
-                            ("2B", 49.55, 2),
-                            ("2B_1A", 41.29, 3),
-                            ("2B_1A_1A", 20.86, 4),
-                            ("2B_1A_1A_1A", 7.65, 5),
-                            ("2B_1A_1A_1A_1A", 1.99, 6),
-                            ("2B_2A", 34.65, 4),
-                            ("2B_2A_1A", 14.12, 5),
-                            ("2B_2A_1A_1A", 5.29, 6),
-                        ]),
-                        tp_sub("Collection 2C", 102.94, vec![
-                            ("2C", 28.08, 2),
-                            ("2C_1A", 23.4, 3),
-                            ("2C_1A_1A", 11.82, 4),
-                            ("2C_1A_1A_1A", 4.33, 5),
-                            ("2C_1A_1A_1A_1A", 1.13, 6),
-                            ("2C_2A", 19.64, 4),
-                            ("2C_2A_1A", 8.0, 5),
-                            ("2C_2A_1A_1A", 1.0, 6),
-                            ("2C_2A_2A", 5.54, 6),
-                        ]),
-                    ],
-                },
-
-                // ── Collection 3X ──
-                TilePresetCollection {
-                    name: "Collection 3X".into(),
-                    raw_probability: 533.02,
-                    collection_probability: 533.02 / total_collection_raw,
-                    tile_presets: vec![],
-                    sub_collections: vec![
-                        tp_sub("Collection 3A", 198.83, vec![
-                            ("3A", 52.65, 3),
-                            ("3A_1A", 39.89, 4),
-                            ("3A_1A_1A", 16.25, 5),
-                            ("3A_1A_1A_1A", 6.09, 6),
-                            ("3A_2A", 27.0, 5),
-                            ("3A_2A_1A", 11.25, 6),
-                            ("3A_2B", 20.65, 5),
-                            ("3A_2B_1A", 8.6, 6),
-                            ("3A_3A", 16.45, 6),
-                        ]),
-                        tp_sub("Collection 3B", 144.12, vec![
-                            ("3B", 49.55, 3),
-                            ("3B_1A", 37.54, 4),
-                            ("3B_1A_1A", 15.29, 5),
-                            ("3B_1A_1A_1A", 5.74, 6),
-                            ("3B_2A", 25.41, 5),
-                            ("3B_2A_1A", 10.59, 6),
-                        ]),
-                        tp_sub("Collection 3C", 144.12, vec![
-                            ("3C", 49.55, 3),
-                            ("3C_1A", 37.54, 4),
-                            ("3C_1A_1A", 15.29, 5),
-                            ("3C_1A_1A_1A", 5.74, 6),
-                            ("3C_2A", 25.41, 5),
-                            ("3C_2A_1A", 10.59, 6),
-                        ]),
-                        tp_sub("Collection 3D", 45.95, vec![
-                            ("3D", 21.06, 3),
-                            ("3D_1A", 15.95, 4),
-                            ("3D_1A_1A", 6.5, 5),
-                            ("3D_1A_1A_1A", 2.44, 6),
-                        ]),
-                    ],
-                },
-
-                // ── Collection 4X ──
-                TilePresetCollection {
-                    name: "Collection 4X".into(),
-                    raw_probability: 285.65,
-                    collection_probability: 285.65 / total_collection_raw,
-                    tile_presets: vec![],
-                    sub_collections: vec![
-                        tp_sub("Collection 4A", 134.83, vec![
-                            ("4A", 58.91, 4),
-                            ("4A_1A", 36.0, 5),
-                            ("4A_1A_1A", 15.0, 6),
-                            ("4A_2A", 24.92, 6),
-                        ]),
-                        tp_sub("Collection 4B", 71.44, vec![
-                            ("4B", 38.29, 4),
-                            ("4B_1A", 23.4, 5),
-                            ("4B_1A_1A", 9.75, 6),
-                        ]),
-                        tp_sub("Collection 4C", 79.38, vec![
-                            ("4C", 42.55, 4),
-                            ("4C_1A", 26.0, 5),
-                            ("4C_1A_1A", 10.83, 6),
-                        ]),
-                    ],
-                },
-
-                // ── Collection 5X ──
-                TilePresetCollection {
-                    name: "Collection 5X".into(),
-                    raw_probability: 70.2,
-                    collection_probability: 70.2 / total_collection_raw,
-                    tile_presets: vec![
-                        tp_c("5A", 43.2, 5),
-                        tp_c("5A_1A", 27.0, 6),
-                    ],
-                    sub_collections: vec![],
-                },
-
-                // ── Collection 6X ──
-                TilePresetCollection {
-                    name: "Collection 6X".into(),
-                    raw_probability: 60.17,
-                    collection_probability: 60.17 / total_collection_raw,
-                    tile_presets: vec![tp_c("6A", 60.17, 6)],
-                    sub_collections: vec![],
-                },
-            ];
-        
-        
         let mut all_tiles_flat = Vec::new();
         for coll in &collections {
             for tile in &coll.tile_presets {
@@ -494,11 +478,424 @@ impl TilePresetConfigurations {
                 }
             }
         }
-        
+
         TilePresetConfigurations {
             all_tile_presets: collections,
             all_tiles_flat,
         }
     }
 }
+
 /* ==================================================================================================== */
+/* QUEST TILE CONFIGURATION (THỨ TỰ VÀ TRỌNG SỐ CHUẨN TỪ UNITY RAM DUMP)                                */
+/* ==================================================================================================== */
+
+#[derive(Debug, Clone)]
+pub struct QuestOption {
+    pub prefab_name: String,
+    pub probability: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct QuestSubCollection {
+    pub probability: f32,
+    pub occupied_edges: usize,
+    pub all_segment_types: Vec<GroupType>,
+    pub quest_tiles: Vec<QuestOption>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QuestCollection {
+    pub name: String,
+    pub group_type: GroupType,
+    pub probability: f32,
+    pub sub_collections: Vec<QuestSubCollection>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QuestConfigurations {
+    pub collections: Vec<QuestCollection>,
+    pub excluded_group_types: Vec<GroupType>,
+}
+
+impl QuestConfigurations {
+    /// Khởi tạo cấu hình Quest bằng cách đọc file monthly_game_info.txt (hoặc mặc định nếu không thấy file)
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Self {
+        let mut forest_prob = 10.0;
+        let mut agri_prob = 10.0;
+        let mut village_prob = 10.0;
+        let mut train_prob = 6.0;
+        let mut water_prob = 8.0;
+
+        if let Ok(content) = fs::read_to_string(path) {
+            for line in content.lines() {
+                if let Some((key, val)) = line.split_once('=') {
+                    let key = key.trim();
+                    let val = val.trim();
+                    if let Ok(num) = val.parse::<f32>() {
+                        match key {
+                            "ACTIVE_ForestProbability" => forest_prob = num,
+                            "ACTIVE_AgricultureProbability" => agri_prob = num,
+                            "ACTIVE_VillageProbability" => village_prob = num,
+                            "ACTIVE_TrainTrackProbability" => train_prob = num,
+                            "ACTIVE_WaterProbability" => water_prob = num,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        Self::new(forest_prob, agri_prob, village_prob, train_prob, water_prob)
+    }
+
+    /// Khởi tạo động cấu hình Quest và tự động tính toán mảng excluded_group_types theo C# dòng 7467-7477
+    pub fn new(forest_prob: f32, agri_prob: f32, village_prob: f32, train_prob: f32, water_prob: f32) -> Self {
+        // Trong C# (dòng 7470): Nếu xác suất nhóm địa hình == 0.0 thì thêm nhóm đó vào excludedGroupTypes
+        let mut excluded_group_types = Vec::new();
+        if forest_prob <= 0.0 { excluded_group_types.push(GroupType::Forest); }
+        if agri_prob <= 0.0 { excluded_group_types.push(GroupType::Agriculture); }
+        if village_prob <= 0.0 { excluded_group_types.push(GroupType::Village); }
+        if train_prob <= 0.0 { excluded_group_types.push(GroupType::TrainTracks); }
+        if water_prob <= 0.0 { excluded_group_types.push(GroupType::Water); }
+
+        let collections = vec![
+            // ── Collection 1: Forest Quests (Vị trí #1 trong questTileCollections của Unity) ──
+            QuestCollection {
+                name: "Forest Quest Collection".into(),
+                group_type: GroupType::Forest,
+                probability: forest_prob,
+                sub_collections: vec![
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 1,
+                        all_segment_types: vec![GroupType::Forest],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Forest_1AF".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Forest_1AF_Deer".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Forest_1AF_Bear".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Forest_1AF_Boar".into(), probability: 1.0 },
+                        ],
+                    },
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 3,
+                        all_segment_types: vec![GroupType::Forest, GroupType::Water],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Forest_1AF_2AW".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Forest_1AF_2AW_Deer".into(), probability: 1.0 },
+                        ],
+                    },
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 2,
+                        all_segment_types: vec![GroupType::Forest],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Forest_2AF".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Forest_2AF_Deer".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Forest_2AF_Bear".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Forest_2AF_Boar".into(), probability: 1.0 },
+                        ],
+                    },
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 3,
+                        all_segment_types: vec![GroupType::Forest],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Forest_3AF".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Forest_3AF_Deer".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Forest_3AF_Bear".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Forest_3AF_Boar".into(), probability: 1.0 },
+                        ],
+                    },
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 4,
+                        all_segment_types: vec![GroupType::Forest],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Forest_4AF".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Forest_4AF_Ruin".into(), probability: 0.25 },
+                        ],
+                    },
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 6,
+                        all_segment_types: vec![GroupType::Forest],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Forest_6AF".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Forest_6AF_Deer".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Forest_6AF_Ruin".into(), probability: 0.5 },
+                            QuestOption { prefab_name: "QuestTile_Forest_6AF_Bear".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Forest_6AF_Boar".into(), probability: 1.0 },
+                        ],
+                    },
+                ],
+            },
+
+            // ── Collection 2: Agriculture Quests (Vị trí #2 trong questTileCollections của Unity) ──
+            QuestCollection {
+                name: "Agriculture Quest Collection".into(),
+                group_type: GroupType::Agriculture,
+                probability: agri_prob,
+                sub_collections: vec![
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 2,
+                        all_segment_types: vec![GroupType::Agriculture],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Agriculture_2AA".into(), probability: 1.0 },
+                        ],
+                    },
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 5,
+                        all_segment_types: vec![GroupType::Agriculture, GroupType::Village],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Agriculture_2AA_2AV_1AV".into(), probability: 1.0 },
+                        ],
+                    },
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 6,
+                        all_segment_types: vec![GroupType::Agriculture, GroupType::Forest],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Agriculture_2AA_4AF".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Agriculture_2AA_4AF_Windmill".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Agriculture_2AA_4AF_Granary".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Agriculture_2AA_4AF_BigTree".into(), probability: 1.0 },
+                        ],
+                    },
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 4,
+                        all_segment_types: vec![GroupType::Agriculture, GroupType::Village],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Agriculture_3AA_1AV".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Agriculture_3AA_1AV_Windmill".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Agriculture_3AA_1AV_Granary".into(), probability: 1.0 },
+                        ],
+                    },
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 6,
+                        all_segment_types: vec![GroupType::Agriculture, GroupType::Forest],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Agriculture_4BA_1AF_1AF".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Agriculture_4BA_1AF_1AF_BigTree".into(), probability: 1.0 },
+                        ],
+                    },
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 6,
+                        all_segment_types: vec![GroupType::Agriculture, GroupType::Forest],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Agriculture_4AA_2AF".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Agriculture_4AA_2AF_Granary".into(), probability: 1.0 },
+                        ],
+                    },
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 6,
+                        all_segment_types: vec![GroupType::Agriculture],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Agriculture_6AA".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Agriculture_6AA_Windmill".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Agriculture_6AA_BigTree".into(), probability: 1.0 },
+                        ],
+                    },
+                ],
+            },
+
+            // ── Collection 3: Village Quests (Vị trí #3 trong questTileCollections của Unity) ──
+            QuestCollection {
+                name: "Village Quest Collection".into(),
+                group_type: GroupType::Village,
+                probability: village_prob,
+                sub_collections: vec![
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 2,
+                        all_segment_types: vec![GroupType::Village],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Village_2AV".into(), probability: 1.0 },
+                        ],
+                    },
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 6,
+                        all_segment_types: vec![GroupType::Village, GroupType::Forest],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Village_3AV_3AF".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Village_3AV_3AF_Fountain".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Village_3AV_3AF_Tower".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Village_3AV_3AF_Fox".into(), probability: 1.0 },
+                        ],
+                    },
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 6,
+                        all_segment_types: vec![GroupType::Village, GroupType::Forest],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Village_4BV_1AF_1AF".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Village_4BV_1AF_1AF_Fountain".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Village_4BV_1AF_1AF_Tower".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Village_4BV_1AF_1AF_Fox".into(), probability: 1.0 },
+                        ],
+                    },
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 6,
+                        all_segment_types: vec![GroupType::Village, GroupType::Forest],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Village_5AV_1AF".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Village_5AV_1AF_Fox".into(), probability: 1.0 },
+                        ],
+                    },
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 6,
+                        all_segment_types: vec![GroupType::Village],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Village_6AV".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Village_6AV_Fountain".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Village_6AV_Tower".into(), probability: 1.0 },
+                        ],
+                    },
+                ],
+            },
+
+            // ── Collection 4: Train Quests (Vị trí #4 trong questTileCollections của Unity) ──
+            QuestCollection {
+                name: "Train Quest Collection".into(),
+                group_type: GroupType::TrainTracks,
+                probability: train_prob,
+                sub_collections: vec![
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 6,
+                        all_segment_types: vec![GroupType::TrainTracks, GroupType::Forest],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Train_2BT-3AF-1AF".into(), probability: 1.0 },
+                        ],
+                    },
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 5,
+                        all_segment_types: vec![GroupType::TrainTracks, GroupType::Agriculture],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Train_2BT-2AA-1AA".into(), probability: 1.0 },
+                        ],
+                    },
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 6,
+                        all_segment_types: vec![GroupType::TrainTracks, GroupType::Village],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Train_2BT-3AV-1AV".into(), probability: 1.0 },
+                        ],
+                    },
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 2,
+                        all_segment_types: vec![GroupType::TrainTracks],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Train_2CT".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Train_2CT_Locomotive".into(), probability: 1.0 },
+                        ],
+                    },
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 4,
+                        all_segment_types: vec![GroupType::TrainTracks, GroupType::Forest, GroupType::Village],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Train_2CT-1AF-1AV".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Train_2CT-1AF-1AV_Locomotive".into(), probability: 1.0 },
+                        ],
+                    },
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 6,
+                        all_segment_types: vec![GroupType::TrainTracks, GroupType::Forest],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Train_4CT_1AF_1AF".into(), probability: 1.0 },
+                        ],
+                    },
+                ],
+            },
+
+            // ── Collection 5: Water Quests (Vị trí #5 trong questTileCollections của Unity) ──
+            QuestCollection {
+                name: "Water Quest Collection".into(),
+                group_type: GroupType::Water,
+                probability: water_prob,
+                sub_collections: vec![
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 6,
+                        all_segment_types: vec![GroupType::Water, GroupType::Forest],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Water_2BW_3AF_1AF".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Water_2BW_3AF_1AF_Boat".into(), probability: 1.0 },
+                        ],
+                    },
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 2,
+                        all_segment_types: vec![GroupType::Water],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Water_2CW".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Water_2CW_Boat".into(), probability: 1.0 },
+                        ],
+                    },
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 5,
+                        all_segment_types: vec![GroupType::Water, GroupType::Village],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Water_2CW_2AV_1AV".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Water_2CW_2AV_2AV_Watermill".into(), probability: 1.0 },
+                        ],
+                    },
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 5,
+                        all_segment_types: vec![GroupType::Water, GroupType::Forest, GroupType::Agriculture],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Water_2CW_2AF_1AA".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Water_2CW_2AF_1AA_Watermill".into(), probability: 1.0 },
+                        ],
+                    },
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 5,
+                        all_segment_types: vec![GroupType::Water, GroupType::Agriculture, GroupType::Village],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Water_2CW_2AA_1AV".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Water_2CW_2AA_1AV_Watermill".into(), probability: 1.0 },
+                        ],
+                    },
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 6,
+                        all_segment_types: vec![GroupType::Water, GroupType::Forest, GroupType::Agriculture],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Water_2CW_2AF_2AA".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Water_2CW_2AF_2AA_Beaver".into(), probability: 1.0 },
+                        ],
+                    },
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 6,
+                        all_segment_types: vec![GroupType::Water, GroupType::Forest],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Water_3AW_3AF".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Water_3AW_3AF_Beaver".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Water_3AW_3AF_SwanGoose".into(), probability: 1.0 },
+                        ],
+                    },
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 6,
+                        all_segment_types: vec![GroupType::Water, GroupType::Forest],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Water_4AW_2AF".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Water_4AW_2AF_Beaver".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Water_4AW_2AF_SwanGoose".into(), probability: 1.0 },
+                        ],
+                    },
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 6,
+                        all_segment_types: vec![GroupType::Water],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_Water_6AW".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Water_6AW_Boat".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Water_6AW_Beaver".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Water_6AW_Ruin".into(), probability: 0.5 },
+                        ],
+                    },
+                    QuestSubCollection {
+                        probability: 1.0, occupied_edges: 12,
+                        all_segment_types: vec![GroupType::Water, GroupType::TrainTracks],
+                        quest_tiles: vec![
+                            QuestOption { prefab_name: "QuestTile_WaterTrainStation_6AW_6AT".into(), probability: 1.0 },
+                        ],
+                    },
+                ],
+            },
+        ];
+
+        QuestConfigurations { collections, excluded_group_types }
+    }
+
+    pub fn default() -> Self {
+        Self::from_file("monthly_game_info.txt")
+    }
+}

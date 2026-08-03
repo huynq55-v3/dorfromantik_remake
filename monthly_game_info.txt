@@ -1,0 +1,17 @@
+=== DORFROMANTIK GAME SESSION DATA EXTRACTION ===
+REAL_TILE_SEED=-2093096630
+CONFIG_STRING=0820260cxQFZ1rZgBb
+
+=== ACTIVE SESSION EXTRACTED VALUES ===
+ACTIVE_VillageProbability=125
+ACTIVE_ForestProbability=125
+ACTIVE_AgricultureProbability=125
+ACTIVE_WaterProbability=1000
+ACTIVE_TrainTrackProbability=0
+ACTIVE_TileStackHeight=10
+ACTIVE_TileLimit=100
+ACTIVE_Density=1.4
+ACTIVE_QuestProbability=1
+ACTIVE_QuestDifficulty=2
+ACTIVE_FlagQuestProbability=0.3
+ACTIVE_WorldBorderRadius=-1

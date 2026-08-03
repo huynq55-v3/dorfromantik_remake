@@ -1,0 +1,20 @@
+[Info   :Tile Extractor] === GENERATE QUEST TILE DETAILS (Quest Seed: -2093096630, InitState Seed: 108774036, Filter: AtLeastTwoEmptyEdges) ===
+[Info   :Tile Extractor] [Info   :Tile Extractor]   [Roll 1: Collection] Raw Random.value: 0.85728820, Total Prob: 1375, Roll Val: 1178.7710, Chosen: 'Water (GroupType)'
+[Info   :Tile Extractor] [Info   :Tile Extractor]   [Roll 2: SubCollection (Filtered)] Raw Random.value: 0.29471850, Total Prob: 41.16, Roll Val: 12.1306, OccupiedEdges: 2
+[Info   :Tile Extractor] [Info   :Tile Extractor]   [Roll 3: Option] Raw Random.value: 0.75049650, Total Prob: 2, Roll Val: 1.5010, Chosen Prefab: 'QuestTile_Water_2CW_Boat'
+[Info   :Tile Extractor] [Info   :Tile Extractor]   -> Unity chọn được Prefab: 'QuestTile_Agriculture_3AA_1AV' (Seed: -2093096630)
+[Info   :Tile Extractor] =======================================================
+
+[Info   :Tile Extractor] === GENERATE QUEST TILE DETAILS (Quest Seed: -2093107078, InitState Seed: 108753140, Filter: AtLeastTwoEmptyEdges) ===
+[Info   :Tile Extractor] [Info   :Tile Extractor]   [Roll 1: Collection] Raw Random.value: 0.60871250, Total Prob: 1375, Roll Val: 836.9797, Chosen: 'Water (GroupType)'
+[Info   :Tile Extractor] [Info   :Tile Extractor]   [Roll 2: SubCollection (Filtered)] Raw Random.value: 0.06271864, Total Prob: 41.16, Roll Val: 2.5815, OccupiedEdges: 2
+[Info   :Tile Extractor] [Info   :Tile Extractor]   [Roll 3: Option] Raw Random.value: 0.82938930, Total Prob: 2, Roll Val: 1.6588, Chosen Prefab: 'QuestTile_Water_2CW_Boat'
+[Info   :Tile Extractor] [Info   :Tile Extractor]   -> Unity chọn được Prefab: 'QuestTile_Water_2CW' (Seed: -2093107078)
+[Info   :Tile Extractor] =======================================================
+
+[Info   :Tile Extractor] === GENERATE QUEST TILE DETAILS (Quest Seed: -2093117526, InitState Seed: 108732244, Filter: AtLeastTwoEmptyEdges) ===
+[Info   :Tile Extractor] [Info   :Tile Extractor]   [Roll 1: Collection] Raw Random.value: 0.26493920, Total Prob: 1375, Roll Val: 364.2914, Chosen: 'Village (GroupType)'
+[Info   :Tile Extractor] [Info   :Tile Extractor]   [Roll 2: SubCollection (Filtered)] Raw Random.value: 0.28621650, Total Prob: 27.44, Roll Val: 7.8538, OccupiedEdges: 2
+[Info   :Tile Extractor] [Info   :Tile Extractor]   [Roll 3: Option] Raw Random.value: 0.01626718, Total Prob: 1, Roll Val: 0.0163, Chosen Prefab: 'QuestTile_Village_2AV'
+[Info   :Tile Extractor] [Info   :Tile Extractor]   -> Unity chọn được Prefab: 'QuestTile_Water_2CW_Boat' (Seed: -2093117526)
+[Info   :Tile Extractor] =======================================================
