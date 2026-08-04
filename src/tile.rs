@@ -182,6 +182,7 @@ pub struct QuestTileData {
     pub quest_type: String,
     pub target_count: usize,
     pub equality: EqualityComparison,
+    pub level: usize,
 }
 
 impl QuestTileData {
@@ -229,6 +230,37 @@ impl QuestTileData {
                 }
             }
             GroupType::Agriculture
+        }
+    }
+
+    /// Đếm tổng số object/element của mảnh QuestTile này thuộc primary_group_type dựa theo config2.txt
+    pub fn own_elements(&self) -> usize {
+        let primary_gt = self.primary_group_type();
+        let cfg = self.config_string();
+        let mut total = 0;
+
+        for part in cfg.split_whitespace() {
+            if let Some((seg_type, group_type)) = parse_segment_code(part) {
+                if group_type == primary_gt {
+                    total += crate::game_config::get_segment_element_count(group_type, seg_type);
+                }
+            }
+        }
+
+        if total == 0 {
+            1
+        } else {
+            total
+        }
+    }
+
+    /// Số ô/cây/nhà còn thiếu hiển thị trên bóng bóng nhiệm vụ vàng (RemainingValue = TargetValue - own_elements)
+    pub fn remaining_display_value(&self) -> usize {
+        let own = self.own_elements();
+        if self.target_count > own {
+            self.target_count - own
+        } else {
+            0
         }
     }
 }
@@ -296,14 +328,7 @@ impl GeneratedTile {
                 if segments.is_empty() {
                     return "Plain".to_string();
                 }
-                let mut sorted_segs = segments.clone();
-                sorted_segs.sort_by(|a, b| {
-                    b.segment_type.edge_count()
-                        .cmp(&a.segment_type.edge_count())
-                        .then_with(|| a.group_type.letter().cmp(&b.group_type.letter()))
-                });
-
-                let codes: Vec<String> = sorted_segs.iter().map(|s| s.config_code()).collect();
+                let codes: Vec<String> = segments.iter().map(|s| s.config_code()).collect();
                 codes.join(" ")
             }
             GeneratedTile::Quest { quest_data, .. } => {

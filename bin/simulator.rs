@@ -73,6 +73,45 @@ fn load_game_seed() -> i32 {
     -2093096630
 }
 
+fn init_active_quest_tile_target(front_tile: &mut GeneratedTile, game_board: &Board) {
+    if let GeneratedTile::Quest { quest_data, .. } = front_tile {
+        if quest_data.target_count == 0 {
+            let gt = quest_data.primary_group_type();
+            let board_ref = game_board.reference_group_count(gt);
+            let min_target = dorfromantik_remake::game_config::get_quest_prefab_min_target_count(&quest_data.quest_type);
+            let (eq, cond_val) = dorfromantik_remake::game_config::get_quest_prefab_condition_target_value(&quest_data.quest_type, gt, quest_data.seed);
+            let mut qm = dorfromantik_remake::quest_manager::QuestManager::new();
+            let fulfilled_count = game_board.placed_tiles.values().filter(|pt| pt.quest_status == Some(dorfromantik_remake::board::FulfillmentStatus::Success)).count();
+            qm.level = fulfilled_count;
+            quest_data.level = fulfilled_count;
+            let ref_base = std::cmp::max(board_ref, 1);
+            let base = std::cmp::max(ref_base, min_target);
+            let diff = qm.difficulty_increase(gt);
+
+            quest_data.target_count = base + cond_val + diff;
+            quest_data.equality = eq;
+
+            let own_elements = quest_data.own_elements();
+            let remaining_display = quest_data.remaining_display_value();
+
+            println!("================================----------------------------------");
+            println!("[ACTIVE TILE INIT - QUEST TARGET CALCULATION]");
+            println!("  - Prefab Name: '{}'", quest_data.quest_type);
+            println!("  - Quest Seed: {}", quest_data.seed);
+            println!("  - Primary GroupType: {:?}", gt);
+            println!("  - Equality: {:?}", eq);
+            println!("  - minTargetCount: {}", min_target);
+            println!("  - conditionTargetValue: {}", cond_val);
+            println!("  - ReferenceGroupCount (On Board): {}", board_ref);
+            println!("  - DifficultyIncrease: {}", diff);
+            println!("  ==> INTERNAL TARGET VALUE (TargetValue): {}", quest_data.target_count);
+            println!("  ==> OWN TILE ELEMENTS (Số Object trên tile): {}", own_elements);
+            println!("  ==> REMAINING DISPLAY VALUE (Số hiển thị trên bóng bóng): {}", remaining_display);
+            println!("================================----------------------------------\n");
+        }
+    }
+}
+
 #[macroquad::main("Dorfromantik Simulator")]
 async fn main() {
     let seed = load_game_seed();
@@ -242,8 +281,18 @@ async fn main() {
                     // Generate Tile #4 using active_quest_count_for_tile4 (calculated from Tile 1)
                     let next_gen = generator.generate_tile(None, active_quest_count_for_tile4, None);
                     tile_queue.push_back(next_gen);
+
+                    // Update TargetValue for the new front tile (Tile #2) based on current board state
+                    if let Some(front_tile) = tile_queue.front_mut() {
+                        init_active_quest_tile_target(front_tile, &game_board);
+                    }
                 }
             }
+        }
+
+        // Active tile initialization at start of frame if uninitialized
+        if let Some(front_tile) = tile_queue.front_mut() {
+            init_active_quest_tile_target(front_tile, &game_board);
         }
 
         // ── 2. Render Placed Tiles on Board ──
@@ -276,7 +325,7 @@ async fn main() {
                     let display_target = if let Some(&(rem_target, _)) = preview_map.get(&(hovered_hex.q, hovered_hex.r)) {
                         rem_target
                     } else {
-                        quest_data.target_count
+                        quest_data.remaining_display_value()
                     };
                     draw_custom_badge_text(screen_pos, quest_data.primary_group_type(), quest_data.equality, display_target, HEX_RADIUS * zoom, 0.85);
                 }
@@ -329,8 +378,10 @@ async fn main() {
             let tile_alpha = if idx == 0 { 1.0 } else { 0.85 };
             draw_hex_tile(slot_center, slot_radii[idx], &cfg, rot, tile_alpha);
 
-            if let GeneratedTile::Quest { quest_data, .. } = tile {
-                draw_badge_text(slot_center, quest_data, slot_radii[idx], tile_alpha);
+            if idx == 0 {
+                if let GeneratedTile::Quest { quest_data, .. } = tile {
+                    draw_badge_text(slot_center, quest_data, slot_radii[idx], tile_alpha);
+                }
             }
 
             let p_code = tile.tile_preset_string();
@@ -497,5 +548,5 @@ fn draw_custom_badge_text(
 
 /// Helper function to draw badge text (+3, =2)
 fn draw_badge_text(center: Vec2, quest_data: &dorfromantik_remake::tile::QuestTileData, hex_radius: f32, alpha: f32) {
-    draw_custom_badge_text(center, quest_data.primary_group_type(), quest_data.equality, quest_data.target_count, hex_radius, alpha);
+    draw_custom_badge_text(center, quest_data.primary_group_type(), quest_data.equality, quest_data.remaining_display_value(), hex_radius, alpha);
 }

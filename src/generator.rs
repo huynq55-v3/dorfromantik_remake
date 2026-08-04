@@ -29,7 +29,7 @@ impl TileGenerator {
             generated_tile_count: 0,
             generated_quest_count: 0,
             tile_seed_increment_step,
-            at_least_two_empty_edges_for_x_turns: 3,
+            at_least_two_empty_edges_for_x_turns: 5,
             base_tile_counter: 0,
             global_quest_probability_multiplier: 1.0,
         }
@@ -82,7 +82,7 @@ impl TileGenerator {
         let (selected_col, col_roll, col_ratio, col_total) = rng
             .select_weighted_info(&col_options)
             .unwrap_or_else(|| (quest_configs.collections[0].clone(), 0.0, 0.0, 0.0));
-        println!("  [Roll 1: Collection] Prob Ratio: {:.8}, Total Prob: {}, Roll Val: {:.4}, Chosen: '{}'", col_ratio, col_total, col_roll, selected_col.name);
+        println!("  [Roll 1: Collection] CollProb: {:.8}, RawProb: {}, Total Prob: {}, Roll Val: {:.4}, Chosen: '{}'", col_ratio, selected_col.probability, col_total, col_roll, selected_col.name);
 
         // 1. Lọc danh sách SubCollection theo excludedGroupTypes (C# dòng 24421: loại bỏ subcollection chứa group_type bị cấm)
         let mut filtered_sub_cols: Vec<_> = selected_col
@@ -107,7 +107,8 @@ impl TileGenerator {
         let (selected_sub, sub_roll, sub_ratio, sub_total) = rng
             .select_weighted_info(&sub_options)
             .unwrap_or_else(|| (filtered_sub_cols[0].clone(), 0.0, 0.0, 0.0));
-        println!("  [Roll 2: SubCollection (Filtered)] Prob Ratio: {:.8}, Total Prob: {}, Roll Val: {:.4}, OccupiedEdges: {}", sub_ratio, sub_total, sub_roll, selected_sub.occupied_edges);
+        let sub_coll_prob = if col_total == 0.0 || sub_total == 0.0 { 0.0 } else { (selected_sub.probability / sub_total) * col_ratio };
+        println!("  [Roll 2: SubCollection (Filtered)] subCollectionProbability: {:.8}, SubRawProb: {:.4}, Total Filtered SubProb: {:.4}, Roll Val: {:.4}, OccupiedEdges: {}", sub_coll_prob, selected_sub.probability, sub_total, sub_roll, selected_sub.occupied_edges);
 
         // Roll 3: Chọn QuestOption từ SubCollection đã chọn
         let opt_options: Vec<_> = selected_sub
@@ -120,23 +121,14 @@ impl TileGenerator {
             .unwrap_or_else(|| (selected_sub.quest_tiles[0].clone(), 0.0, 0.0, 0.0));
         println!("  [Roll 3: Option] Prob Ratio: {:.8}, Total Prob: {}, Roll Val: {:.4}, Chosen Prefab: '{}'\n", opt_ratio, opt_total, opt_roll, selected_opt.prefab_name);
 
-        let min_target_count = crate::game_config::get_quest_prefab_min_target_count(&selected_opt.prefab_name);
-        let temp_quest = QuestTileData {
-            seed: quest_seed,
-            quest_type: selected_opt.prefab_name.clone(),
-            target_count: 0,
-            equality: crate::tile::EqualityComparison::MoreThan,
-        };
-        let gt = temp_quest.primary_group_type();
-        let (equality, condition_target_val) = crate::game_config::get_quest_prefab_condition_target_value(&selected_opt.prefab_name, gt, quest_seed);
-        let quest_manager = crate::quest_manager::QuestManager::new();
-        let target_count = quest_manager.calculate_target_value(&temp_quest, min_target_count, condition_target_val);
+        let (equality, _) = crate::game_config::get_quest_prefab_condition_target_value(&selected_opt.prefab_name, GroupType::Forest, quest_seed);
 
         QuestTileData {
             seed: quest_seed,
-            quest_type: selected_opt.prefab_name,
-            target_count,
+            quest_type: selected_opt.prefab_name.clone(),
+            target_count: 0,
             equality,
+            level: 0,
         }
     }
 
@@ -198,7 +190,8 @@ impl TileGenerator {
             // Dòng 43178 C#: GeneratedQuestCount++
             self.generated_quest_count += 1;
 
-            let quest_data = self.generate_quest_tile(num2, used_filter);
+            let mut quest_data = self.generate_quest_tile(num2, used_filter);
+            quest_data.level = 0;
             println!("  ==> ACTUAL RETURNED QUEST TILE: '{}'", quest_data.quest_type);
             println!("================================----------------------------------\n");
 
@@ -211,25 +204,74 @@ impl TileGenerator {
         // Nếu là Normal Tile
         let mut rng_tile = UnityRandom::init_state(num);
         let tile_configs = TilePresetConfigurations::default();
-        let seg_configs = SegmentPresetConfigurations::default();
+        let seg_configs = SegmentPresetConfigurations::from_file("monthly_game_info.txt");
 
-        let preset_options: Vec<_> = tile_configs
+        // Lọc tilePresets theo used_filter (nếu AtLeastTwoEmptyEdges thì occupied_edges < 5)
+        let filtered_presets: Vec<_> = tile_configs
             .all_tiles_flat
+            .iter()
+            .filter(|p| match used_filter {
+                TileGenFilter::AtLeastTwoEmptyEdges => p.occupied_edges < 5,
+                TileGenFilter::None => true,
+            })
+            .cloned()
+            .collect();
+
+        let preset_options: Vec<_> = filtered_presets
             .iter()
             .map(|p| (p.clone(), p.final_probability))
             .collect();
 
         let selected_preset = rng_tile
             .select_weighted(&preset_options)
-            .unwrap_or_else(|| tile_configs.all_tiles_flat[0].clone());
+            .unwrap_or_else(|| filtered_presets[0].clone());
 
         println!("  ==> ACTUAL RETURNED TILE OBJECT: '{}'", selected_preset.name);
 
-        let mut segments = Vec::new();
+        fn segments_adjacent(edges1: &[usize], edges2: &[usize]) -> bool {
+            for &e1 in edges1 {
+                for &e2 in edges2 {
+                    let diff = (e1 as i32 - e2 as i32).abs();
+                    if diff == 1 || diff == 5 {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+
+        fn rotations_to_fit_on_tile(base_edges: &[usize], occupied_tile_edges: &[usize]) -> Vec<usize> {
+            let mut valid_rotations = Vec::new();
+            let num = if !occupied_tile_edges.is_empty() {
+                *occupied_tile_edges.iter().max().unwrap()
+            } else {
+                0
+            };
+
+            for i in 0..6 {
+                let rot = (i + num) % 6;
+                let rotated_edges: Vec<usize> = base_edges.iter().map(|&b| (b + rot) % 6).collect();
+                let has_overlap = rotated_edges.iter().any(|e| occupied_tile_edges.contains(e));
+                if !has_overlap {
+                    valid_rotations.push(rot);
+                }
+            }
+            valid_rotations
+        }
+
+        let mut segments: Vec<SegmentData> = Vec::new();
 
         for seg_type in &selected_preset.segments {
             let seg_type = *seg_type;
-            let rotation = rng_tile.range_usize(0, 6);
+            let occupied_tile_edges: Vec<usize> = segments.iter().flat_map(|s| s.occupied_edges.iter().cloned()).collect();
+            let valid_rotations = rotations_to_fit_on_tile(seg_type.base_edges(), &occupied_tile_edges);
+            let rotation = if !valid_rotations.is_empty() {
+                let idx = rng_tile.range_usize(0, valid_rotations.len());
+                valid_rotations[idx]
+            } else {
+                rng_tile.range_usize(0, 6)
+            };
+            let edges: Vec<usize> = seg_type.base_edges().iter().map(|&b| (b + rotation) % 6).collect();
 
             let seg_preset_opt = seg_configs
                 .all_segment_presets
@@ -237,12 +279,19 @@ impl TileGenerator {
                 .find(|s| s.segment_type == seg_type);
 
             let group_type = if let Some(seg_preset) = seg_preset_opt {
-                let group_options: Vec<_> = seg_preset
+                let mut group_options: Vec<_> = seg_preset
                     .possible_types
                     .iter()
                     .filter(|gt| gt.probability_in_percent > 0.0)
                     .map(|gt| (gt.group_type, gt.probability_in_percent))
                     .collect();
+
+                // Dòng 43242 C#: Loại bỏ GroupType của các segment kề cạnh (SegmentsAdjacent)
+                for existing_seg in &segments {
+                    if segments_adjacent(&existing_seg.occupied_edges, &edges) {
+                        group_options.retain(|(gt, _)| *gt != existing_seg.group_type);
+                    }
+                }
 
                 rng_tile
                     .select_weighted(&group_options)
@@ -251,7 +300,8 @@ impl TileGenerator {
                 GroupType::Agriculture
             };
 
-            let edges: Vec<usize> = seg_type.base_edges().iter().map(|&b| (b + rotation) % 6).collect();
+            // Dòng 43262 C#: Unity luôn gọi Random.value để kiểm tra hybrid variant cho mỗi segment
+            let _value2 = rng_tile.value();
 
             segments.push(SegmentData {
                 index: segments.len(),
@@ -264,7 +314,8 @@ impl TileGenerator {
 
         println!("      [NORMAL TILE DETAILS] Total Segments: {}", segments.len());
         for (idx, seg) in segments.iter().enumerate() {
-            println!("        - Segment #{}: GroupType = {:?}, SegmentType = {:?}", idx, seg.group_type, seg.segment_type);
+            println!("        - Segment #{}: GroupType = {:?}, SegmentType = {:?}, Rotation = {}, Edges = {:?}",
+                idx, seg.group_type, seg.segment_type, seg.rotation, seg.occupied_edges);
         }
         println!("================================----------------------------------\n");
 

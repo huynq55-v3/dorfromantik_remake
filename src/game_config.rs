@@ -363,7 +363,7 @@ impl TilePresetConfigurations {
     pub fn default() -> Self {
         let total_collection_raw: f32 = TOTAL_COLLECTION_RAW;
 
-        let collections = vec![
+        let mut collections = vec![
             TilePresetCollection {
                 name: "Collection 0X".into(),
                 raw_probability: 35.1,
@@ -509,13 +509,50 @@ impl TilePresetConfigurations {
             },
         ];
 
+        // Recalculate probabilities matching Unity C# logic (UpdateAllTilePresetsList in Dorfromantik2.cs)
+        for coll in &mut collections {
+            coll.collection_probability = coll.raw_probability / total_collection_raw;
+
+            if !coll.sub_collections.is_empty() {
+                let sum_sub_raws: f32 = coll.sub_collections.iter().map(|s| s.raw_probability).sum();
+                for sub in &mut coll.sub_collections {
+                    sub.sub_probability = if sum_sub_raws == 0.0 {
+                        0.0
+                    } else {
+                        (sub.raw_probability / sum_sub_raws) * coll.collection_probability
+                    };
+
+                    let sum_tile_raws: f32 = sub.tile_presets.iter().map(|t| t.raw_probability).sum();
+                    for tile in &mut sub.tile_presets {
+                        tile.final_probability = if sum_tile_raws * sub.sub_probability == 0.0 {
+                            0.0
+                        } else {
+                            (tile.raw_probability / sum_tile_raws) * sub.sub_probability
+                        };
+                    }
+                }
+            } else if !coll.tile_presets.is_empty() {
+                let sum_tile_raws: f32 = coll.tile_presets.iter().map(|t| t.raw_probability).sum();
+                for tile in &mut coll.tile_presets {
+                    tile.final_probability = if sum_tile_raws * coll.collection_probability == 0.0 {
+                        0.0
+                    } else {
+                        (tile.raw_probability / sum_tile_raws) * coll.collection_probability
+                    };
+                }
+            }
+        }
+
         let mut all_tiles_flat = Vec::new();
         for coll in &collections {
-            for tile in &coll.tile_presets {
-                all_tiles_flat.push(tile.clone());
-            }
-            for sub in &coll.sub_collections {
-                for tile in &sub.tile_presets {
+            if !coll.sub_collections.is_empty() {
+                for sub in &coll.sub_collections {
+                    for tile in &sub.tile_presets {
+                        all_tiles_flat.push(tile.clone());
+                    }
+                }
+            } else if !coll.tile_presets.is_empty() {
+                for tile in &coll.tile_presets {
                     all_tiles_flat.push(tile.clone());
                 }
             }
@@ -551,7 +588,7 @@ pub fn get_quest_prefab_min_target_count(prefab_name: &str) -> usize {
     }
 }
 
-/// Trả về số lượng object nhỏ (house, tree, field, river, traintrack) từ config2.txt cho (GroupType, SegmentType)
+/// Tra cứu số lượng object nhỏ (house, tree, field, river, traintrack) được hardcode trực tiếp từ config2.txt
 pub fn get_segment_element_count(group_type: GroupType, segment_type: SegmentType) -> usize {
     match group_type {
         GroupType::Village => match segment_type {
@@ -718,6 +755,19 @@ impl QuestConfigurations {
         Self::new(forest_prob, agri_prob, village_prob, train_prob, water_prob)
     }
 
+    /// Tính toán động collectionProbability (CollProb) và subCollectionProbability tương ứng Unity C# dòng 24498-24507 (UpdateValues)
+    pub fn collection_probability(&self, group_type: GroupType) -> f32 {
+        let total_raw: f32 = self.collections.iter().map(|c| c.probability).sum();
+        if total_raw == 0.0 {
+            return 0.0;
+        }
+        if let Some(col) = self.collections.iter().find(|c| c.group_type == group_type) {
+            col.probability / total_raw
+        } else {
+            0.0
+        }
+    }
+
     /// Khởi tạo động cấu hình Quest và tự động tính toán mảng excluded_group_types theo C# dòng 7467-7477
     pub fn new(forest_prob: f32, agri_prob: f32, village_prob: f32, train_prob: f32, water_prob: f32) -> Self {
         // Trong C# (dòng 7470): Nếu xác suất nhóm địa hình == 0.0 thì thêm nhóm đó vào excludedGroupTypes
@@ -729,221 +779,221 @@ impl QuestConfigurations {
         if water_prob <= 0.0 { excluded_group_types.push(GroupType::Water); }
 
         let collections = vec![
-            // ── Collection 1: Forest Quests (Vị trí #1 trong questTileCollections của Unity) ──
+            // ── Collection 1: Forest Quests (Index #0) ──
             QuestCollection {
                 name: "Forest Quest Collection".into(),
                 group_type: GroupType::Forest,
                 probability: forest_prob,
                 sub_collections: vec![
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 1,
+                        probability: 19.6, occupied_edges: 1,
                         all_segment_types: vec![GroupType::Forest],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Forest_1AF".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Forest_1AF_Deer".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Forest_1AF_Bear".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Forest_1AF_Boar".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Forest_1AF_Deer".into(), probability: 0.0 },
+                            QuestOption { prefab_name: "QuestTile_Forest_1AF_Bear".into(), probability: 0.0 },
+                            QuestOption { prefab_name: "QuestTile_Forest_1AF_Boar".into(), probability: 0.0 },
                         ],
                     },
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 3,
+                        probability: 3.8416, occupied_edges: 3,
                         all_segment_types: vec![GroupType::Forest, GroupType::Water],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Forest_1AF_2AW".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Forest_1AF_2AW_Deer".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Forest_1AF_2AW_Deer".into(), probability: 0.0 },
                         ],
                     },
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 2,
+                        probability: 27.44, occupied_edges: 2,
                         all_segment_types: vec![GroupType::Forest],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Forest_2AF".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Forest_2AF_Deer".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Forest_2AF_Bear".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Forest_2AF_Boar".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Forest_2AF_Deer".into(), probability: 0.0 },
+                            QuestOption { prefab_name: "QuestTile_Forest_2AF_Bear".into(), probability: 0.0 },
+                            QuestOption { prefab_name: "QuestTile_Forest_2AF_Boar".into(), probability: 0.0 },
                         ],
                     },
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 3,
+                        probability: 38.416, occupied_edges: 3,
                         all_segment_types: vec![GroupType::Forest],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Forest_3AF".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Forest_3AF_Deer".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Forest_3AF_Bear".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Forest_3AF_Boar".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Forest_3AF_Deer".into(), probability: 0.0 },
+                            QuestOption { prefab_name: "QuestTile_Forest_3AF_Bear".into(), probability: 0.0 },
+                            QuestOption { prefab_name: "QuestTile_Forest_3AF_Boar".into(), probability: 0.0 },
                         ],
                     },
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 4,
+                        probability: 80.67359, occupied_edges: 4,
                         all_segment_types: vec![GroupType::Forest],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Forest_4AF".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Forest_4AF_Ruin".into(), probability: 0.25 },
+                            QuestOption { prefab_name: "QuestTile_Forest_4AF_Ruin".into(), probability: 0.0 },
                         ],
                     },
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 6,
+                        probability: 158.1202, occupied_edges: 6,
                         all_segment_types: vec![GroupType::Forest],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Forest_6AF".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Forest_6AF_Deer".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Forest_6AF_Ruin".into(), probability: 0.5 },
-                            QuestOption { prefab_name: "QuestTile_Forest_6AF_Bear".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Forest_6AF_Boar".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Forest_6AF_Deer".into(), probability: 0.0 },
+                            QuestOption { prefab_name: "QuestTile_Forest_6AF_Ruin".into(), probability: 0.0 },
+                            QuestOption { prefab_name: "QuestTile_Forest_6AF_Bear".into(), probability: 0.0 },
+                            QuestOption { prefab_name: "QuestTile_Forest_6AF_Boar".into(), probability: 0.0 },
                         ],
                     },
                 ],
             },
 
-            // ── Collection 2: Agriculture Quests (Vị trí #2 trong questTileCollections của Unity) ──
+            // ── Collection 2: Agriculture Quests (Index #1) ──
             QuestCollection {
                 name: "Agriculture Quest Collection".into(),
                 group_type: GroupType::Agriculture,
                 probability: agri_prob,
                 sub_collections: vec![
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 2,
+                        probability: 27.44, occupied_edges: 2,
                         all_segment_types: vec![GroupType::Agriculture],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Agriculture_2AA".into(), probability: 1.0 },
                         ],
                     },
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 5,
+                        probability: 52.70675, occupied_edges: 5,
                         all_segment_types: vec![GroupType::Agriculture, GroupType::Village],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Agriculture_2AA_2AV_1AV".into(), probability: 1.0 },
                         ],
                     },
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 6,
+                        probability: 52.70675, occupied_edges: 6,
                         all_segment_types: vec![GroupType::Agriculture, GroupType::Forest],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Agriculture_2AA_4AF".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Agriculture_2AA_4AF_Windmill".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Agriculture_2AA_4AF_Granary".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Agriculture_2AA_4AF_BigTree".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Agriculture_2AA_4AF_Windmill".into(), probability: 0.0 },
+                            QuestOption { prefab_name: "QuestTile_Agriculture_2AA_4AF_Granary".into(), probability: 0.0 },
+                            QuestOption { prefab_name: "QuestTile_Agriculture_2AA_4AF_BigTree".into(), probability: 0.0 },
                         ],
                     },
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 4,
+                        probability: 26.8912, occupied_edges: 4,
                         all_segment_types: vec![GroupType::Agriculture, GroupType::Village],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Agriculture_3AA_1AV".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Agriculture_3AA_1AV_Windmill".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Agriculture_3AA_1AV_Granary".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Agriculture_3AA_1AV_Windmill".into(), probability: 0.0 },
+                            QuestOption { prefab_name: "QuestTile_Agriculture_3AA_1AV_Granary".into(), probability: 0.0 },
                         ],
                     },
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 6,
+                        probability: 52.70675, occupied_edges: 6,
                         all_segment_types: vec![GroupType::Agriculture, GroupType::Forest],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Agriculture_4BA_1AF_1AF".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Agriculture_4BA_1AF_1AF_BigTree".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Agriculture_4BA_1AF_1AF_BigTree".into(), probability: 0.0 },
                         ],
                     },
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 6,
+                        probability: 105.4135, occupied_edges: 6,
                         all_segment_types: vec![GroupType::Agriculture, GroupType::Forest],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Agriculture_4AA_2AF".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Agriculture_4AA_2AF_Granary".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Agriculture_4AA_2AF_Granary".into(), probability: 0.0 },
                         ],
                     },
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 6,
+                        probability: 158.1202, occupied_edges: 6,
                         all_segment_types: vec![GroupType::Agriculture],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Agriculture_6AA".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Agriculture_6AA_Windmill".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Agriculture_6AA_BigTree".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Agriculture_6AA_Windmill".into(), probability: 0.0 },
+                            QuestOption { prefab_name: "QuestTile_Agriculture_6AA_BigTree".into(), probability: 0.0 },
                         ],
                     },
                 ],
             },
 
-            // ── Collection 3: Village Quests (Vị trí #3 trong questTileCollections của Unity) ──
+            // ── Collection 3: Village Quests (Index #2) ──
             QuestCollection {
                 name: "Village Quest Collection".into(),
                 group_type: GroupType::Village,
                 probability: village_prob,
                 sub_collections: vec![
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 2,
+                        probability: 27.44, occupied_edges: 2,
                         all_segment_types: vec![GroupType::Village],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Village_2AV".into(), probability: 1.0 },
                         ],
                     },
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 6,
+                        probability: 105.4135, occupied_edges: 6,
                         all_segment_types: vec![GroupType::Village, GroupType::Forest],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Village_3AV_3AF".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Village_3AV_3AF_Fountain".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Village_3AV_3AF_Tower".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Village_3AV_3AF_Fox".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Village_3AV_3AF_Fountain".into(), probability: 0.0 },
+                            QuestOption { prefab_name: "QuestTile_Village_3AV_3AF_Tower".into(), probability: 0.0 },
+                            QuestOption { prefab_name: "QuestTile_Village_3AV_3AF_Fox".into(), probability: 0.0 },
                         ],
                     },
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 6,
+                        probability: 31.62405, occupied_edges: 6,
                         all_segment_types: vec![GroupType::Village, GroupType::Forest],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Village_4BV_1AF_1AF".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Village_4BV_1AF_1AF_Fountain".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Village_4BV_1AF_1AF_Tower".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Village_4BV_1AF_1AF_Fox".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Village_4BV_1AF_1AF_Fountain".into(), probability: 0.0 },
+                            QuestOption { prefab_name: "QuestTile_Village_4BV_1AF_1AF_Tower".into(), probability: 0.0 },
+                            QuestOption { prefab_name: "QuestTile_Village_4BV_1AF_1AF_Fox".into(), probability: 0.0 },
                         ],
                     },
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 6,
+                        probability: 105.4135, occupied_edges: 6,
                         all_segment_types: vec![GroupType::Village, GroupType::Forest],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Village_5AV_1AF".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Village_5AV_1AF_Fox".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Village_5AV_1AF_Fox".into(), probability: 0.0 },
                         ],
                     },
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 6,
+                        probability: 105.4135, occupied_edges: 6,
                         all_segment_types: vec![GroupType::Village],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Village_6AV".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Village_6AV_Fountain".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Village_6AV_Tower".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Village_6AV_Fountain".into(), probability: 0.0 },
+                            QuestOption { prefab_name: "QuestTile_Village_6AV_Tower".into(), probability: 0.0 },
                         ],
                     },
                 ],
             },
 
-            // ── Collection 4: Train Quests (Vị trí #4 trong questTileCollections của Unity) ──
+            // ── Collection 4: Train Quests (Index #3) ──
             QuestCollection {
                 name: "Train Quest Collection".into(),
                 group_type: GroupType::TrainTracks,
                 probability: train_prob,
                 sub_collections: vec![
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 6,
+                        probability: 105.4135, occupied_edges: 6,
                         all_segment_types: vec![GroupType::TrainTracks, GroupType::Forest],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Train_2BT-3AF-1AF".into(), probability: 1.0 },
                         ],
                     },
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 5,
+                        probability: 75.29535, occupied_edges: 5,
                         all_segment_types: vec![GroupType::TrainTracks, GroupType::Agriculture],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Train_2BT-2AA-1AA".into(), probability: 1.0 },
                         ],
                     },
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 6,
+                        probability: 73.78944, occupied_edges: 6,
                         all_segment_types: vec![GroupType::TrainTracks, GroupType::Village],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Train_2BT-3AV-1AV".into(), probability: 1.0 },
                         ],
                     },
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 2,
+                        probability: 54.88, occupied_edges: 2,
                         all_segment_types: vec![GroupType::TrainTracks],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Train_2CT".into(), probability: 1.0 },
@@ -951,7 +1001,7 @@ impl QuestConfigurations {
                         ],
                     },
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 4,
+                        probability: 26.8912, occupied_edges: 4,
                         all_segment_types: vec![GroupType::TrainTracks, GroupType::Forest, GroupType::Village],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Train_2CT-1AF-1AV".into(), probability: 1.0 },
@@ -959,8 +1009,8 @@ impl QuestConfigurations {
                         ],
                     },
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 6,
-                        all_segment_types: vec![GroupType::TrainTracks, GroupType::Forest],
+                        probability: 0.0, occupied_edges: 6,
+                        all_segment_types: vec![GroupType::TrainTracks],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Train_4CT_1AF_1AF".into(), probability: 1.0 },
                         ],
@@ -968,14 +1018,14 @@ impl QuestConfigurations {
                 ],
             },
 
-            // ── Collection 5: Water Quests (Vị trí #5 trong questTileCollections của Unity) ──
+            // ── Collection 5: Water Quests (Index #4) ──
             QuestCollection {
                 name: "Water Quest Collection".into(),
                 group_type: GroupType::Water,
                 probability: water_prob,
                 sub_collections: vec![
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 6,
+                        probability: 105.4135, occupied_edges: 6,
                         all_segment_types: vec![GroupType::Water, GroupType::Forest],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Water_2BW_3AF_1AF".into(), probability: 1.0 },
@@ -983,7 +1033,7 @@ impl QuestConfigurations {
                         ],
                     },
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 2,
+                        probability: 41.16, occupied_edges: 2,
                         all_segment_types: vec![GroupType::Water],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Water_2CW".into(), probability: 1.0 },
@@ -991,31 +1041,31 @@ impl QuestConfigurations {
                         ],
                     },
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 5,
+                        probability: 37.64767, occupied_edges: 5,
                         all_segment_types: vec![GroupType::Water, GroupType::Village],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Water_2CW_2AV_1AV".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Water_2CW_2AV_2AV_Watermill".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Water_2CW_2AV_2AV_Watermill".into(), probability: 0.0 },
                         ],
                     },
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 5,
+                        probability: 37.64767, occupied_edges: 5,
                         all_segment_types: vec![GroupType::Water, GroupType::Forest, GroupType::Agriculture],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Water_2CW_2AF_1AA".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Water_2CW_2AF_1AA_Watermill".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Water_2CW_2AF_1AA_Watermill".into(), probability: 0.0 },
                         ],
                     },
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 5,
+                        probability: 37.64767, occupied_edges: 5,
                         all_segment_types: vec![GroupType::Water, GroupType::Agriculture, GroupType::Village],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Water_2CW_2AA_1AV".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Water_2CW_2AA_1AV_Watermill".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Water_2CW_2AA_1AV_Watermill".into(), probability: 0.0 },
                         ],
                     },
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 6,
+                        probability: 52.70675, occupied_edges: 6,
                         all_segment_types: vec![GroupType::Water, GroupType::Forest, GroupType::Agriculture],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Water_2CW_2AF_2AA".into(), probability: 1.0 },
@@ -1023,35 +1073,35 @@ impl QuestConfigurations {
                         ],
                     },
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 6,
+                        probability: 105.4135, occupied_edges: 6,
                         all_segment_types: vec![GroupType::Water, GroupType::Forest],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Water_3AW_3AF".into(), probability: 1.0 },
                             QuestOption { prefab_name: "QuestTile_Water_3AW_3AF_Beaver".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Water_3AW_3AF_SwanGoose".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Water_3AW_3AF_SwanGoose".into(), probability: 0.0 },
                         ],
                     },
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 6,
+                        probability: 105.4135, occupied_edges: 6,
                         all_segment_types: vec![GroupType::Water, GroupType::Forest],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Water_4AW_2AF".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Water_4AW_2AF_Beaver".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Water_4AW_2AF_SwanGoose".into(), probability: 1.0 },
+                            QuestOption { prefab_name: "QuestTile_Water_4AW_2AF_Beaver".into(), probability: 0.0 },
+                            QuestOption { prefab_name: "QuestTile_Water_4AW_2AF_SwanGoose".into(), probability: 0.0 },
                         ],
                     },
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 6,
+                        probability: 263.5337, occupied_edges: 6,
                         all_segment_types: vec![GroupType::Water],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_Water_6AW".into(), probability: 1.0 },
                             QuestOption { prefab_name: "QuestTile_Water_6AW_Boat".into(), probability: 1.0 },
                             QuestOption { prefab_name: "QuestTile_Water_6AW_Beaver".into(), probability: 1.0 },
-                            QuestOption { prefab_name: "QuestTile_Water_6AW_Ruin".into(), probability: 0.5 },
+                            QuestOption { prefab_name: "QuestTile_Water_6AW_Ruin".into(), probability: 0.0 },
                         ],
                     },
                     QuestSubCollection {
-                        probability: 1.0, occupied_edges: 12,
+                        probability: 0.0, occupied_edges: 12,
                         all_segment_types: vec![GroupType::Water, GroupType::TrainTracks],
                         quest_tiles: vec![
                             QuestOption { prefab_name: "QuestTile_WaterTrainStation_6AW_6AT".into(), probability: 1.0 },

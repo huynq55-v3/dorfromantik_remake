@@ -80,7 +80,7 @@ impl Board {
         for group in self.groups.values() {
             if group.group_type == group_type && !group.is_closed {
                 let count = match group_type {
-                    GroupType::Forest | GroupType::Village => group.total_element_count,
+                    GroupType::Forest | GroupType::Village | GroupType::Agriculture => group.total_element_count,
                     _ => group.total_segment_count,
                 };
                 if count > max_count {
@@ -348,12 +348,12 @@ impl Board {
             .count() as i32
     }
 
-    /// Trả về con số target còn lại hiện tại của ô Quest (target_count - external_count)
+    /// Trả về con số target còn lại hiện tại của ô Quest (remaining_display_value - external_count)
     pub fn get_quest_remaining_target(&self, pos: (i32, i32)) -> usize {
         if let Some(pt) = self.placed_tiles.get(&pos) {
             if let GeneratedTile::Quest { quest_data, .. } = &pt.tile {
                 let external_count = self.get_quest_external_count(pos, quest_data.primary_group_type());
-                return quest_data.target_count.saturating_sub(external_count);
+                return quest_data.remaining_display_value().saturating_sub(external_count);
             }
         }
         0
@@ -371,7 +371,7 @@ impl Board {
             let (target_count, equality, group_type) = {
                 let pt = &self.placed_tiles[&pos];
                 if let GeneratedTile::Quest { quest_data, .. } = &pt.tile {
-                    (quest_data.target_count, quest_data.equality, quest_data.primary_group_type())
+                    (quest_data.remaining_display_value(), quest_data.equality, quest_data.primary_group_type())
                 } else {
                     continue;
                 }
@@ -434,7 +434,7 @@ impl Board {
             let (target_count, equality, group_type) = {
                 let pt = &self.placed_tiles[&pos];
                 if let GeneratedTile::Quest { quest_data, .. } = &pt.tile {
-                    (quest_data.target_count, quest_data.equality, quest_data.primary_group_type())
+                    (quest_data.remaining_display_value(), quest_data.equality, quest_data.primary_group_type())
                 } else {
                     continue;
                 }
@@ -507,7 +507,7 @@ impl Board {
 
         // Thêm tính toán preview cho chính ô hover_tile (nếu hover_tile bản thân nó là 1 ô Quest)
         if let GeneratedTile::Quest { quest_data, .. } = hover_tile {
-            let target_count = quest_data.target_count;
+            let target_count = quest_data.remaining_display_value();
             let equality = quest_data.equality;
             let group_type = quest_data.primary_group_type();
 
@@ -527,7 +527,7 @@ impl Board {
                                     connected_gids.insert(gid);
                                     if let Some(group) = self.groups.get(&gid) {
                                         let count = match group_type {
-                                            GroupType::Forest | GroupType::Village => group.total_element_count,
+                                            GroupType::Forest | GroupType::Village | GroupType::Agriculture => group.total_element_count,
                                             _ => group.total_segment_count,
                                         };
                                         simulated_external += count;
@@ -536,7 +536,7 @@ impl Board {
                             } else {
                                 // Hàng xóm đơn lẻ chưa có group ID
                                 let count = match group_type {
-                                    GroupType::Forest | GroupType::Village => self.get_tile_element_count(&neighbor.tile, group_type),
+                                    GroupType::Forest | GroupType::Village | GroupType::Agriculture => self.get_tile_element_count(&neighbor.tile, group_type),
                                     _ => 1,
                                 };
                                 simulated_external += count;
