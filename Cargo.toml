@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+macroquad = "0.4"
 
 [[bin]]
 name = "check"
@@ -12,4 +13,8 @@ path = "bin/check.rs"
 [[bin]]
 name = "gen_preview"
 path = "bin/gen_preview.rs"
+
+[[bin]]
+name = "simulator"
+path = "bin/simulator.rs"
 

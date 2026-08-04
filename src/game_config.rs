@@ -25,12 +25,45 @@ pub struct GlobalGroupTypeConfiguration {
 
 impl GlobalGroupTypeConfiguration {
     pub fn default_table() -> Self {
+        Self::new(10.0, 10.0, 10.0, 5.0, 7.0)
+    }
+
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Self {
+        let mut village_prob = 10.0;
+        let mut forest_prob = 10.0;
+        let mut agri_prob = 10.0;
+        let mut train_prob = 5.0;
+        let mut water_prob = 7.0;
+
+        if let Ok(content) = fs::read_to_string(path) {
+            for line in content.lines() {
+                if let Some((key, val)) = line.split_once('=') {
+                    let key = key.trim();
+                    let val = val.trim();
+                    if let Ok(num) = val.parse::<f32>() {
+                        match key {
+                            "ACTIVE_VillageProbability" => village_prob = num,
+                            "ACTIVE_ForestProbability" => forest_prob = num,
+                            "ACTIVE_AgricultureProbability" => agri_prob = num,
+                            "ACTIVE_TrainTrackProbability" => train_prob = num,
+                            "ACTIVE_WaterProbability" => water_prob = num,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        Self::new(village_prob, forest_prob, agri_prob, train_prob, water_prob)
+    }
+
+    pub fn new(village_prob: f32, forest_prob: f32, agri_prob: f32, train_prob: f32, water_prob: f32) -> Self {
         let raws = vec![
-            (GroupType::Village, 10.0),
-            (GroupType::Forest, 10.0),
-            (GroupType::Agriculture, 10.0),
-            (GroupType::TrainTracks, 5.0),
-            (GroupType::Water, 7.0),
+            (GroupType::Village, village_prob),
+            (GroupType::Forest, forest_prob),
+            (GroupType::Agriculture, agri_prob),
+            (GroupType::TrainTracks, train_prob),
+            (GroupType::Water, water_prob),
         ];
 
         let total: f32 = raws.iter().map(|(_, r)| r).sum();
@@ -38,7 +71,7 @@ impl GlobalGroupTypeConfiguration {
         let global_group_type_probabilities: Vec<GroupTypeConfiguration> = raws
             .into_iter()
             .map(|(gt, raw)| {
-                let prob_in_percent = raw / total;
+                let prob_in_percent = if total > 0.0 { raw / total } else { 0.0 };
                 GroupTypeConfiguration {
                     group_type: gt,
                     raw_probability: raw,
@@ -95,8 +128,17 @@ impl SegmentPresetConfigurations {
         list.iter().find(|g| g.group_type == gt).map(|g| g.probability_in_percent).unwrap_or(0.0)
     }
 
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Self {
+        let global = GlobalGroupTypeConfiguration::from_file(path);
+        Self::with_global(global)
+    }
+
     pub fn default() -> Self {
         let global = GlobalGroupTypeConfiguration::default_table();
+        Self::with_global(global)
+    }
+
+    pub fn with_global(global: GlobalGroupTypeConfiguration) -> Self {
         let global_pcts: Vec<(GroupType, f32)> = global.global_group_type_probabilities.iter()
             .map(|g| (g.group_type, g.probability_in_percent)).collect();
 
@@ -495,6 +537,133 @@ pub struct QuestOption {
     pub prefab_name: String,
     pub probability: f32,
 }
+
+/// Bảng tra cứu minTargetCount đã dump từ BepInEx trên Unity Game
+pub fn get_quest_prefab_min_target_count(prefab_name: &str) -> usize {
+    let clean = prefab_name.trim_start_matches("QuestTile_").trim_end_matches("(Clone)");
+    match clean {
+        "Village_6AV" => 7,
+        "Village_6AV_Tower" | "Village_6AV_Fountain" => 6,
+        "Village_4BV_1AF_1AF_Tower" | "Village_4BV_1AF_1AF_Fountain" 
+        | "Village_4BV_1AF_1AF" | "Village_4BV_1AF_1AF_Fox"
+        | "Village_5AV_1AF" | "Village_5AV_1AF_Fox" => 5,
+        _ => 0,
+    }
+}
+
+/// Trả về số lượng object nhỏ (house, tree, field, river, traintrack) từ config2.txt cho (GroupType, SegmentType)
+pub fn get_segment_element_count(group_type: GroupType, segment_type: SegmentType) -> usize {
+    match group_type {
+        GroupType::Village => match segment_type {
+            SegmentType::ST1A => 1,
+            SegmentType::ST2A => 2,
+            SegmentType::ST2B | SegmentType::ST2C | SegmentType::ST3A => 3,
+            SegmentType::ST3B | SegmentType::ST3C | SegmentType::ST3D => 4,
+            SegmentType::ST4A | SegmentType::ST4B | SegmentType::ST4C => 5,
+            SegmentType::ST5A | SegmentType::ST6A => 7,
+        },
+        GroupType::Forest => match segment_type {
+            SegmentType::ST1A => 4,
+            SegmentType::ST2A => 10,
+            SegmentType::ST2B => 15,
+            SegmentType::ST2C | SegmentType::ST3A => 17,
+            SegmentType::ST3B | SegmentType::ST3C | SegmentType::ST3D => 20,
+            SegmentType::ST4A => 21,
+            SegmentType::ST4B | SegmentType::ST4C => 24,
+            SegmentType::ST5A => 29,
+            SegmentType::ST6A => 33,
+        },
+        GroupType::Agriculture => match segment_type {
+            SegmentType::ST1A | SegmentType::ST2A | SegmentType::ST3A => 1,
+            SegmentType::ST2B | SegmentType::ST2C | SegmentType::ST3B | SegmentType::ST3C 
+            | SegmentType::ST4A | SegmentType::ST4B | SegmentType::ST5A => 2,
+            SegmentType::ST3D | SegmentType::ST4C | SegmentType::ST6A => 3,
+        },
+        GroupType::TrainTracks | GroupType::Water => 1,
+    }
+}
+
+/// Đường cong xác suất mô phỏng 1:1 theo class AnimationCurve trong Unity C# (Dorfromantik2.cs)
+#[derive(Debug, Clone)]
+pub struct AnimationCurve {
+    pub time_start: f32,
+    pub value_start: f32,
+    pub time_end: f32,
+    pub value_end: f32,
+}
+
+impl AnimationCurve {
+    pub fn linear(time_start: f32, value_start: f32, time_end: f32, value_end: f32) -> Self {
+        Self {
+            time_start,
+            value_start,
+            time_end,
+            value_end,
+        }
+    }
+
+    pub fn evaluate(&self, time: f32) -> f32 {
+        if time <= self.time_start {
+            self.value_start
+        } else if time >= self.time_end {
+            self.value_end
+        } else {
+            let t = (time - self.time_start) / (self.time_end - self.time_start);
+            self.value_start + t * (self.value_end - self.value_start)
+        }
+    }
+}
+
+/// Lựa chọn nhiệm vụ ngẫu nhiên theo trọng số SelectWeightedRandom (Dorfromantik2.cs dòng 24448)
+pub fn select_random_quest(
+    _prefab_name: &str,
+    group_type: GroupType,
+    quest_seed: i32,
+    level: usize,
+) -> (crate::tile::EqualityComparison, usize) {
+    let mut rng = crate::unity_random::UnityRandom::init_state(quest_seed);
+
+    // C# Candidate 1: Quest MoreThan (+) - AnimationCurve mặc định (weight=1.0)
+    let c1_equality = crate::tile::EqualityComparison::MoreThan;
+    let c1_val = match group_type {
+        GroupType::Forest => 5,      // ForestQuest_01_Elements_MoreThan
+        GroupType::Agriculture => 3, // FieldQuest_01_Elements_MoreThan
+        GroupType::Village => 3,     // VillageQuest_01_Elements_MoreThan
+        GroupType::TrainTracks => 3, // TrainQuest_01_Segments_MoreThan
+        GroupType::Water => 2,       // WaterQuest_01_Segments_MoreThan
+    };
+    let c1_curve = AnimationCurve::linear(0.0, 1.0, 50.0, 1.0);
+
+    // C# Candidate 2: Quest Exactly (=) - AnimationCurve.Linear(0, 0.1, 50, 0.5)
+    let c2_equality = crate::tile::EqualityComparison::Exactly;
+    let c2_val = match group_type {
+        GroupType::Forest => 4,      // ForestQuest_02_Elements_Exactly
+        GroupType::Agriculture => 3, // FieldQuest_02_Elements_Exactly
+        GroupType::Village => 2,     // VillageQuest_02_Elements_Exactly
+        GroupType::TrainTracks => 3, // TrainQuest_02_Segments_Exactly
+        GroupType::Water => 2,       // WaterQuest_02_Segments_Exactly
+    };
+    let c2_curve = AnimationCurve::linear(0.0, 0.1, 50.0, 0.5);
+
+    let level_f = level as f32;
+    let w1 = c1_curve.evaluate(level_f);
+    let w2 = c2_curve.evaluate(level_f);
+    let total_weight = w1 + w2;
+
+    let roll_val = rng.value() * total_weight;
+    if roll_val < w1 {
+        (c1_equality, c1_val)
+    } else {
+        (c2_equality, c2_val)
+    }
+}
+
+/// Trả về (EqualityComparison, condition.targetValue) theo chuẩn C# SelectRandomQuest (Dorfromantik2.cs dòng 24448)
+pub fn get_quest_prefab_condition_target_value(prefab_name: &str, group_type: GroupType, quest_seed: i32) -> (crate::tile::EqualityComparison, usize) {
+    select_random_quest(prefab_name, group_type, quest_seed, 0)
+}
+
+
 
 #[derive(Debug, Clone)]
 pub struct QuestSubCollection {

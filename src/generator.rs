@@ -120,10 +120,23 @@ impl TileGenerator {
             .unwrap_or_else(|| (selected_sub.quest_tiles[0].clone(), 0.0, 0.0, 0.0));
         println!("  [Roll 3: Option] Prob Ratio: {:.8}, Total Prob: {}, Roll Val: {:.4}, Chosen Prefab: '{}'\n", opt_ratio, opt_total, opt_roll, selected_opt.prefab_name);
 
+        let min_target_count = crate::game_config::get_quest_prefab_min_target_count(&selected_opt.prefab_name);
+        let temp_quest = QuestTileData {
+            seed: quest_seed,
+            quest_type: selected_opt.prefab_name.clone(),
+            target_count: 0,
+            equality: crate::tile::EqualityComparison::MoreThan,
+        };
+        let gt = temp_quest.primary_group_type();
+        let (equality, condition_target_val) = crate::game_config::get_quest_prefab_condition_target_value(&selected_opt.prefab_name, gt, quest_seed);
+        let quest_manager = crate::quest_manager::QuestManager::new();
+        let target_count = quest_manager.calculate_target_value(&temp_quest, min_target_count, condition_target_val);
+
         QuestTileData {
             seed: quest_seed,
             quest_type: selected_opt.prefab_name,
-            target_count: 10,
+            target_count,
+            equality,
         }
     }
 
@@ -138,9 +151,12 @@ impl TileGenerator {
             self.generate_base_tile(-1, "Stacked Tile")
         });
 
+        let before_tile_count = self.generated_tile_count;
+        let before_quest_count = self.generated_quest_count;
+
         // Dòng 43168 C#: Tính num (Tile Seed) TRƯỚC KHI tăng generatedTileCount
         let num = self.tile_generation_seed
-            .wrapping_add((self.generated_tile_count - self.generated_quest_count).wrapping_mul(self.tile_seed_increment_step));
+            .wrapping_add((before_tile_count - before_quest_count).wrapping_mul(self.tile_seed_increment_step));
         
         // Dòng 43169 C#: generatedTileCount++
         self.generated_tile_count += 1;
@@ -154,31 +170,37 @@ impl TileGenerator {
             TileGenFilter::None
         };
 
-        println!("Generated Tile Count: {}, Generated Quest Count: {}, Tile Seed: {}", self.generated_tile_count, self.generated_quest_count, num);
+        println!("\n================================----------------------------------");
+        println!("[TILE GENERATION LOG] Tile #{}", self.generated_tile_count);
+        println!("  - Generated Tile Count (Before): {}", before_tile_count);
+        println!("  - Generated Quest Count (Before): {}", before_quest_count);
+        println!("  - Active Quest Count (Board): {}", active_quest_count);
+        println!("  - Tile Seed (num): {}", num);
         println!("Tile Generation Seed: {}, Tile Seed Increment Step: {}", self.tile_generation_seed, self.tile_seed_increment_step);
 
-        // Dòng 43172 C#: Random.InitState dùng generatedTileCount SAU KHI TĂNG!
         let seed_quest_check = self.tile_generation_seed
             .wrapping_add(self.generated_tile_count.wrapping_mul(self.tile_seed_increment_step));
-
         println!("Seed Quest Check: {}", seed_quest_check);
 
         let mut rng_quest = UnityRandom::init_state(seed_quest_check);
         let quest_roll = rng_quest.value();
-
-        println!("Quest Roll: {}, Active Quest Count: {}", quest_roll, active_quest_count);
-
         let quest_prob = overwrite_quest_prob.unwrap_or_else(|| self.quest_tile_probability(active_quest_count));
 
-        if quest_roll <= quest_prob {
+        let is_quest = quest_roll <= quest_prob;
+        println!("  - Quest Roll: {:.8} | Threshold (Prob): {:.8}", quest_roll, quest_prob);
+        println!("  ==> DECISION ROLL: {}", if is_quest { "QUEST TILE" } else { "NORMAL TILE" });
+
+        if is_quest {
             // Dòng 43176 C#: Tính num2 (Quest Seed) dùng generatedQuestCount TRƯỚC KHI TĂNG
             let num2 = self.tile_generation_seed
-                .wrapping_add(self.generated_quest_count.wrapping_mul(self.tile_seed_increment_step));
+                .wrapping_add(before_quest_count.wrapping_mul(self.tile_seed_increment_step));
             
             // Dòng 43178 C#: GeneratedQuestCount++
             self.generated_quest_count += 1;
 
             let quest_data = self.generate_quest_tile(num2, used_filter);
+            println!("  ==> ACTUAL RETURNED QUEST TILE: '{}'", quest_data.quest_type);
+            println!("================================----------------------------------\n");
 
             return GeneratedTile::Quest {
                 base_tile,
@@ -200,6 +222,8 @@ impl TileGenerator {
         let selected_preset = rng_tile
             .select_weighted(&preset_options)
             .unwrap_or_else(|| tile_configs.all_tiles_flat[0].clone());
+
+        println!("  ==> ACTUAL RETURNED TILE OBJECT: '{}'", selected_preset.name);
 
         let mut segments = Vec::new();
 
@@ -227,7 +251,7 @@ impl TileGenerator {
                 GroupType::Agriculture
             };
 
-            let edges = vec![rotation % 6];
+            let edges: Vec<usize> = seg_type.base_edges().iter().map(|&b| (b + rotation) % 6).collect();
 
             segments.push(SegmentData {
                 index: segments.len(),
@@ -237,6 +261,12 @@ impl TileGenerator {
                 rotation,
             });
         }
+
+        println!("      [NORMAL TILE DETAILS] Total Segments: {}", segments.len());
+        for (idx, seg) in segments.iter().enumerate() {
+            println!("        - Segment #{}: GroupType = {:?}, SegmentType = {:?}", idx, seg.group_type, seg.segment_type);
+        }
+        println!("================================----------------------------------\n");
 
         GeneratedTile::Normal {
             base_tile,

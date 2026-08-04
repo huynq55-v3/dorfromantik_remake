@@ -188,10 +188,18 @@ fn main() {
     }
 
     // ── 3. Thống kê ──
-    println!("\n─── 3. Thống kê ───");
-    println!("  Collections: {}", tile_config.all_tile_presets.len());
-    println!("  Segment collections: {}", seg_config.segment_preset_collections.len());
-    println!("  Tiles: {}", REF_TILES.len());
+    println!("\n─── 4. Test generate_quest_tile với Seed -2093096630 ───");
+    let mut gen = dorfromantik_remake::generator::TileGenerator::new(-2093096630);
+    let quest_tile = gen.generate_quest_tile(-2093096630, dorfromantik_remake::generator::TileGenFilter::AtLeastTwoEmptyEdges);
+    println!("-> Result Prefab: '{}'", quest_tile.quest_type);
+
+    println!("\n─── 5. Test Chuỗi Cấu Hình Thẻ Tile (Giống Text Vàng C# Plugin) ───");
+    let mut gen2 = dorfromantik_remake::generator::TileGenerator::new(-2093096630);
+    for i in 1..=10 {
+        let tile = gen2.generate_tile(None, 0, None);
+        println!("Tile #{:02} | ID: {} | Code Chữ Vàng: '{}' | (Tile Name: {})",
+            i, tile.base_tile().id, tile.tile_preset_string(), tile.base_tile().name);
+    }
     let tile_total: f64 = tile_config.all_tiles_flat.iter().map(|t| t.final_probability as f64).sum();
     println!("  Tổng final_probability: {:.8} (kỳ vọng ≈ 1.0)", tile_total);
     println!();
