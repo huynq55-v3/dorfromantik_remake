@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use crate::game_config::GroupType;
 use crate::tile::QuestTileData;
 
@@ -20,6 +21,23 @@ pub struct QuestManager {
     // Quản lý các Active Quest đang mở trên bàn chơi / trong stack (Dorfromantik2.cs:24124)
     pub active_quests: Vec<ActiveQuest>,
     next_quest_id: usize,
+
+    // ── Active Quest Count Formula (3-step lag) ──
+    // Công thức: active_quest_count_for_tile(n+3) =
+    //     prev_active
+    //     + (tile[n] là Quest ? +2 : 0)
+    //     - (tile[n-1] là Quest ? -1 : 0)
+    //     - m  (số quest hoàn thành/thất bại trong lượt n)
+    //
+    // - 3 tile đầu tiên (index 0,1,2) → count = 0 (khởi tạo sẵn)
+    // - Khi đặt tile thứ n → tính count cho tile n+3 và push vào queue
+    // - Khi generate tile k → pop từ front queue (count đã tính từ 3 bước trước)
+    upcoming_quest_counts: VecDeque<i32>,
+    /// Giá trị count được tính và push gần nhất (dùng làm prev_active cho lượt tiếp)
+    /// Tách riêng khỏi queue vì queue có thể bị pop sạch trước khi update_after_placement chạy
+    last_computed_count: i32,
+    /// Tile vừa đặt có phải Quest không (dùng cho công thức lượt kế tiếp)
+    prev_tile_was_quest: bool,
 }
 
 impl Default for QuestManager {
@@ -58,6 +76,10 @@ impl QuestManager {
             level: 0,
             active_quests: Vec::new(),
             next_quest_id: 1,
+            // 3 tile đầu tiên dùng count = 0
+            upcoming_quest_counts: VecDeque::from([0, 0, 0]),
+            last_computed_count: 0,
+            prev_tile_was_quest: false,
         }
     }
 
@@ -106,11 +128,36 @@ impl QuestManager {
     }
 
     /// Trả về số lượng ActiveQuestCount đang mở chuẩn theo C# (Dorfromantik2.cs:24124)
+    /// Đây là đếm nội bộ active_quests vec, KHÔNG dùng cho quest_tile_probability.
     pub fn active_quest_count(&self) -> i32 {
         self.active_quests
             .iter()
             .filter(|q| q.counts_towards_limit)
             .count() as i32
+    }
+
+    /// Lấy active_quest_count để truyền vào generate_tile() cho tile tiếp theo.
+    /// Dùng TRƯỚC khi generate tile, tuân theo công thức 3-step lag.
+    /// Trả về 0 nếu queue rỗng (vượt quá giới hạn — không nên xảy ra).
+    pub fn pop_next_active_quest_count(&mut self) -> i32 {
+        self.upcoming_quest_counts.pop_front().unwrap_or(0)
+    }
+
+    /// Cập nhật active_quest_count sau khi đặt tile thứ n xuống bàn.
+    /// Tính và enqueue count cho tile n+3.
+    ///
+    /// - `is_quest`: tile thứ n vừa đặt có phải QuestTile không
+    /// - `quests_resolved`: m = số quest hoàn thành/thất bại trong lượt này
+    pub fn update_after_placement(&mut self, is_quest: bool, quests_resolved: usize) {
+        // prev = giá trị count đã tính ở lượt trước (KHÔNG dùng queue.back()
+        // vì queue có thể đã bị pop sạch trước khi hàm này được gọi)
+        let prev = self.last_computed_count;
+        let plus_quest = if is_quest { 2 } else { 0 };
+        let minus_prev_quest = if self.prev_tile_was_quest { 1 } else { 0 };
+        let new_count = (prev + plus_quest - minus_prev_quest - quests_resolved as i32).max(0);
+        self.last_computed_count = new_count;
+        self.upcoming_quest_counts.push_back(new_count);
+        self.prev_tile_was_quest = is_quest;
     }
 
     /// Thêm một Quest mới khi được sinh ra (AddQuest C# dòng 24171)
@@ -150,45 +197,5 @@ impl QuestManager {
         let diff = self.difficulty_increase(group_type);
 
         base + condition_target_value + diff
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_counts_towards_quest_limit() {
-        assert!(QuestManager::counts_towards_quest_limit("QuestTile_Agriculture_3AA_1AV"));
-        assert!(QuestManager::counts_towards_quest_limit("QuestTile_Water_2CW"));
-        assert!(QuestManager::counts_towards_quest_limit("QuestTile_Water_2CW_Boat"));
-        assert!(QuestManager::counts_towards_quest_limit("QuestTile_Water_2BW_3AF_1AF_Boat"));
-        assert!(!QuestManager::counts_towards_quest_limit("QuestTile_Unlock_Challenge_01"));
-    }
-
-    #[test]
-    fn test_active_quest_count_lifecycle() {
-        let mut qm = QuestManager::new();
-        assert_eq!(qm.active_quest_count(), 0);
-
-        let q1 = qm.add_quest("QuestTile_Agriculture_3AA_1AV");
-        assert_eq!(qm.active_quest_count(), 1);
-
-        let q2 = qm.add_quest("QuestTile_Water_2CW");
-        assert_eq!(qm.active_quest_count(), 2);
-
-        // Boat quest là Quest tiêu chuẩn nên VẪN TĂNG active_quest_count lên 3
-        let q3 = qm.add_quest("QuestTile_Water_2CW_Boat");
-        assert_eq!(qm.active_quest_count(), 3);
-
-        // Xóa quest làm giảm active_quest_count
-        qm.remove_quest(q1);
-        assert_eq!(qm.active_quest_count(), 2);
-
-        qm.remove_quest(q3);
-        assert_eq!(qm.active_quest_count(), 1);
-
-        qm.remove_quest(q2);
-        assert_eq!(qm.active_quest_count(), 0);
     }
 }

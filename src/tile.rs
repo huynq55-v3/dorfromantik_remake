@@ -262,15 +262,15 @@ impl QuestTileData {
     /// Xác định GroupType chính của Nhiệm vụ
     pub fn primary_group_type(&self) -> GroupType {
         let name = self.quest_type.to_lowercase();
-        if name.contains("village") || name.contains("house") {
+        if name.contains("village") {
             GroupType::Village
-        } else if name.contains("forest") || name.contains("tree") {
+        } else if name.contains("forest") {
             GroupType::Forest
-        } else if name.contains("agriculture") || name.contains("field") || name.contains("windmill") || name.contains("granary") {
+        } else if name.contains("agriculture") {
             GroupType::Agriculture
-        } else if name.contains("water") || name.contains("river") || name.contains("boat") {
+        } else if name.contains("water") {
             GroupType::Water
-        } else if name.contains("train") || name.contains("rail") || name.contains("station") {
+        } else if name.contains("train") {
             GroupType::TrainTracks
         } else {
             let cfg = self.config_string();

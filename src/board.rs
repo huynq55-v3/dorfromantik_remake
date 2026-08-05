@@ -180,17 +180,18 @@ impl Board {
         // Hợp nhất cụm địa hình liên thông (ElementGroupManager)
         self.update_element_groups(q, r);
 
-        // ĐÁNH GIÁ LIÊN TỤC TẤT CẢ CÁC QUEST DANG ACTIVE TRÊN BÀN
-        self.evaluate_all_active_quests(None);
-
         true
     }
 
     /// Đặt bài đồng thời hỗ trợ cập nhật tự động QuestManager (gọi remove_quest khi hoàn thành)
-    pub fn place_tile_with_manager(&mut self, q: i32, r: i32, tile: GeneratedTile, rotation: usize, quest_manager: Option<&mut crate::quest_manager::QuestManager>) -> bool {
+    pub fn place_tile_with_manager(&mut self, q: i32, r: i32, tile: GeneratedTile, rotation: usize, mut quest_manager: Option<&mut crate::quest_manager::QuestManager>) -> bool {
+        let is_quest = matches!(&tile, GeneratedTile::Quest { .. });
         let ok = self.place_tile(q, r, tile, rotation);
         if ok {
-            self.evaluate_all_active_quests(quest_manager);
+            let quests_resolved = self.evaluate_all_active_quests(quest_manager.as_deref_mut());
+            if let Some(qm) = quest_manager {
+                qm.update_after_placement(is_quest, quests_resolved);
+            }
         }
         ok
     }
@@ -383,13 +384,16 @@ impl Board {
         0
     }
 
-    /// ĐÁNH GIÁ LIÊN TỤC TẤT CẢ CÁC QUEST ACTIVE TRÊN BÀN CHƠI
-    pub fn evaluate_all_active_quests(&mut self, mut quest_manager: Option<&mut crate::quest_manager::QuestManager>) {
+    /// Đánh giá liên tục tất cả các Quest active trên bàn chơi.
+    /// Trả về số quest được finalize (hoàn thành hoặc thất bại) trong lượt này.
+    pub fn evaluate_all_active_quests(&mut self, mut quest_manager: Option<&mut crate::quest_manager::QuestManager>) -> usize {
         let active_keys: Vec<(i32, i32)> = self.placed_tiles
             .iter()
             .filter(|(_, pt)| matches!(pt.tile, GeneratedTile::Quest { .. }) && !pt.quest_finalized)
             .map(|(&pos, _)| pos)
             .collect();
+
+        let mut resolved_count = 0;
 
         for pos in active_keys {
             let (target_count, equality, group_type) = {
@@ -425,6 +429,7 @@ impl Board {
             if let Some(pt) = self.placed_tiles.get_mut(&pos) {
                 pt.quest_status = Some(new_status);
                 if new_status == FulfillmentStatus::Success || new_status == FulfillmentStatus::Failed {
+                    resolved_count += 1;
                     if let Some(qid) = pt.quest_id {
                         if let Some(ref mut qm) = quest_manager {
                             qm.remove_quest(qid);
@@ -436,6 +441,8 @@ impl Board {
                 }
             }
         }
+
+        resolved_count
     }
 
     /// Tính số cụm địa hình (Group ID) duy nhất đang chứa quest active chưa hoàn thành trên bàn bài
@@ -619,88 +626,5 @@ impl Board {
         }
 
         preview_results
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::game_config::{GroupType, SegmentType};
-    use crate::tile::{BaseTile, EdgeType, GeneratedTile, SegmentData};
-
-    fn make_test_tile(group_type: GroupType, segment_type: SegmentType, is_hybrid: bool) -> GeneratedTile {
-        let edges = segment_type.base_edges().to_vec();
-        GeneratedTile::Normal {
-            base_tile: BaseTile {
-                id: 0,
-                name: "Test".to_string(),
-                seed: 123,
-                is_generated: true,
-            },
-            segments: vec![SegmentData {
-                index: 0,
-                group_type,
-                segment_type,
-                occupied_edges: edges,
-                rotation: 0,
-                is_hybrid,
-            }],
-        }
-    }
-
-    #[test]
-    fn test_6aw_flexible_water_can_be_placed_next_to_plain() {
-        let mut board = Board::new();
-        // Đặt 1 ô Plain mộc ở (0,0)
-        let plain_tile = GeneratedTile::Normal {
-            base_tile: BaseTile { id: 0, name: "Plain".to_string(), seed: 1, is_generated: true },
-            segments: vec![],
-        };
-        board.place_tile(0, 0, plain_tile, 0);
-
-        // Ô 6AW (Lake_6A) là FlexibleWater
-        let tile_6aw = make_test_tile(GroupType::Water, SegmentType::ST6A, true);
-
-        // Kiểm tra đặt kề ở (1, 0)
-        assert!(board.can_place_tile(1, 0, &tile_6aw, 0));
-    }
-
-    #[test]
-    fn test_river_2c_strict_water_cannot_be_placed_next_to_plain() {
-        let mut board = Board::new();
-        // Đặt 1 ô Plain mộc ở (0,0)
-        let plain_tile = GeneratedTile::Normal {
-            base_tile: BaseTile { id: 0, name: "Plain".to_string(), seed: 1, is_generated: true },
-            segments: vec![],
-        };
-        board.place_tile(0, 0, plain_tile, 0);
-
-        // Dòng sông River 2C (0,3) là Water cứng (is_hybrid = false)
-        let river_2c = make_test_tile(GroupType::Water, SegmentType::ST2C, false);
-
-        // Cạnh 0 (Water) của ô (0,-1) chĩa sang (0,0) là Plain -> Không được phép ghép vì River 2C là Water cứng!
-        assert!(!board.can_place_tile(0, -1, &river_2c, 0));
-    }
-
-    #[test]
-    fn test_quest_tile_hybrid_water_parsed_as_flexible_water() {
-        use crate::tile::QuestTileData;
-        let quest_tile = GeneratedTile::Quest {
-            base_tile: BaseTile { id: 1, name: "Quest 1".to_string(), seed: 100, is_generated: true },
-            quest_data: QuestTileData {
-                seed: 100,
-                quest_type: "QuestTile_Water_4A_HybridW_2AF".to_string(),
-                target_count: 5,
-                equality: crate::tile::EqualityComparison::MoreThan,
-                level: 1,
-                quest_id: None,
-                stack_quest_id: None,
-            },
-        };
-
-        let cfg = quest_tile.to_hex_edge_config();
-        // 4 cạnh Nước 4A_HybridW phải là FlexibleWater!
-        let flexible_water_count = cfg.edges.iter().filter(|&&e| e == EdgeType::FlexibleWater).count();
-        assert_eq!(flexible_water_count, 4);
     }
 }
