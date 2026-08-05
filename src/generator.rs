@@ -1,4 +1,4 @@
-use crate::game_config::{GroupType, QuestConfigurations, SegmentPresetConfigurations, TilePresetConfigurations};
+use crate::game_config::{GroupType, QuestConfigurations, SegmentPresetConfigurations, SegmentType, TilePresetConfigurations};
 use crate::tile::{BaseTile, GeneratedTile, QuestTileData, SegmentData};
 use crate::unity_random::UnityRandom;
 
@@ -104,7 +104,7 @@ impl TileGenerator {
             .iter()
             .map(|s| (s.clone(), s.probability))
             .collect();
-        let (selected_sub, sub_roll, sub_ratio, sub_total) = rng
+        let (selected_sub, sub_roll, _sub_ratio, sub_total) = rng
             .select_weighted_info(&sub_options)
             .unwrap_or_else(|| (filtered_sub_cols[0].clone(), 0.0, 0.0, 0.0));
         let sub_coll_prob = if col_total == 0.0 || sub_total == 0.0 { 0.0 } else { (selected_sub.probability / sub_total) * col_ratio };
@@ -129,6 +129,8 @@ impl TileGenerator {
             target_count: 0,
             equality,
             level: 0,
+            quest_id: None,
+            stack_quest_id: None,
         }
     }
 
@@ -300,8 +302,20 @@ impl TileGenerator {
                 GroupType::Agriculture
             };
 
-            // Dòng 43262 C#: Unity luôn gọi Random.value để kiểm tra hybrid variant cho mỗi segment
-            let _value2 = rng_tile.value();
+            // Dòng 43262 C#: Unity gọi Random.value để kiểm tra hybrid variant cho mỗi segment
+            let value2 = rng_tile.value();
+            let is_hybrid = if group_type == GroupType::Water {
+                match seg_type {
+                    SegmentType::ST6A => true,
+                    SegmentType::ST2A => value2 <= 0.5,
+                    SegmentType::ST3A => value2 <= 0.9,
+                    SegmentType::ST4A => value2 <= 0.9,
+                    SegmentType::ST5A => value2 <= 0.95,
+                    _ => false,
+                }
+            } else {
+                false
+            };
 
             segments.push(SegmentData {
                 index: segments.len(),
@@ -309,6 +323,7 @@ impl TileGenerator {
                 segment_type: seg_type,
                 occupied_edges: edges,
                 rotation,
+                is_hybrid,
             });
         }
 

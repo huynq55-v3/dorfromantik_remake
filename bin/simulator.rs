@@ -1,6 +1,7 @@
 use macroquad::prelude::*;
 use dorfromantik_remake::board::{Board, FulfillmentStatus};
 use dorfromantik_remake::generator::TileGenerator;
+use dorfromantik_remake::quest_manager::QuestManager;
 use dorfromantik_remake::tile::{EdgeType, GeneratedTile, HexEdgeConfig};
 use std::collections::VecDeque;
 use std::fs;
@@ -21,32 +22,20 @@ impl HexPos {
     }
 
     pub fn to_screen(&self, radius: f32) -> Vec2 {
-        let x = radius * 1.5 * self.q as f32;
-        let y = radius * (3.0_f32.sqrt() / 2.0 * self.q as f32 + 3.0_f32.sqrt() * self.r as f32);
+        let tile_size_x = radius * 2.0;
+        let tile_size_y = radius * 3.0_f32.sqrt();
+        let x = self.q as f32 * tile_size_x * 0.75;
+        let y = -((self.r as f32) - (self.q.abs() % 2) as f32 / 2.0) * tile_size_y;
         Vec2::new(x, y)
     }
 }
 
 pub fn screen_to_hex(world_pos: Vec2, radius: f32) -> HexPos {
-    let q_float = (2.0 / 3.0 * world_pos.x) / radius;
-    let r_float = (-1.0 / 3.0 * world_pos.x + 3.0_f32.sqrt() / 3.0 * world_pos.y) / radius;
-    let s_float = -q_float - r_float;
-
-    let mut q_round = q_float.round();
-    let mut r_round = r_float.round();
-    let s_round = s_float.round();
-
-    let q_diff = (q_round - q_float).abs();
-    let r_diff = (r_round - r_float).abs();
-    let s_diff = (s_round - s_float).abs();
-
-    if q_diff > r_diff && q_diff > s_diff {
-        q_round = -r_round - s_round;
-    } else if r_diff > s_diff {
-        r_round = -q_round - s_round;
-    }
-
-    HexPos::new(q_round as i32, r_round as i32)
+    let tile_size_x = radius * 2.0;
+    let tile_size_y = radius * 3.0_f32.sqrt();
+    let q = (world_pos.x / (tile_size_x * 0.75)).round() as i32;
+    let r = ((-world_pos.y / tile_size_y) + (q.abs() % 2) as f32 / 2.0).round() as i32;
+    HexPos::new(q, r)
 }
 
 fn get_edge_color(edge_type: EdgeType) -> Color {
@@ -54,9 +43,10 @@ fn get_edge_color(edge_type: EdgeType) -> Color {
         EdgeType::Plain => Color::from_rgba(144, 190, 109, 255),        // Meadow Green
         EdgeType::Agriculture => Color::from_rgba(230, 194, 41, 255),  // Wheat Gold
         EdgeType::Forest => Color::from_rgba(45, 106, 79, 255),         // Deep Forest Green
-        EdgeType::Village => Color::from_rgba(217, 4, 41, 255),         // Roof Terracotta
-        EdgeType::Water => Color::from_rgba(0, 119, 182, 255),          // Sapphire Blue
+        EdgeType::Village => Color::from_rgba(224, 86, 60, 255),         // Roof Terracotta Warm Red-Orange
+        EdgeType::Water | EdgeType::FlexibleWater => Color::from_rgba(0, 119, 182, 255), // Sapphire Blue
         EdgeType::TrainTracks => Color::from_rgba(74, 78, 105, 255),    // Railway Steel
+        EdgeType::WaterTrainStation => Color::from_rgba(114, 9, 183, 255), // Purple Tower
     }
 }
 
@@ -116,6 +106,7 @@ fn init_active_quest_tile_target(front_tile: &mut GeneratedTile, game_board: &Bo
 async fn main() {
     let seed = load_game_seed();
     let mut generator = TileGenerator::new(seed);
+    let mut quest_manager = QuestManager::new();
     let mut game_board = Board::new();
 
     // Tile Queue buffer maintains 4 tiles ahead
@@ -131,16 +122,25 @@ async fn main() {
     };
     game_board.place_tile(0, 0, initial_tile, 0);
 
-    // 2. Pre-generate top 3 tiles (Tile 1, Tile 2, Tile 3) for the queue buffer at startup
+    // 2. Sinh 3 tile preview ban đầu (Tile #1, #2, #3) với active_count = 0
     for _ in 0..3 {
         let t = generator.generate_tile(None, 0, None);
         tile_queue.push_back(t);
+    }
+
+    // Kích hoạt/Đăng ký QuestWatcher CHỈ cho ô đầu cọc bài (Active Tile ở vị trí topStackPreview)
+    if let Some(front_tile) = tile_queue.front_mut() {
+        if let GeneratedTile::Quest { ref mut quest_data, .. } = front_tile {
+            let qid = quest_manager.add_quest(&quest_data.quest_type);
+            quest_data.quest_id = Some(qid);
+        }
     }
 
     // Camera variables
     let mut camera_pos = Vec2::ZERO;
     let mut zoom: f32 = 1.0;
     let mut last_mouse_pos = mouse_position();
+    let mut total_drag_dist: f32 = 0.0;
 
     loop {
         clear_background(Color::from_rgba(20, 24, 33, 255));
@@ -151,30 +151,49 @@ async fn main() {
         // Active tile in hand is the first tile in queue
         let active_tile_opt = tile_queue.front().cloned();
 
-        // ── 1. Controls ──
+        // ── 1. Controls & Mouse Dragging ──
         let current_mouse_pos = mouse_position();
-        if is_mouse_button_down(MouseButton::Right) {
-            let dx = current_mouse_pos.0 - last_mouse_pos.0;
-            let dy = current_mouse_pos.1 - last_mouse_pos.1;
-            camera_pos.x -= dx / zoom;
-            camera_pos.y -= dy / zoom;
+        let mouse_delta = Vec2::new(current_mouse_pos.0 - last_mouse_pos.0, current_mouse_pos.1 - last_mouse_pos.1);
+
+        if is_mouse_button_pressed(MouseButton::Left) || is_mouse_button_pressed(MouseButton::Right) || is_mouse_button_pressed(MouseButton::Middle) {
+            total_drag_dist = 0.0;
+        }
+
+        if is_mouse_button_down(MouseButton::Left) || is_mouse_button_down(MouseButton::Right) || is_mouse_button_down(MouseButton::Middle) {
+            total_drag_dist += mouse_delta.length();
+            if total_drag_dist > 4.0 {
+                camera_pos.x -= mouse_delta.x / zoom;
+                camera_pos.y -= mouse_delta.y / zoom;
+            }
         }
         last_mouse_pos = current_mouse_pos;
 
-        let speed = 400.0 / zoom;
+        let speed = 500.0 / zoom;
         if is_key_down(KeyCode::W) || is_key_down(KeyCode::Up) { camera_pos.y -= speed * delta; }
         if is_key_down(KeyCode::S) || is_key_down(KeyCode::Down) { camera_pos.y += speed * delta; }
         if is_key_down(KeyCode::A) || is_key_down(KeyCode::Left) { camera_pos.x -= speed * delta; }
         if is_key_down(KeyCode::D) || is_key_down(KeyCode::Right) { camera_pos.x += speed * delta; }
 
+        // Mouse Wheel: Scroll to rotate tile, Ctrl + Scroll to zoom camera
+        let wheel = mouse_wheel().1;
         if is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl) {
-            let wheel = mouse_wheel().1;
-            if wheel > 0.0 { zoom *= 1.1; }
-            if wheel < 0.0 { zoom *= 0.9; }
+            if wheel > 0.0 { zoom *= 1.12; }
+            if wheel < 0.0 { zoom *= 0.88; }
+        } else if wheel != 0.0 {
+            if wheel < 0.0 {
+                current_rotation = (current_rotation + 1) % 6;
+            } else {
+                current_rotation = (current_rotation + 5) % 6;
+            }
         }
-        if is_key_pressed(KeyCode::Equal) || is_key_pressed(KeyCode::Key1) { zoom *= 1.1; }
-        if is_key_pressed(KeyCode::Minus) || is_key_pressed(KeyCode::Key2) { zoom *= 0.9; }
-        zoom = zoom.clamp(0.4, 3.0);
+
+        if is_key_pressed(KeyCode::Equal) || is_key_pressed(KeyCode::Key1) { zoom *= 1.15; }
+        if is_key_pressed(KeyCode::Minus) || is_key_pressed(KeyCode::Key2) { zoom *= 0.85; }
+        if is_key_pressed(KeyCode::C) || is_key_pressed(KeyCode::Home) {
+            camera_pos = Vec2::ZERO;
+            zoom = 1.0;
+        }
+        zoom = zoom.clamp(0.2, 4.0);
 
         // World coordinates & Hovered Hex
         let mouse_vec = Vec2::new(current_mouse_pos.0, current_mouse_pos.1);
@@ -182,30 +201,14 @@ async fn main() {
         let mouse_world = (mouse_vec - center_vec) / zoom + camera_pos;
         let hovered_hex = screen_to_hex(mouse_world, HEX_RADIUS);
 
-        // Smart Rotation: Skip invalid rotations when rotating tile
-        let wheel = mouse_wheel().1;
-        if !(is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl)) {
-            if let Some(ref active_tile) = active_tile_opt {
-                if wheel > 0.0 {
-                    current_rotation = game_board.get_next_valid_rotation(hovered_hex.q, hovered_hex.r, active_tile, current_rotation, true);
-                } else if wheel < 0.0 {
-                    current_rotation = game_board.get_next_valid_rotation(hovered_hex.q, hovered_hex.r, active_tile, current_rotation, false);
-                }
-            }
-        }
-
-        if is_mouse_button_pressed(MouseButton::Middle) || is_key_pressed(KeyCode::R) || is_key_pressed(KeyCode::E) || is_key_pressed(KeyCode::Space) {
-            if let Some(ref active_tile) = active_tile_opt {
-                current_rotation = game_board.get_next_valid_rotation(hovered_hex.q, hovered_hex.r, active_tile, current_rotation, true);
-            }
+        // Rotate tile with RMB Click, Space, R, E, Q or Middle Button
+        let rmb_clicked = is_mouse_button_released(MouseButton::Right) && total_drag_dist <= 6.0;
+        if rmb_clicked || is_mouse_button_pressed(MouseButton::Middle) || is_key_pressed(KeyCode::R) || is_key_pressed(KeyCode::E) || is_key_pressed(KeyCode::Space) {
+            current_rotation = (current_rotation + 1) % 6;
         }
         if is_key_pressed(KeyCode::Q) {
-            if let Some(ref active_tile) = active_tile_opt {
-                current_rotation = game_board.get_next_valid_rotation(hovered_hex.q, hovered_hex.r, active_tile, current_rotation, false);
-            }
+            current_rotation = (current_rotation + 5) % 6;
         }
-
-
 
         // ── 1.5. Render Grid Slots for All Possible Placement Locations ──
         if let Some(ref active_tile) = active_tile_opt {
@@ -228,15 +231,6 @@ async fn main() {
             }
         }
 
-        // Auto-Snap Hover Orientation: Automatically snap current_rotation to a valid orientation when hovering any slot
-        if let Some(ref active_tile) = active_tile_opt {
-            if !game_board.can_place_tile(hovered_hex.q, hovered_hex.r, active_tile, current_rotation) {
-                if let Some(valid_rot) = (0..6).find(|&rot| game_board.can_place_tile(hovered_hex.q, hovered_hex.r, active_tile, rot)) {
-                    current_rotation = valid_rot;
-                }
-            }
-        }
-
         // Validate placement against Board rules (Water MUST connect Water, Train MUST connect Train)
         let can_place = if let Some(ref active_tile) = active_tile_opt {
             game_board.can_place_tile(hovered_hex.q, hovered_hex.r, active_tile, current_rotation)
@@ -255,34 +249,34 @@ async fn main() {
             std::collections::HashMap::new()
         };
 
-        // Active Quest Count Calculation according to exact user formula:
-        let active_on_board = game_board.active_quest_count();
-        let current_is_quest = active_tile_opt.as_ref().map_or(false, |t| matches!(t, GeneratedTile::Quest { .. }));
-        let effective_active_quests = if current_is_quest {
-            active_on_board + 2
-        } else {
-            active_on_board
-        };
-
-        // Click LMB to Place Tile
-        if can_place && is_mouse_button_pressed(MouseButton::Left) {
+        // Click LMB (without dragging) to Place Tile
+        if can_place && is_mouse_button_released(MouseButton::Left) && total_drag_dist <= 6.0 {
             if let Some(active_tile) = active_tile_opt.as_ref() {
-                // Store active quest count calculated for CURRENT tile (Tile #1) to generate Tile #4 (current + 3 ahead)
-                let active_quest_count_for_tile4 = effective_active_quests;
-
-                if game_board.place_tile(hovered_hex.q, hovered_hex.r, active_tile.clone(), current_rotation) {
+                if game_board.place_tile_with_manager(hovered_hex.q, hovered_hex.r, active_tile.clone(), current_rotation, Some(&mut quest_manager)) {
+                    println!("   ===> [TILE PLACED] Tile '{}' placed at GridPos ({}, {}) | Rotation: {} (byPlayer: True)", active_tile.tile_preset_string(), hovered_hex.q, hovered_hex.r, current_rotation);
                     placed_count += 1;
                     score += 10;
 
-                    // Pop placed tile (Tile 1) from queue
+                    // Pop placed tile khỏi cọc bài
                     tile_queue.pop_front();
                     current_rotation = 0;
 
-                    // Generate Tile #4 using active_quest_count_for_tile4 (calculated from Tile 1)
-                    let next_gen = generator.generate_tile(None, active_quest_count_for_tile4, None);
+                    // Kích hoạt QuestWatcher cho ô mới tiến lên vị trí đầu cọc bài (topStackPreview)
+                    if let Some(front_tile) = tile_queue.front_mut() {
+                        if let GeneratedTile::Quest { ref mut quest_data, .. } = front_tile {
+                            if quest_data.quest_id.is_none() {
+                                let qid = quest_manager.add_quest(&quest_data.quest_type);
+                                quest_data.quest_id = Some(qid);
+                            }
+                        }
+                    }
+
+                    // Sinh Tile tiếp theo (Tile N+3) sau khi đặt ô xuống bàn chơi
+                    let active_count = quest_manager.active_quest_count();
+                    let next_gen = generator.generate_tile(None, active_count, None);
                     tile_queue.push_back(next_gen);
 
-                    // Update TargetValue for the new front tile (Tile #2) based on current board state
+                    // Update TargetValue cho ô mới ở đầu cọc bài dựa theo trạng thái bàn chơi
                     if let Some(front_tile) = tile_queue.front_mut() {
                         init_active_quest_tile_target(front_tile, &game_board);
                     }
@@ -342,8 +336,7 @@ async fn main() {
 
         draw_text("DORFROMANTIK SIMULATOR", 28.0, 38.0, 20.0, SKYBLUE);
         draw_text(&format!("Tiles Placed: {}  |  Score: {} pts", placed_count, score), 28.0, 65.0, 16.0, WHITE);
-        draw_text(&format!("Active Quests on Board: {}", active_on_board), 28.0, 88.0, 16.0, GOLD);
-        draw_text(&format!("Gen Active Count (for Tile #4): {}", effective_active_quests), 28.0, 111.0, 16.0, GREEN);
+        draw_text(&format!("Active Quests: {}", quest_manager.active_quest_count()), 28.0, 88.0, 16.0, GOLD);
         draw_text("LMB: Place | RMB Drag: Pan | Wheel: Rotate", 28.0, 134.0, 13.0, LIGHTGRAY);
         draw_text("Ctrl + Wheel: Zoom", 28.0, 150.0, 13.0, LIGHTGRAY);
 
@@ -398,12 +391,12 @@ async fn main() {
 fn draw_hex_tile(center: Vec2, radius: f32, config: &HexEdgeConfig, rotation: usize, alpha: f32) {
     let mut points = [Vec2::ZERO; 6];
     let angles: [f32; 6] = [
+        4.0 * std::f32::consts::FRAC_PI_3,
+        5.0 * std::f32::consts::FRAC_PI_3,
         0.0,
         std::f32::consts::FRAC_PI_3,
         2.0 * std::f32::consts::FRAC_PI_3,
         std::f32::consts::PI,
-        4.0 * std::f32::consts::FRAC_PI_3,
-        5.0 * std::f32::consts::FRAC_PI_3,
     ];
 
     for i in 0..6 {
@@ -422,7 +415,7 @@ fn draw_hex_tile(center: Vec2, radius: f32, config: &HexEdgeConfig, rotation: us
         draw_triangle(center, p1, p2, fill_color);
     }
 
-    // Draw 6 colored edge sectors
+    // Draw 6 colored edge sectors (28% depth trapezoid wedges)
     for i in 0..6 {
         let edge_type = config.edge_at(i, rotation);
         if edge_type != EdgeType::Plain {
@@ -430,8 +423,8 @@ fn draw_hex_tile(center: Vec2, radius: f32, config: &HexEdgeConfig, rotation: us
             let p2 = points[(i + 1) % 6];
             let mut edge_color = get_edge_color(edge_type);
             edge_color.a *= alpha;
-            let mid_p1 = center + (p1 - center) * 0.90;
-            let mid_p2 = center + (p2 - center) * 0.90;
+            let mid_p1 = center + (p1 - center) * 0.72;
+            let mid_p2 = center + (p2 - center) * 0.72;
 
             draw_triangle(p1, p2, mid_p2, edge_color);
             draw_triangle(p1, mid_p2, mid_p1, edge_color);
@@ -451,12 +444,12 @@ fn draw_hex_tile(center: Vec2, radius: f32, config: &HexEdgeConfig, rotation: us
 /// Helper function to draw hex outline
 fn draw_hex_lines(center: Vec2, radius: f32, thickness: f32, color: Color) {
     let angles: [f32; 6] = [
+        4.0 * std::f32::consts::FRAC_PI_3,
+        5.0 * std::f32::consts::FRAC_PI_3,
         0.0,
         std::f32::consts::FRAC_PI_3,
         2.0 * std::f32::consts::FRAC_PI_3,
         std::f32::consts::PI,
-        4.0 * std::f32::consts::FRAC_PI_3,
-        5.0 * std::f32::consts::FRAC_PI_3,
     ];
 
     for i in 0..6 {

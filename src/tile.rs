@@ -43,6 +43,8 @@ pub enum EdgeType {
     Village,
     Water,
     TrainTracks,
+    FlexibleWater,
+    WaterTrainStation,
 }
 
 impl From<GroupType> for EdgeType {
@@ -63,9 +65,37 @@ impl EdgeType {
             EdgeType::Agriculture => Some(GroupType::Agriculture),
             EdgeType::Forest => Some(GroupType::Forest),
             EdgeType::Village => Some(GroupType::Village),
-            EdgeType::Water => Some(GroupType::Water),
+            EdgeType::Water | EdgeType::FlexibleWater => Some(GroupType::Water),
             EdgeType::TrainTracks => Some(GroupType::TrainTracks),
+            EdgeType::WaterTrainStation => None,
             EdgeType::Plain => None,
+        }
+    }
+
+    pub fn is_compatible_with(&self, other: EdgeType) -> bool {
+        match (self, other) {
+            // Water cứng: Bắt buộc ghép Nước (Water, FlexibleWater, WaterTrainStation)
+            (EdgeType::Water, EdgeType::Water | EdgeType::FlexibleWater | EdgeType::WaterTrainStation) => true,
+            (EdgeType::Water, _) => false,
+
+            // TrainTracks cứng: Bắt buộc ghép Xe Lửa (TrainTracks, WaterTrainStation)
+            (EdgeType::TrainTracks, EdgeType::TrainTracks | EdgeType::WaterTrainStation) => true,
+            (EdgeType::TrainTracks, _) => false,
+
+            // FlexibleWater ghép Nước, Plain, FlexibleWater, WaterTrainStation, nhưng không ghép TrainTracks cứng
+            (EdgeType::FlexibleWater, EdgeType::TrainTracks) => false,
+            (EdgeType::FlexibleWater, _) => true,
+
+            // WaterTrainStation ghép tất cả (Water, TrainTracks, Plain, FlexibleWater, WaterTrainStation)
+            (EdgeType::WaterTrainStation, _) => true,
+
+            // Plain ghép Plain, FlexibleWater, WaterTrainStation và các loại không ràng buộc (Forest, Village, Agri)
+            (EdgeType::Plain, EdgeType::Water) | (EdgeType::Plain, EdgeType::TrainTracks) => false,
+            (EdgeType::Plain, _) => true,
+
+            // Các loại không ràng buộc (Agriculture, Forest, Village) ghép được với tất cả trừ Water/TrainTracks cứng
+            (EdgeType::Agriculture | EdgeType::Forest | EdgeType::Village, EdgeType::Water | EdgeType::TrainTracks) => false,
+            _ => true,
         }
     }
 }
@@ -105,6 +135,10 @@ impl HexEdgeConfig {
 }
 
 impl SegmentType {
+    pub fn is_lake_shape(&self) -> bool {
+        matches!(self, SegmentType::ST2A | SegmentType::ST3A | SegmentType::ST4A | SegmentType::ST5A | SegmentType::ST6A)
+    }
+
     pub fn shape_code(&self) -> &'static str {
         match self {
             SegmentType::ST1A => "1A",
@@ -161,6 +195,7 @@ pub struct SegmentData {
     pub segment_type: SegmentType,
     pub occupied_edges: Vec<usize>,
     pub rotation: usize,
+    pub is_hybrid: bool,
 }
 
 impl SegmentData {
@@ -183,23 +218,38 @@ pub struct QuestTileData {
     pub target_count: usize,
     pub equality: EqualityComparison,
     pub level: usize,
+    pub quest_id: Option<usize>,
+    pub stack_quest_id: Option<usize>,
 }
 
 impl QuestTileData {
-    /// Trích xuất chuỗi cấu hình địa hình từ tên prefab quest (ví dụ: "QuestTile_Agriculture_3AA_1AV_Windmill" -> "3AA 1AV")
+    /// Trích xuất chuỗi cấu hình địa hình từ tên prefab quest (ví dụ: "QuestTile_Water_4A_HybridW_2AF" -> "4A_HybridW 2AF")
     pub fn config_string(&self) -> String {
         let clean_name = self.quest_type.replace('-', "_");
         let parts: Vec<&str> = clean_name.split('_').collect();
         let mut seg_codes = Vec::new();
 
-        for part in parts {
-            let part = part.trim();
+        let mut i = 0;
+        while i < parts.len() {
+            let part = parts[i].trim();
             if part.is_empty() || part == "QuestTile" || part == "Train" || part == "WaterTrainStation" {
+                i += 1;
                 continue;
             }
+
+            if i + 1 < parts.len() && parts[i + 1].to_lowercase().contains("hybrid") {
+                let combined = format!("{}_{}", part, parts[i + 1]);
+                if is_segment_code(&combined) {
+                    seg_codes.push(combined);
+                    i += 2;
+                    continue;
+                }
+            }
+
             if is_segment_code(part) {
                 seg_codes.push(part.to_string());
             }
+            i += 1;
         }
 
         if !seg_codes.is_empty() {
@@ -225,7 +275,7 @@ impl QuestTileData {
         } else {
             let cfg = self.config_string();
             for part in cfg.split_whitespace() {
-                if let Some((_, gt)) = parse_segment_code(part) {
+                if let Some((_, gt, _)) = parse_segment_code(part) {
                     return gt;
                 }
             }
@@ -235,20 +285,24 @@ impl QuestTileData {
 
     /// Đếm tổng số object/element của mảnh QuestTile này thuộc primary_group_type dựa theo config2.txt
     pub fn own_elements(&self) -> usize {
-        let primary_gt = self.primary_group_type();
+        self.own_elements_for_group(self.primary_group_type())
+    }
+
+    /// Đếm tổng số object/element của mảnh QuestTile này thuộc group_type cụ thể
+    pub fn own_elements_for_group(&self, gt: GroupType) -> usize {
         let cfg = self.config_string();
         let mut total = 0;
 
         for part in cfg.split_whitespace() {
-            if let Some((seg_type, group_type)) = parse_segment_code(part) {
-                if group_type == primary_gt {
+            if let Some((seg_type, group_type, _)) = parse_segment_code(part) {
+                if group_type == gt {
                     total += crate::game_config::get_segment_element_count(group_type, seg_type);
                 }
             }
         }
 
         if total == 0 {
-            1
+            if self.primary_group_type() == gt { 1 } else { 0 }
         } else {
             total
         }
@@ -266,6 +320,10 @@ impl QuestTileData {
 }
 
 fn is_segment_code(s: &str) -> bool {
+    let lower = s.to_lowercase();
+    if lower.contains("hybrid") {
+        return true;
+    }
     let len = s.len();
     if len < 2 { return false; }
     let last = s.chars().last().unwrap();
@@ -276,9 +334,14 @@ fn is_segment_code(s: &str) -> bool {
     first_char.is_ascii_digit()
 }
 
-pub fn parse_segment_code(code: &str) -> Option<(SegmentType, GroupType)> {
-    if code.len() < 2 { return None; }
-    let group_char = code.chars().last()?;
+pub fn parse_segment_code(code: &str) -> Option<(SegmentType, GroupType, bool)> {
+    if code.is_empty() { return None; }
+    let is_hybrid_explicit = code.to_lowercase().contains("hybrid");
+
+    let mut cleaned = code.replace("Hybrid", "").replace("hybrid", "").replace('_', "");
+    if cleaned.is_empty() { return None; }
+
+    let group_char = cleaned.chars().last()?;
     let group_type = match group_char {
         'A' => GroupType::Agriculture,
         'F' => GroupType::Forest,
@@ -287,8 +350,15 @@ pub fn parse_segment_code(code: &str) -> Option<(SegmentType, GroupType)> {
         'W' => GroupType::Water,
         _ => return None,
     };
-    let shape_str = &code[..code.len() - 1];
-    let seg_type = match shape_str {
+
+    cleaned.pop(); // Remove last group char
+
+    if cleaned.starts_with('h') || cleaned.starts_with('H') {
+        cleaned.remove(0);
+    }
+
+    let shape_str = cleaned;
+    let seg_type = match shape_str.as_str() {
         "1A" => SegmentType::ST1A,
         "2A" => SegmentType::ST2A,
         "2B" => SegmentType::ST2B,
@@ -304,7 +374,10 @@ pub fn parse_segment_code(code: &str) -> Option<(SegmentType, GroupType)> {
         "6A" => SegmentType::ST6A,
         _ => return None,
     };
-    Some((seg_type, group_type))
+
+    let is_hybrid = is_hybrid_explicit || (group_type == GroupType::Water && seg_type == SegmentType::ST6A);
+
+    Some((seg_type, group_type, is_hybrid))
 }
 
 /// Kết quả bài hoàn chỉnh sau khi Generate
@@ -352,7 +425,16 @@ impl GeneratedTile {
             GeneratedTile::Normal { segments, .. } => {
                 for seg in segments {
                     let base = seg.segment_type.base_edges();
-                    let edge_type = EdgeType::from(seg.group_type);
+                    let edge_type = match seg.group_type {
+                        GroupType::Water => {
+                            if seg.segment_type == SegmentType::ST6A || seg.is_hybrid {
+                                EdgeType::FlexibleWater
+                            } else {
+                                EdgeType::Water
+                            }
+                        }
+                        gt => EdgeType::from(gt),
+                    };
                     for &b in base {
                         let idx = (b + seg.rotation) % 6;
                         edges[idx] = edge_type;
@@ -360,14 +442,28 @@ impl GeneratedTile {
                 }
             }
             GeneratedTile::Quest { quest_data, .. } => {
+                let name_lower = quest_data.quest_type.to_lowercase();
+                if name_lower.contains("watertrainstation") || name_lower.contains("water_trainstation") {
+                    return HexEdgeConfig::new([EdgeType::WaterTrainStation; 6]);
+                }
+
                 let preset_str = quest_data.config_string();
                 let parts: Vec<&str> = preset_str.split_whitespace().collect();
                 let mut occupied = [false; 6];
 
                 for part in parts {
-                    if let Some((seg_type, group_type)) = parse_segment_code(part) {
+                    if let Some((seg_type, group_type, is_hybrid)) = parse_segment_code(part) {
                         let base = seg_type.base_edges();
-                        let edge_type = EdgeType::from(group_type);
+                        let edge_type = match group_type {
+                            GroupType::Water => {
+                                if seg_type.is_lake_shape() || is_hybrid {
+                                    EdgeType::FlexibleWater
+                                } else {
+                                    EdgeType::Water
+                                }
+                            }
+                            gt => EdgeType::from(gt),
+                        };
                         
                         // Tìm rot hợp lệ đầu tiên không bị đè cạnh đã có
                         let mut best_rot = 0;

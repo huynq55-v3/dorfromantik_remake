@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use crate::game_config::{get_segment_element_count, GroupType};
-use crate::tile::{EdgeType, GeneratedTile, HexEdgeConfig, EqualityComparison};
+use crate::game_config::GroupType;
+use crate::tile::{GeneratedTile, HexEdgeConfig, EqualityComparison};
 
 /// Trạng thái hoàn thành của Quest
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,17 +22,39 @@ pub struct PlacedTile {
     pub quest_status: Option<FulfillmentStatus>,
     /// Đánh dấu quest đã hoàn thành/thất bại và không theo dõi nữa
     pub quest_finalized: bool,
+    /// ID Quest được đăng ký bởi QuestManager (nếu có)
+    pub quest_id: Option<usize>,
 }
 
-/// Tọa độ 6 hướng láng giềng Axial Hex (Flat-Topped Hex Grid)
-pub const HEX_DIRECTIONS: [(i32, i32); 6] = [
-    (1, 0),   // 0: Right
-    (0, 1),   // 1: Bottom-Right
-    (-1, 1),  // 2: Bottom-Left
-    (-1, 0),  // 3: Left
-    (0, -1),  // 4: Top-Left
-    (1, -1),  // 5: Top-Right
+/// Tọa độ 6 hướng láng giềng Unity Offset Grid (Even-Q / Uneven-Q Column Offset)
+pub const EVEN_COLUMN_DIRECTIONS: [(i32, i32); 6] = [
+    (0, 1),   // 0: Top / North
+    (1, 1),   // 1: Top-Right / North-East
+    (1, 0),   // 2: Bottom-Right / South-East
+    (0, -1),  // 3: Bottom / South
+    (-1, 0),  // 4: Bottom-Left / South-West
+    (-1, 1),  // 5: Top-Left / North-West
 ];
+
+pub const UNEVEN_COLUMN_DIRECTIONS: [(i32, i32); 6] = [
+    (0, 1),   // 0: Top / North
+    (1, 0),   // 1: Top-Right / North-East
+    (1, -1),  // 2: Bottom-Right / South-East
+    (0, -1),  // 3: Bottom / South
+    (-1, -1), // 4: Bottom-Left / South-West
+    (-1, 0),  // 5: Top-Left / North-West
+];
+
+/// Trả về vị trí láng giềng kề cạnh `dir` theo đúng hệ tọa độ Unity Offset Grid (Vector2Int x, y)
+pub fn get_neighbor_pos(q: i32, r: i32, dir: usize) -> (i32, i32) {
+    let dirs = if q % 2 == 0 {
+        &EVEN_COLUMN_DIRECTIONS
+    } else {
+        &UNEVEN_COLUMN_DIRECTIONS
+    };
+    let (dq, dr) = dirs[dir % 6];
+    (q + dq, r + dr)
+}
 
 /// Trả về hướng đối diện (0 <-> 3, 1 <-> 4, 2 <-> 5)
 pub fn opposite_direction(dir: usize) -> usize {
@@ -51,6 +73,7 @@ pub struct ElementGroup {
 }
 
 /// Board quản lý bàn chơi và thuật toán ghép cụm ElementGroupManager
+#[derive(Debug, Clone)]
 pub struct Board {
     pub placed_tiles: HashMap<(i32, i32), PlacedTile>,
     pub groups: HashMap<usize, ElementGroup>,
@@ -101,8 +124,9 @@ impl Board {
 
         // Bắt buộc phải kề với ít nhất 1 ô đã đặt (trừ ô trung tâm 0,0 đầu tiên)
         if !self.placed_tiles.is_empty() && (q != 0 || r != 0) {
-            let has_neighbor = HEX_DIRECTIONS.iter().any(|&(dq, dr)| {
-                self.placed_tiles.contains_key(&(q + dq, r + dr))
+            let has_neighbor = (0..6).any(|dir| {
+                let n_pos = get_neighbor_pos(q, r, dir);
+                self.placed_tiles.contains_key(&n_pos)
             });
             if !has_neighbor {
                 return false;
@@ -112,26 +136,13 @@ impl Board {
         let mut cfg = tile.to_hex_edge_config();
         cfg.rotate(rotation);
 
-        for (dir, &(dq, dr)) in HEX_DIRECTIONS.iter().enumerate() {
-            let neighbor_pos = (q + dq, r + dr);
+        for dir in 0..6 {
+            let neighbor_pos = get_neighbor_pos(q, r, dir);
             if let Some(neighbor) = self.placed_tiles.get(&neighbor_pos) {
                 let my_edge = cfg.edges[dir];
                 let neighbor_edge = neighbor.edge_config.edges[opposite_direction(dir)];
 
-                // Constraining placement rules:
-                // 1. Water edge MUST match Water edge
-                if my_edge == EdgeType::Water && neighbor_edge != EdgeType::Water {
-                    return false;
-                }
-                if neighbor_edge == EdgeType::Water && my_edge != EdgeType::Water {
-                    return false;
-                }
-
-                // 2. TrainTrack edge MUST match TrainTrack edge
-                if my_edge == EdgeType::TrainTracks && neighbor_edge != EdgeType::TrainTracks {
-                    return false;
-                }
-                if neighbor_edge == EdgeType::TrainTracks && my_edge != EdgeType::TrainTracks {
+                if !my_edge.is_compatible_with(neighbor_edge) {
                     return false;
                 }
             }
@@ -149,7 +160,10 @@ impl Board {
         let mut cfg = tile.to_hex_edge_config();
         cfg.rotate(rotation);
 
-        let is_quest = matches!(tile, GeneratedTile::Quest { .. });
+        let (is_quest, quest_id) = match &tile {
+            GeneratedTile::Quest { quest_data, .. } => (true, quest_data.quest_id),
+            _ => (false, None),
+        };
         let placed = PlacedTile {
             q,
             r,
@@ -158,6 +172,7 @@ impl Board {
             edge_config: cfg,
             quest_status: if is_quest { Some(FulfillmentStatus::Incomplete) } else { None },
             quest_finalized: false,
+            quest_id,
         };
 
         self.placed_tiles.insert((q, r), placed);
@@ -166,9 +181,18 @@ impl Board {
         self.update_element_groups(q, r);
 
         // ĐÁNH GIÁ LIÊN TỤC TẤT CẢ CÁC QUEST DANG ACTIVE TRÊN BÀN
-        self.evaluate_all_active_quests();
+        self.evaluate_all_active_quests(None);
 
         true
+    }
+
+    /// Đặt bài đồng thời hỗ trợ cập nhật tự động QuestManager (gọi remove_quest khi hoàn thành)
+    pub fn place_tile_with_manager(&mut self, q: i32, r: i32, tile: GeneratedTile, rotation: usize, quest_manager: Option<&mut crate::quest_manager::QuestManager>) -> bool {
+        let ok = self.place_tile(q, r, tile, rotation);
+        if ok {
+            self.evaluate_all_active_quests(quest_manager);
+        }
+        ok
     }
 
     /// Cập nhật và hợp nhất cụm địa hình liên thông (ElementGroupManager)
@@ -190,8 +214,8 @@ impl Board {
             let segment_count = 1;
 
             let mut connected_group_ids = HashSet::new();
-            for (dir, &(dq, dr)) in HEX_DIRECTIONS.iter().enumerate() {
-                let neighbor_pos = (q + dq, r + dr);
+            for dir in 0..6 {
+                let neighbor_pos = get_neighbor_pos(q, r, dir);
                 if let Some(neighbor) = self.placed_tiles.get(&neighbor_pos) {
                     let my_edge = placed.edge_config.edges[dir];
                     let neighbor_edge = neighbor.edge_config.edges[opposite_direction(dir)];
@@ -246,23 +270,23 @@ impl Board {
         }
     }
 
-    /// Trả về số lượng element của ô bài (Fix bug: Trả về 0 nếu ô không chứa địa hình GroupType)
+    /// Trả về số lượng element/cạnh địa hình của ô bài đối với GroupType
     pub fn get_tile_element_count(&self, tile: &GeneratedTile, gt: GroupType) -> usize {
         match tile {
+            GeneratedTile::Quest { quest_data, .. } => quest_data.own_elements_for_group(gt),
             GeneratedTile::Normal { segments, .. } => {
-                let mut sum = 0;
+                let mut total = 0;
                 for seg in segments {
                     if seg.group_type == gt {
-                        sum += get_segment_element_count(gt, seg.segment_type);
+                        total += crate::game_config::get_segment_element_count(gt, seg.segment_type);
                     }
                 }
-                sum
-            }
-            GeneratedTile::Quest { quest_data, .. } => {
-                if quest_data.primary_group_type() == gt {
-                    1
+                if total > 0 {
+                    total
                 } else {
-                    0
+                    let cfg = tile.to_hex_edge_config();
+                    let count = cfg.edges.iter().filter(|&&e| e.to_group_type() == Some(gt)).count();
+                    if count > 0 { count } else { 0 }
                 }
             }
         }
@@ -306,8 +330,8 @@ impl Board {
         }
 
         for &(pq, pr) in self.placed_tiles.keys() {
-            for &(dq, dr) in HEX_DIRECTIONS.iter() {
-                let n_pos = (pq + dq, pr + dr);
+            for dir in 0..6 {
+                let n_pos = get_neighbor_pos(pq, pr, dir);
                 if !self.placed_tiles.contains_key(&n_pos) {
                     let is_valid = (0..6).any(|rot| self.can_place_tile(n_pos.0, n_pos.1, tile, rot));
                     slots.entry(n_pos).or_insert(is_valid);
@@ -327,7 +351,7 @@ impl Board {
                     if m_pos != pos {
                         if let Some(pt) = self.placed_tiles.get(&m_pos) {
                             let count = match group_type {
-                                GroupType::Forest | GroupType::Village => self.get_tile_element_count(&pt.tile, group_type),
+                                GroupType::Forest | GroupType::Village | GroupType::Water | GroupType::Agriculture => self.get_tile_element_count(&pt.tile, group_type),
                                 _ => 1,
                             };
                             external_count += count;
@@ -360,7 +384,7 @@ impl Board {
     }
 
     /// ĐÁNH GIÁ LIÊN TỤC TẤT CẢ CÁC QUEST ACTIVE TRÊN BÀN CHƠI
-    pub fn evaluate_all_active_quests(&mut self) {
+    pub fn evaluate_all_active_quests(&mut self, mut quest_manager: Option<&mut crate::quest_manager::QuestManager>) {
         let active_keys: Vec<(i32, i32)> = self.placed_tiles
             .iter()
             .filter(|(_, pt)| matches!(pt.tile, GeneratedTile::Quest { .. }) && !pt.quest_finalized)
@@ -401,10 +425,35 @@ impl Board {
             if let Some(pt) = self.placed_tiles.get_mut(&pos) {
                 pt.quest_status = Some(new_status);
                 if new_status == FulfillmentStatus::Success || new_status == FulfillmentStatus::Failed {
-                    pt.quest_finalized = true;
+                    if let Some(qid) = pt.quest_id {
+                        if let Some(ref mut qm) = quest_manager {
+                            qm.remove_quest(qid);
+                            pt.quest_finalized = true;
+                        }
+                    } else {
+                        pt.quest_finalized = true;
+                    }
                 }
             }
         }
+    }
+
+    /// Tính số cụm địa hình (Group ID) duy nhất đang chứa quest active chưa hoàn thành trên bàn bài
+    pub fn active_quest_group_count_on_board(&self) -> usize {
+        let mut active_gids = std::collections::HashSet::new();
+        for (&pos, pt) in &self.placed_tiles {
+            if matches!(pt.tile, GeneratedTile::Quest { .. }) && !pt.quest_finalized {
+                if let GeneratedTile::Quest { quest_data, .. } = &pt.tile {
+                    let gt = quest_data.primary_group_type();
+                    if let Some(&gid) = self.tile_to_group.get(&(pos, gt)) {
+                        active_gids.insert(gid);
+                    } else {
+                        active_gids.insert((pos.0 as isize * 100000 + pos.1 as isize) as usize);
+                    }
+                }
+            }
+        }
+        active_gids.len()
     }
 
     /// PREVIEW TÍNH NĂNG CẬP NHẬT CON SỐ QUEST NGAY KHI RÊ TILE ĐẾN VỊ TRÍ ỨỚM THỬ (hover_q, hover_r)
@@ -444,8 +493,8 @@ impl Board {
             let mut added_external = 0;
 
             // Kiểm tra xem tile đang ướm thử có cạnh MATCHING group_type nối vào pos hay cụm của pos không
-            for (dir, &(dq, dr)) in HEX_DIRECTIONS.iter().enumerate() {
-                let n_pos = (hover_q + dq, hover_r + dr);
+            for dir in 0..6 {
+                let n_pos = get_neighbor_pos(hover_q, hover_r, dir);
                 if n_pos == pos {
                     // Hover tile kề trực tiếp với Quest tile pos
                     let my_edge = preview_cfg.edges[dir];
@@ -514,8 +563,8 @@ impl Board {
             let mut simulated_external = 0;
             let mut connected_gids = HashSet::new();
 
-            for (dir, &(dq, dr)) in HEX_DIRECTIONS.iter().enumerate() {
-                let n_pos = (hover_q + dq, hover_r + dr);
+            for dir in 0..6 {
+                let n_pos = get_neighbor_pos(hover_q, hover_r, dir);
                 let my_edge = preview_cfg.edges[dir];
 
                 if my_edge.to_group_type() == Some(group_type) {
@@ -570,5 +619,88 @@ impl Board {
         }
 
         preview_results
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game_config::{GroupType, SegmentType};
+    use crate::tile::{BaseTile, EdgeType, GeneratedTile, SegmentData};
+
+    fn make_test_tile(group_type: GroupType, segment_type: SegmentType, is_hybrid: bool) -> GeneratedTile {
+        let edges = segment_type.base_edges().to_vec();
+        GeneratedTile::Normal {
+            base_tile: BaseTile {
+                id: 0,
+                name: "Test".to_string(),
+                seed: 123,
+                is_generated: true,
+            },
+            segments: vec![SegmentData {
+                index: 0,
+                group_type,
+                segment_type,
+                occupied_edges: edges,
+                rotation: 0,
+                is_hybrid,
+            }],
+        }
+    }
+
+    #[test]
+    fn test_6aw_flexible_water_can_be_placed_next_to_plain() {
+        let mut board = Board::new();
+        // Đặt 1 ô Plain mộc ở (0,0)
+        let plain_tile = GeneratedTile::Normal {
+            base_tile: BaseTile { id: 0, name: "Plain".to_string(), seed: 1, is_generated: true },
+            segments: vec![],
+        };
+        board.place_tile(0, 0, plain_tile, 0);
+
+        // Ô 6AW (Lake_6A) là FlexibleWater
+        let tile_6aw = make_test_tile(GroupType::Water, SegmentType::ST6A, true);
+
+        // Kiểm tra đặt kề ở (1, 0)
+        assert!(board.can_place_tile(1, 0, &tile_6aw, 0));
+    }
+
+    #[test]
+    fn test_river_2c_strict_water_cannot_be_placed_next_to_plain() {
+        let mut board = Board::new();
+        // Đặt 1 ô Plain mộc ở (0,0)
+        let plain_tile = GeneratedTile::Normal {
+            base_tile: BaseTile { id: 0, name: "Plain".to_string(), seed: 1, is_generated: true },
+            segments: vec![],
+        };
+        board.place_tile(0, 0, plain_tile, 0);
+
+        // Dòng sông River 2C (0,3) là Water cứng (is_hybrid = false)
+        let river_2c = make_test_tile(GroupType::Water, SegmentType::ST2C, false);
+
+        // Cạnh 0 (Water) của ô (0,-1) chĩa sang (0,0) là Plain -> Không được phép ghép vì River 2C là Water cứng!
+        assert!(!board.can_place_tile(0, -1, &river_2c, 0));
+    }
+
+    #[test]
+    fn test_quest_tile_hybrid_water_parsed_as_flexible_water() {
+        use crate::tile::QuestTileData;
+        let quest_tile = GeneratedTile::Quest {
+            base_tile: BaseTile { id: 1, name: "Quest 1".to_string(), seed: 100, is_generated: true },
+            quest_data: QuestTileData {
+                seed: 100,
+                quest_type: "QuestTile_Water_4A_HybridW_2AF".to_string(),
+                target_count: 5,
+                equality: crate::tile::EqualityComparison::MoreThan,
+                level: 1,
+                quest_id: None,
+                stack_quest_id: None,
+            },
+        };
+
+        let cfg = quest_tile.to_hex_edge_config();
+        // 4 cạnh Nước 4A_HybridW phải là FlexibleWater!
+        let flexible_water_count = cfg.edges.iter().filter(|&&e| e == EdgeType::FlexibleWater).count();
+        assert_eq!(flexible_water_count, 4);
     }
 }
