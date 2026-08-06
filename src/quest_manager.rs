@@ -199,3 +199,44 @@ impl QuestManager {
         base + condition_target_value + diff
     }
 }
+
+/// Khởi tạo thông số mục tiêu (TargetValue, EqualityComparison) cho ô Quest Tile khi chuyển lên vị trí ô chính (Top of Stack)
+/// Tuân theo 1:1 quy trình trong C# Unity (QuestTile.InitializeRandomQuest):
+/// - Roll loại Quest (MoreThan / Exactly) theo C# SelectRandomQuest (với rewardSystem.Level = 0 khi ở đầu màn chơi)
+/// - Tính TargetValue = max(reference_group_count, min_target_count) + condition.targetValue + difficulty_increase
+pub fn initialize_active_quest_tile(
+    front_tile: &mut crate::tile::GeneratedTile,
+    game_board: &crate::board::Board,
+    quest_manager: &mut QuestManager,
+) {
+    if let crate::tile::GeneratedTile::Quest { ref mut quest_data, .. } = front_tile {
+        if quest_data.target_count == 0 {
+            let gt = quest_data.primary_group_type();
+            let board_ref = game_board.reference_group_count(gt);
+            let min_target = crate::game_config::get_quest_prefab_min_target_count(&quest_data.quest_type);
+
+            // Reward Level trong Unity C# bằng 0 khi ở đầu màn chơi
+            let reward_level = 0;
+            let (eq, cond_val) = crate::game_config::get_quest_prefab_condition_target_value_with_level(
+                &quest_data.quest_type,
+                gt,
+                quest_data.seed,
+                reward_level,
+            );
+
+            // Cập nhật fulfilled_count (số quest đã xong trên bàn) cho QuestManager để tính difficulty_increase
+            let fulfilled_count = game_board.placed_tiles.values()
+                .filter(|pt| pt.quest_status == Some(crate::board::FulfillmentStatus::Success))
+                .count();
+            quest_manager.level = fulfilled_count;
+
+            let ref_base = std::cmp::max(board_ref, 1);
+            let base = std::cmp::max(ref_base, min_target);
+            let diff = quest_manager.difficulty_increase(gt);
+
+            quest_data.target_count = base + cond_val + diff;
+            quest_data.equality = eq;
+            quest_data.level = reward_level;
+        }
+    }
+}

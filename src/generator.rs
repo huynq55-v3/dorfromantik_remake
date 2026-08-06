@@ -121,7 +121,7 @@ impl TileGenerator {
             .unwrap_or_else(|| (selected_sub.quest_tiles[0].clone(), 0.0, 0.0, 0.0));
         println!("  [Roll 3: Option] Prob Ratio: {:.8}, Total Prob: {}, Roll Val: {:.4}, Chosen Prefab: '{}'\n", opt_ratio, opt_total, opt_roll, selected_opt.prefab_name);
 
-        let (equality, _) = crate::game_config::get_quest_prefab_condition_target_value(&selected_opt.prefab_name, GroupType::Forest, quest_seed);
+        let (equality, _) = crate::game_config::get_quest_prefab_condition_target_value(&selected_opt.prefab_name, selected_col.group_type, quest_seed);
 
         QuestTileData {
             seed: quest_seed,
@@ -340,3 +340,22 @@ impl TileGenerator {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tile1_generation() {
+        let mut gen = TileGenerator::new(-2093096630);
+        let mut quest_count = 0;
+        for i in 1..=22 {
+            let tile = gen.generate_tile(None, quest_count, None);
+            if let GeneratedTile::Quest { ref quest_data, .. } = tile {
+                quest_count += 1;
+                println!("Tile #{}: Prefab='{}', Equality={:?}", i, quest_data.quest_type, quest_data.equality);
+            }
+        }
+    }
+}
+

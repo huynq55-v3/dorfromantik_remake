@@ -183,17 +183,19 @@ impl Board {
         true
     }
 
-    /// Đặt bài đồng thời hỗ trợ cập nhật tự động QuestManager (gọi remove_quest khi hoàn thành)
-    pub fn place_tile_with_manager(&mut self, q: i32, r: i32, tile: GeneratedTile, rotation: usize, mut quest_manager: Option<&mut crate::quest_manager::QuestManager>) -> bool {
+    /// Đặt bài đồng thời hỗ trợ cập nhật tự động QuestManager (trả về (thành công, số_quest_hoàn_thành))
+    pub fn place_tile_with_manager(&mut self, q: i32, r: i32, tile: GeneratedTile, rotation: usize, mut quest_manager: Option<&mut crate::quest_manager::QuestManager>) -> (bool, usize) {
         let is_quest = matches!(&tile, GeneratedTile::Quest { .. });
         let ok = self.place_tile(q, r, tile, rotation);
         if ok {
-            let quests_resolved = self.evaluate_all_active_quests(quest_manager.as_deref_mut());
+            let (quests_resolved, quests_succeeded) = self.evaluate_all_active_quests(quest_manager.as_deref_mut());
             if let Some(qm) = quest_manager {
                 qm.update_after_placement(is_quest, quests_resolved);
             }
+            (true, quests_succeeded)
+        } else {
+            (false, 0)
         }
-        ok
     }
 
     /// Cập nhật và hợp nhất cụm địa hình liên thông (ElementGroupManager)
@@ -385,8 +387,9 @@ impl Board {
     }
 
     /// Đánh giá liên tục tất cả các Quest active trên bàn chơi.
-    /// Trả về số quest được finalize (hoàn thành hoặc thất bại) trong lượt này.
-    pub fn evaluate_all_active_quests(&mut self, mut quest_manager: Option<&mut crate::quest_manager::QuestManager>) -> usize {
+    /// Đánh giá liên tục tất cả các Quest active trên bàn chơi.
+    /// Trả về (số quest được finalize, số quest hoàn thành thành công) trong lượt này.
+    pub fn evaluate_all_active_quests(&mut self, mut quest_manager: Option<&mut crate::quest_manager::QuestManager>) -> (usize, usize) {
         let active_keys: Vec<(i32, i32)> = self.placed_tiles
             .iter()
             .filter(|(_, pt)| matches!(pt.tile, GeneratedTile::Quest { .. }) && !pt.quest_finalized)
@@ -394,6 +397,7 @@ impl Board {
             .collect();
 
         let mut resolved_count = 0;
+        let mut succeeded_count = 0;
 
         for pos in active_keys {
             let (target_count, equality, group_type) = {
@@ -428,6 +432,9 @@ impl Board {
 
             if let Some(pt) = self.placed_tiles.get_mut(&pos) {
                 pt.quest_status = Some(new_status);
+                if new_status == FulfillmentStatus::Success {
+                    succeeded_count += 1;
+                }
                 if new_status == FulfillmentStatus::Success || new_status == FulfillmentStatus::Failed {
                     resolved_count += 1;
                     if let Some(qid) = pt.quest_id {
@@ -442,7 +449,7 @@ impl Board {
             }
         }
 
-        resolved_count
+        (resolved_count, succeeded_count)
     }
 
     /// Tính số cụm địa hình (Group ID) duy nhất đang chứa quest active chưa hoàn thành trên bàn bài

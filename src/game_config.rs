@@ -620,34 +620,70 @@ pub fn get_segment_element_count(group_type: GroupType, segment_type: SegmentTyp
     }
 }
 
+/// Điểm nút Keyframe trên đường cong xác suất AnimationCurve dump trực tiếp từ Unity Asset
+#[derive(Debug, Clone, Copy)]
+pub struct Keyframe {
+    pub time: f32,
+    pub value: f32,
+    pub in_tangent: f32,
+    pub out_tangent: f32,
+}
+
 /// Đường cong xác suất mô phỏng 1:1 theo class AnimationCurve trong Unity C# (Dorfromantik2.cs)
+/// Dữ liệu Keyframe được dump trực tiếp từ Unity Asset qua BepInEx ActiveQuestDumper.
+/// 
+/// Dữ liệu Keyframe cấu hình từ Unity Game:
+/// - MoreThan Quests (field_moreThan, forest_moreThan, village_moreThan, train_moreThan, water_moreThan):
+///     Keyframe #1: time=0.0000, value=1.0000 (CurveWeight=1.0)
+///     Keyframe #2: time=50.0000, value=1.0000
+/// - Exactly Quests (field_exactly, village_exactly, train_exactly, water_exactly):
+///     Keyframe #1: time=0.0000
+///     Keyframe #2: time=5.0000
+///     Keyframe #3: time=20.0000
+///     Keyframe #4: time=50.0000
 #[derive(Debug, Clone)]
 pub struct AnimationCurve {
-    pub time_start: f32,
-    pub value_start: f32,
-    pub time_end: f32,
-    pub value_end: f32,
+    pub keys: Vec<Keyframe>,
 }
 
 impl AnimationCurve {
+    pub fn new(keys: Vec<Keyframe>) -> Self {
+        Self { keys }
+    }
+
     pub fn linear(time_start: f32, value_start: f32, time_end: f32, value_end: f32) -> Self {
         Self {
-            time_start,
-            value_start,
-            time_end,
-            value_end,
+            keys: vec![
+                Keyframe { time: time_start, value: value_start, in_tangent: 0.0, out_tangent: 0.0 },
+                Keyframe { time: time_end, value: value_end, in_tangent: 0.0, out_tangent: 0.0 },
+            ],
         }
     }
 
     pub fn evaluate(&self, time: f32) -> f32 {
-        if time <= self.time_start {
-            self.value_start
-        } else if time >= self.time_end {
-            self.value_end
-        } else {
-            let t = (time - self.time_start) / (self.time_end - self.time_start);
-            self.value_start + t * (self.value_end - self.value_start)
+        if self.keys.is_empty() {
+            return 0.0;
         }
+        if time <= self.keys[0].time {
+            return self.keys[0].value;
+        }
+        let last_idx = self.keys.len() - 1;
+        if time >= self.keys[last_idx].time {
+            return self.keys[last_idx].value;
+        }
+        for i in 0..last_idx {
+            let k1 = &self.keys[i];
+            let k2 = &self.keys[i + 1];
+            if time >= k1.time && time <= k2.time {
+                let range = k2.time - k1.time;
+                if range == 0.0 {
+                    return k1.value;
+                }
+                let t = (time - k1.time) / range;
+                return k1.value + t * (k2.value - k1.value);
+            }
+        }
+        self.keys[0].value
     }
 }
 
@@ -660,7 +696,7 @@ pub fn select_random_quest(
 ) -> (crate::tile::EqualityComparison, usize) {
     let mut rng = crate::unity_random::UnityRandom::init_state(quest_seed);
 
-    // C# Candidate 1: Quest MoreThan (+) - AnimationCurve mặc định (weight=1.0)
+    // C# Candidate 1: Quest MoreThan (+) - AnimationCurve (Keyframe 0: 1.0, Keyframe 50: 1.0)
     let c1_equality = crate::tile::EqualityComparison::MoreThan;
     let c1_val = match group_type {
         GroupType::Forest => 5,      // ForestQuest_01_Elements_MoreThan
@@ -669,9 +705,13 @@ pub fn select_random_quest(
         GroupType::TrainTracks => 3, // TrainQuest_01_Segments_MoreThan
         GroupType::Water => 2,       // WaterQuest_01_Segments_MoreThan
     };
-    let c1_curve = AnimationCurve::linear(0.0, 1.0, 50.0, 1.0);
+    let c1_curve = AnimationCurve::new(vec![
+        Keyframe { time: 0.0, value: 1.0, in_tangent: 0.0, out_tangent: 0.0 },
+        Keyframe { time: 50.0, value: 1.0, in_tangent: 0.0, out_tangent: 0.0 },
+    ]);
 
-    // C# Candidate 2: Quest Exactly (=) - AnimationCurve.Linear(0, 0.1, 50, 0.5)
+    // C# Candidate 2: Quest Exactly (=) - AnimationCurve (Dumped 1:1 từ Unity Asset)
+    // Keyframes: t=0: v=0.0, t=5: v=0.2, t=20: v=1.0, t=50: v=1.0
     let c2_equality = crate::tile::EqualityComparison::Exactly;
     let c2_val = match group_type {
         GroupType::Forest => 4,      // ForestQuest_02_Elements_Exactly
@@ -680,24 +720,44 @@ pub fn select_random_quest(
         GroupType::TrainTracks => 3, // TrainQuest_02_Segments_Exactly
         GroupType::Water => 2,       // WaterQuest_02_Segments_Exactly
     };
-    let c2_curve = AnimationCurve::linear(0.0, 0.1, 50.0, 0.5);
+    let c2_curve = AnimationCurve::new(vec![
+        Keyframe { time: 0.0, value: 0.0, in_tangent: 0.0, out_tangent: 0.0 },
+        Keyframe { time: 5.0, value: 0.2, in_tangent: 0.0, out_tangent: 0.05333333 },
+        Keyframe { time: 20.0, value: 1.0, in_tangent: 0.05333333, out_tangent: 0.0 },
+        Keyframe { time: 50.0, value: 1.0, in_tangent: 0.0, out_tangent: 0.018 },
+    ]);
 
     let level_f = level as f32;
     let w1 = c1_curve.evaluate(level_f);
     let w2 = c2_curve.evaluate(level_f);
     let total_weight = w1 + w2;
 
-    let roll_val = rng.value() * total_weight;
-    if roll_val < w1 {
+    // Trong Unity C#, SelectWeightedRandom(Dictionary) gọi Random.Range(0f, total_weight)
+    let roll_val = rng.range_f32(0.0, total_weight);
+
+    let result = if roll_val < w1 {
         (c1_equality, c1_val)
     } else {
         (c2_equality, c2_val)
-    }
+    };
+
+    println!(
+        "  [SelectRandomQuest] Prefab='{}' GroupType={:?} Seed={} Level={} | w1(+)={:.4} w2(=)={:.4} total={:.4} | roll={:.8} | => {:?} val={}",
+        _prefab_name, group_type, quest_seed, level, w1, w2, total_weight, roll_val,
+        result.0, result.1
+    );
+
+    result
 }
+
 
 /// Trả về (EqualityComparison, condition.targetValue) theo chuẩn C# SelectRandomQuest (Dorfromantik2.cs dòng 24448)
 pub fn get_quest_prefab_condition_target_value(prefab_name: &str, group_type: GroupType, quest_seed: i32) -> (crate::tile::EqualityComparison, usize) {
     select_random_quest(prefab_name, group_type, quest_seed, 0)
+}
+
+pub fn get_quest_prefab_condition_target_value_with_level(prefab_name: &str, group_type: GroupType, quest_seed: i32, level: usize) -> (crate::tile::EqualityComparison, usize) {
+    select_random_quest(prefab_name, group_type, quest_seed, level)
 }
 
 
