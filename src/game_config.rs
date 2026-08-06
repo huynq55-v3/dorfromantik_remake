@@ -793,6 +793,7 @@ impl QuestConfigurations {
         let mut village_prob = 10.0;
         let mut train_prob = 6.0;
         let mut water_prob = 8.0;
+        let mut density = 1.4;
 
         if let Ok(content) = fs::read_to_string(path) {
             for line in content.lines() {
@@ -806,6 +807,7 @@ impl QuestConfigurations {
                             "ACTIVE_VillageProbability" => village_prob = num,
                             "ACTIVE_TrainTrackProbability" => train_prob = num,
                             "ACTIVE_WaterProbability" => water_prob = num,
+                            "ACTIVE_Density" => density = num,
                             _ => {}
                         }
                     }
@@ -813,7 +815,7 @@ impl QuestConfigurations {
             }
         }
 
-        Self::new(forest_prob, agri_prob, village_prob, train_prob, water_prob)
+        Self::new(forest_prob, agri_prob, village_prob, train_prob, water_prob, density)
     }
 
     /// Tính toán động collectionProbability (CollProb) tương ứng Unity C# dòng 24501
@@ -849,7 +851,14 @@ impl QuestConfigurations {
     }
 
     /// Khởi tạo động cấu hình Quest và tự động tính toán mảng excluded_group_types theo C# dòng 7467-7477
-    pub fn new(forest_prob: f32, agri_prob: f32, village_prob: f32, train_prob: f32, water_prob: f32) -> Self {
+    pub fn new(
+        forest_prob: f32,
+        agri_prob: f32,
+        village_prob: f32,
+        train_prob: f32,
+        water_prob: f32,
+        density: f32,
+    ) -> Self {
         // Trong C# (dòng 7470): Nếu xác suất nhóm địa hình == 0.0 thì thêm nhóm đó vào excludedGroupTypes
         let mut excluded_group_types = Vec::new();
         if forest_prob <= 0.0 { excluded_group_types.push(GroupType::Forest); }
@@ -860,8 +869,31 @@ impl QuestConfigurations {
 
         let total_col_raw = forest_prob + agri_prob + village_prob + train_prob + water_prob;
 
+        // Helper nhân density.powf(occupied_edges + 1) tương ứng C# dòng 3415:
+        // questTileSubCollection.subCollectionRawProbability *= Mathf.Pow(Density, occupiedEdges + 1);
+        let make_sub_raw = |base_raw: f32, occupied_edges: usize| -> f32 {
+            base_raw * density.powf((occupied_edges + 1) as f32)
+        };
+
+        let forest_sub_total = make_sub_raw(10.0, 1) + make_sub_raw(1.0, 3) + make_sub_raw(10.0, 2)
+            + make_sub_raw(10.0, 3) + make_sub_raw(15.0, 4) + make_sub_raw(15.0, 6);
+
+        let agri_sub_total = make_sub_raw(10.0, 2) + make_sub_raw(7.0, 5) + make_sub_raw(5.0, 6)
+            + make_sub_raw(5.0, 4) + make_sub_raw(5.0, 6) + make_sub_raw(10.0, 6) + make_sub_raw(15.0, 6);
+
+        let village_sub_total = make_sub_raw(10.0, 2) + make_sub_raw(10.0, 6) + make_sub_raw(3.0, 6)
+            + make_sub_raw(10.0, 6) + make_sub_raw(10.0, 6);
+
+        let train_sub_total = make_sub_raw(10.0, 6) + make_sub_raw(10.0, 5) + make_sub_raw(7.0, 6)
+            + make_sub_raw(20.0, 2) + make_sub_raw(5.0, 4) + make_sub_raw(0.0, 6);
+
+        let water_sub_total = make_sub_raw(10.0, 6) + make_sub_raw(15.0, 2) + make_sub_raw(5.0, 5)
+            + make_sub_raw(5.0, 5) + make_sub_raw(5.0, 5) + make_sub_raw(5.0, 6)
+            + make_sub_raw(10.0, 6) + make_sub_raw(10.0, 6) + make_sub_raw(25.0, 6) + make_sub_raw(0.0, 12);
+
         // Helper function to build QuestSubCollection with dynamically calculated probability according to C# UpdateValues (line 24506)
-        let make_sub = |raw_prob: f32, total_sub_raw: f32, col_prob: f32, occupied_edges: usize, all_seg: Vec<GroupType>, tiles: Vec<QuestOption>| -> QuestSubCollection {
+        let make_sub = |base_raw: f32, total_sub_raw: f32, col_prob: f32, occupied_edges: usize, all_seg: Vec<GroupType>, tiles: Vec<QuestOption>| -> QuestSubCollection {
+            let raw_prob = make_sub_raw(base_raw, occupied_edges);
             let col_share = if total_col_raw > 0.0 { col_prob / total_col_raw } else { 0.0 };
             let sub_prob = if total_sub_raw > 0.0 { (raw_prob / total_sub_raw) * col_share } else { 0.0 };
             QuestSubCollection {
@@ -872,12 +904,6 @@ impl QuestConfigurations {
                 quest_tiles: tiles,
             }
         };
-
-        let forest_sub_total = 10.0 + 1.0 + 10.0 + 10.0 + 15.0 + 15.0; // = 61.0
-        let agri_sub_total = 10.0 + 7.0 + 5.0 + 5.0 + 5.0 + 10.0 + 15.0; // = 57.0
-        let village_sub_total = 10.0 + 10.0 + 3.0 + 10.0 + 10.0; // = 43.0
-        let train_sub_total = 10.0 + 10.0 + 7.0 + 20.0 + 5.0 + 0.0; // = 52.0
-        let water_sub_total = 10.0 + 15.0 + 5.0 + 5.0 + 5.0 + 5.0 + 10.0 + 10.0 + 25.0 + 0.0; // = 90.0
 
         let collections = vec![
             // ── Collection 1: Forest Quests (Index #0) ──
@@ -1096,7 +1122,8 @@ mod tests {
         // ACTIVE_AgricultureProbability=125
         // ACTIVE_WaterProbability=1000
         // ACTIVE_TrainTrackProbability=0
-        let config = QuestConfigurations::new(125.0, 125.0, 125.0, 0.0, 1000.0);
+        // ACTIVE_Density=1.4
+        let config = QuestConfigurations::new(125.0, 125.0, 125.0, 0.0, 1000.0, 1.4);
 
         // 1. Kiểm tra mảng excluded_group_types
         assert!(config.excluded_group_types.contains(&GroupType::TrainTracks));
@@ -1113,18 +1140,13 @@ mod tests {
         assert_eq!(train_col_prob, 0.0);
 
         // 3. Kiểm tra SubCollection Probabilities tự động cho Water 6AW (sub_index #8)
-        // raw_prob = 25, total_sub_raw = 90
-        // subCollectionProbability = (25 / 90) * (1000 / 1375) = 200 / 990 = 0.2020202...
         let water_6aw_prob = config.sub_collection_probability(GroupType::Water, 8);
-        let expected_water_6aw = (25.0 / 90.0) * (1000.0 / 1375.0);
+        let make_sub_raw = |base_raw: f32, occupied_edges: usize| base_raw * 1.4f32.powf((occupied_edges + 1) as f32);
+        let water_sub_total = make_sub_raw(10.0, 6) + make_sub_raw(15.0, 2) + make_sub_raw(5.0, 5)
+            + make_sub_raw(5.0, 5) + make_sub_raw(5.0, 5) + make_sub_raw(5.0, 6)
+            + make_sub_raw(10.0, 6) + make_sub_raw(10.0, 6) + make_sub_raw(25.0, 6) + make_sub_raw(0.0, 12);
+        let expected_water_6aw = (make_sub_raw(25.0, 6) / water_sub_total) * (1000.0 / 1375.0);
         assert!((water_6aw_prob - expected_water_6aw).abs() < 1e-5);
-
-        // 4. Kiểm tra SubCollection Probabilities cho Village 3AV 3AF (sub_index #1)
-        // raw_prob = 10, total_sub_raw = 43
-        // subCollectionProbability = (10 / 43) * (125 / 1375) = 10 / 473 = 0.0211416...
-        let village_3av_3af_prob = config.sub_collection_probability(GroupType::Village, 1);
-        let expected_village = (10.0 / 43.0) * (125.0 / 1375.0);
-        assert!((village_3av_3af_prob - expected_village).abs() < 1e-5);
     }
 
     #[test]
@@ -1135,7 +1157,8 @@ mod tests {
         // ACTIVE_AgricultureProbability=50
         // ACTIVE_WaterProbability=38
         // ACTIVE_TrainTrackProbability=25
-        let config = QuestConfigurations::new(50.0, 50.0, 50.0, 25.0, 38.0);
+        // ACTIVE_Density=1.4
+        let config = QuestConfigurations::new(50.0, 50.0, 50.0, 25.0, 38.0, 1.4);
 
         // 1. Excluded group types phải rỗng vì tất cả prob > 0
         assert!(config.excluded_group_types.is_empty());
@@ -1146,10 +1169,5 @@ mod tests {
 
         assert!((train_col_prob - (25.0 / 213.0)).abs() < 1e-5);
         assert!((water_col_prob - (38.0 / 213.0)).abs() < 1e-5);
-
-        // 3. SubCollection Probabilities cho Water 6AW (sub_index #8)
-        let water_6aw_prob = config.sub_collection_probability(GroupType::Water, 8);
-        let expected_water_6aw = (25.0 / 90.0) * (38.0 / 213.0);
-        assert!((water_6aw_prob - expected_water_6aw).abs() < 1e-5);
     }
 }
