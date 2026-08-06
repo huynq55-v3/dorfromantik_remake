@@ -13,6 +13,7 @@ pub struct ActiveQuest {
 #[derive(Debug, Clone)]
 pub struct QuestManager {
     pub global_difficulty_multiplier: f32,
+    pub reward_system_global_difficulty: f32,
     pub exponential_difficulty_factor: f32,
     pub levels_needed_per_increase: usize,
     pub target_value_increase: f32,
@@ -53,6 +54,7 @@ impl QuestManager {
 
     pub fn from_file<P: AsRef<std::path::Path>>(path: P) -> Self {
         let mut global_difficulty_multiplier = 1.0;
+        let reward_system_global_difficulty = 2.0; // Hardcoded RS.GlobalDiff = 2.0 theo yêu cầu người dùng
 
         if let Ok(content) = std::fs::read_to_string(path) {
             for line in content.lines() {
@@ -70,6 +72,7 @@ impl QuestManager {
 
         Self {
             global_difficulty_multiplier,
+            reward_system_global_difficulty,
             exponential_difficulty_factor: 1.0,
             levels_needed_per_increase: 1,
             target_value_increase: 0.33333334,
@@ -95,8 +98,11 @@ impl QuestManager {
     /// - Sông (Water), Đường ray (TrainTracks): 1/6 (0.16666667)
     pub fn target_value_increase(&self, group_type: GroupType) -> f32 {
         match group_type {
-            GroupType::Water | GroupType::TrainTracks => 0.16666667,
-            _ => 0.33333334,
+            GroupType::Water => 0.09,
+            GroupType::TrainTracks => 0.09,
+            GroupType::Agriculture => 0.20,
+            GroupType::Forest => 0.20,
+            GroupType::Village => 0.20,
         }
     }
 
@@ -110,9 +116,16 @@ impl QuestManager {
         let target_increase = self.target_value_increase(group_type);
         let level_f = self.level as f32;
         let pow_level = level_f.powf(self.exponential_difficulty_factor);
+
+        // Dorfromantik2.cs dòng 22368:
+        // num = pow_level / levelsNeeded * target_increase * RS.globalDifficultyMultiplier * QM.GlobalQuestDifficultyMultiplier
+        let rs_global_diff = self.reward_system_global_difficulty;
+        let qm_global_diff = self.global_difficulty_multiplier;
+
         let increase = (pow_level / self.levels_needed_per_increase as f32)
             * target_increase
-            * self.global_difficulty_multiplier;
+            * rs_global_diff
+            * qm_global_diff;
 
         increase.round() as usize
     }
@@ -212,7 +225,12 @@ pub fn initialize_active_quest_tile(
     if let crate::tile::GeneratedTile::Quest { ref mut quest_data, .. } = front_tile {
         if quest_data.target_count == 0 {
             let gt = quest_data.primary_group_type();
-            let board_ref = game_board.reference_group_count(gt);
+            let board_ref_on_table = game_board.reference_group_count(gt);
+            let tile_own_count = match gt {
+                crate::game_config::GroupType::Water | crate::game_config::GroupType::TrainTracks => 1,
+                _ => quest_data.own_elements_for_group(gt),
+            };
+            let board_ref = std::cmp::max(board_ref_on_table, tile_own_count);
             let min_target = crate::game_config::get_quest_prefab_min_target_count(&quest_data.quest_type);
 
             // Reward Level trong Unity C# bằng 0 khi ở đầu màn chơi
@@ -230,13 +248,17 @@ pub fn initialize_active_quest_tile(
                 .count();
             quest_manager.level = fulfilled_count;
 
-            let ref_base = std::cmp::max(board_ref, 1);
-            let base = std::cmp::max(ref_base, min_target);
+            let base = std::cmp::max(board_ref, min_target);
             let diff = quest_manager.difficulty_increase(gt);
 
             quest_data.target_count = base + cond_val + diff;
             quest_data.equality = eq;
             quest_data.level = reward_level;
+
+            println!(
+                "  [INIT QUEST TARGET] Prefab='{}' Seed={} | GroupType={:?} | BoardRefOnTable={} | TileOwnCount={} | BoardRef={} | MinTarget={} | Base={} | CondVal={} | Level={} | DiffIncrease={} | TargetValue={} | RemainingValue (Displayed)={}",
+                quest_data.quest_type, quest_data.seed, gt, board_ref_on_table, tile_own_count, board_ref, min_target, base, cond_val, quest_manager.level, diff, quest_data.target_count, quest_data.remaining_display_value()
+            );
         }
     }
 }
