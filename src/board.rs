@@ -509,7 +509,7 @@ impl Board {
 
                     if my_edge.to_group_type() == Some(group_type) && quest_edge.to_group_type() == Some(group_type) {
                         let delta = match group_type {
-                            GroupType::Forest | GroupType::Village => self.get_tile_element_count(hover_tile, group_type),
+                            GroupType::Forest | GroupType::Village | GroupType::Agriculture | GroupType::Water => self.get_tile_element_count(hover_tile, group_type),
                             _ => 1,
                         };
                         added_external = delta;
@@ -524,7 +524,7 @@ impl Board {
                                 let neighbor_edge = self.placed_tiles[&n_pos].edge_config.edges[opposite_direction(dir)];
                                 if neighbor_edge.to_group_type() == Some(group_type) {
                                     let delta = match group_type {
-                                        GroupType::Forest | GroupType::Village => self.get_tile_element_count(hover_tile, group_type),
+                                        GroupType::Forest | GroupType::Village | GroupType::Agriculture | GroupType::Water => self.get_tile_element_count(hover_tile, group_type),
                                         _ => 1,
                                     };
                                     added_external = delta;

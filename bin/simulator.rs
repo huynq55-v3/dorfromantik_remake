@@ -44,7 +44,8 @@ fn get_edge_color(edge_type: EdgeType) -> Color {
         EdgeType::Agriculture => Color::from_rgba(230, 194, 41, 255),  // Wheat Gold
         EdgeType::Forest => Color::from_rgba(45, 106, 79, 255),         // Deep Forest Green
         EdgeType::Village => Color::from_rgba(224, 86, 60, 255),         // Roof Terracotta Warm Red-Orange
-        EdgeType::Water | EdgeType::FlexibleWater => Color::from_rgba(0, 119, 182, 255), // Sapphire Blue
+        EdgeType::Water         => Color::from_rgba(0,  119, 182, 255), // Sapphire Blue (nước cứng)
+        EdgeType::FlexibleWater => Color::from_rgba(0,  200, 190, 255), // Teal Cyan (nước mềm / lake)
         EdgeType::TrainTracks => Color::from_rgba(74, 78, 105, 255),    // Railway Steel
         EdgeType::WaterTrainStation => Color::from_rgba(114, 9, 183, 255), // Purple Tower
     }
@@ -177,14 +178,22 @@ async fn main() {
 
         // Mouse Wheel: Scroll to rotate tile, Ctrl + Scroll to zoom camera
         let wheel = mouse_wheel().1;
+        // Mouse wheel (không Ctrl): xoay tile theo valid rotation
         if is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl) {
             if wheel > 0.0 { zoom *= 1.12; }
             if wheel < 0.0 { zoom *= 0.88; }
         } else if wheel != 0.0 {
-            if wheel < 0.0 {
-                current_rotation = (current_rotation + 1) % 6;
+            if let Some(ref active_tile) = active_tile_opt {
+                // Cần hovered_hex — tính tạm ở đây vì hovered_hex chưa được tính
+                let mouse_vec_early = Vec2::new(current_mouse_pos.0, current_mouse_pos.1);
+                let center_vec_early = Vec2::new(screen_w * 0.5, screen_h * 0.5);
+                let mouse_world_early = (mouse_vec_early - center_vec_early) / zoom + camera_pos;
+                let hex_early = screen_to_hex(mouse_world_early, HEX_RADIUS);
+                let forward = wheel < 0.0;
+                current_rotation = game_board.get_next_valid_rotation(hex_early.q, hex_early.r, active_tile, current_rotation, forward);
             } else {
-                current_rotation = (current_rotation + 5) % 6;
+                if wheel < 0.0 { current_rotation = (current_rotation + 1) % 6; }
+                else           { current_rotation = (current_rotation + 5) % 6; }
             }
         }
 
@@ -203,15 +212,42 @@ async fn main() {
         let hovered_hex = screen_to_hex(mouse_world, HEX_RADIUS);
 
         // Rotate tile with RMB Click, Space, R, E, Q or Middle Button
+        // Chỉ xoay đến góc hợp lệ tại ô đang hover (nếu có tile đang cầm)
         let rmb_clicked = is_mouse_button_released(MouseButton::Right) && total_drag_dist <= 6.0;
         if rmb_clicked || is_mouse_button_pressed(MouseButton::Middle) || is_key_pressed(KeyCode::R) || is_key_pressed(KeyCode::E) || is_key_pressed(KeyCode::Space) {
-            current_rotation = (current_rotation + 1) % 6;
+            if let Some(ref active_tile) = active_tile_opt {
+                current_rotation = game_board.get_next_valid_rotation(hovered_hex.q, hovered_hex.r, active_tile, current_rotation, true);
+            } else {
+                current_rotation = (current_rotation + 1) % 6;
+            }
         }
         if is_key_pressed(KeyCode::Q) {
-            current_rotation = (current_rotation + 5) % 6;
+            if let Some(ref active_tile) = active_tile_opt {
+                current_rotation = game_board.get_next_valid_rotation(hovered_hex.q, hovered_hex.r, active_tile, current_rotation, false);
+            } else {
+                current_rotation = (current_rotation + 5) % 6;
+            }
         }
 
-        // ── 1.5. Render Grid Slots for All Possible Placement Locations ──
+        // Auto-snap rotation về góc hợp lệ gần nhất khi di chuột sang ô mới
+        // (không cần nhấn R — tự động điều chỉnh khi hover qua ô có ràng buộc khác)
+        if let Some(ref active_tile) = active_tile_opt {
+            if !game_board.can_place_tile(hovered_hex.q, hovered_hex.r, active_tile, current_rotation) {
+                let valid_rots: Vec<usize> = (0..6)
+                    .filter(|&rot| game_board.can_place_tile(hovered_hex.q, hovered_hex.r, active_tile, rot))
+                    .collect();
+                if !valid_rots.is_empty() {
+                    // Snap đến góc hợp lệ gần nhất với current_rotation
+                    current_rotation = *valid_rots.iter()
+                        .min_by_key(|&&rot| {
+                            let diff = (rot as i32 - current_rotation as i32).rem_euclid(6) as usize;
+                            diff.min(6 - diff)
+                        })
+                        .unwrap();
+                }
+            }
+        }
+
         if let Some(ref active_tile) = active_tile_opt {
             let available_slots = game_board.get_available_placement_slots(active_tile);
             for ((sq, sr), is_slot_valid) in available_slots {
