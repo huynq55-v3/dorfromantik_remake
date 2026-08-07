@@ -100,6 +100,54 @@ impl Linear {
             self.bias[i] -= lr * m_hat / (v_hat.sqrt() + eps);
         }
     }
+
+    pub fn save_to_writer<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        writer.write_all(&(self.in_features as u64).to_le_bytes())?;
+        writer.write_all(&(self.out_features as u64).to_le_bytes())?;
+        for &val in self.weight.iter().chain(&self.bias).chain(&self.m_w).chain(&self.v_w).chain(&self.m_b).chain(&self.v_b) {
+            writer.write_all(&val.to_le_bytes())?;
+        }
+        Ok(())
+    }
+
+    pub fn load_from_reader<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let mut buf8 = [0u8; 8];
+        reader.read_exact(&mut buf8)?;
+        let in_features = u64::from_le_bytes(buf8) as usize;
+        reader.read_exact(&mut buf8)?;
+        let out_features = u64::from_le_bytes(buf8) as usize;
+
+        let w_len = out_features * in_features;
+        let b_len = out_features;
+
+        let mut read_vec = |len: usize| -> std::io::Result<Vec<f32>> {
+            let mut v = Vec::with_capacity(len);
+            let mut buf4 = [0u8; 4];
+            for _ in 0..len {
+                reader.read_exact(&mut buf4)?;
+                v.push(f32::from_le_bytes(buf4));
+            }
+            Ok(v)
+        };
+
+        let weight = read_vec(w_len)?;
+        let bias = read_vec(b_len)?;
+        let m_w = read_vec(w_len)?;
+        let v_w = read_vec(w_len)?;
+        let m_b = read_vec(b_len)?;
+        let v_b = read_vec(b_len)?;
+
+        Ok(Self {
+            in_features,
+            out_features,
+            weight,
+            bias,
+            m_w,
+            v_w,
+            m_b,
+            v_b,
+        })
+    }
 }
 
 /// Mạng 3-Hop Residual Graph Neural Network kết hợp Action Scoring MLP Head
@@ -391,7 +439,7 @@ impl HexGNNModel {
         (log_prob, state_value, entropy)
     }
 
-    /// Backpropagation: Tính đạo hàm giải tích chính xác qua toàn bộ 3 Layers GNN + Action Scoring MLP Head
+    /// Backpropagation: Tính đạo hàm giải tích chính xác qua toàn bộ 3 Layers GNN + Action Scoring MLP Head (PPO)
     pub fn backward_accumulate(
         &self,
         node_positions: &[(i32, i32)],
@@ -404,9 +452,90 @@ impl HexGNNModel {
         value_grad: f32,
         grads: &mut HexGNNModel,
     ) {
+        let num_actions = valid_actions.len();
+        if num_actions == 0 {
+            return;
+        }
+        let (action_logits, _) = self.forward(node_positions, node_features, edge_index, valid_actions, action_features);
+        let max_logit = action_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = action_logits.iter().map(|l| (l - max_logit).exp()).collect();
+        let sum_exp: f32 = exps.iter().sum();
+        let probs: Vec<f32> = exps.iter().map(|e| e / sum_exp.max(1e-8)).collect();
+
+        // dL/dz(a) = -advantage * (1(a == chosen) - prob(a))
+        let mut d_logits = vec![0.0f32; num_actions];
+        for a in 0..num_actions {
+            let target = if a == chosen_action_idx { 1.0 } else { 0.0 };
+            d_logits[a] = -advantage * (target - probs[a]);
+        }
+
+        self.backward_accumulate_with_d_logits(
+            node_positions,
+            node_features,
+            edge_index,
+            valid_actions,
+            action_features,
+            &d_logits,
+            value_grad,
+            grads,
+        );
+    }
+
+    /// Backpropagation cho AlphaZero / Expert Iteration:
+    /// Gradient theo hàm Cross-Entropy giữa Policy Network và MCTS Target Distribution (dL/dz_a = prob_a - target_prob_a)
+    pub fn backward_accumulate_alphazero(
+        &self,
+        node_positions: &[(i32, i32)],
+        node_features: &[[f32; 40]],
+        edge_index: &[(usize, usize)],
+        valid_actions: &[crate::env::Action],
+        action_features: &[[f32; 16]],
+        target_probs: &[f32],
+        value_grad: f32,
+        grads: &mut HexGNNModel,
+    ) {
+        let num_actions = valid_actions.len();
+        if num_actions == 0 || target_probs.len() != num_actions {
+            return;
+        }
+        let (action_logits, _) = self.forward(node_positions, node_features, edge_index, valid_actions, action_features);
+        let max_logit = action_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = action_logits.iter().map(|l| (l - max_logit).exp()).collect();
+        let sum_exp: f32 = exps.iter().sum();
+        let probs: Vec<f32> = exps.iter().map(|e| e / sum_exp.max(1e-8)).collect();
+
+        let mut d_logits = vec![0.0f32; num_actions];
+        for a in 0..num_actions {
+            d_logits[a] = probs[a] - target_probs[a];
+        }
+
+        self.backward_accumulate_with_d_logits(
+            node_positions,
+            node_features,
+            edge_index,
+            valid_actions,
+            action_features,
+            &d_logits,
+            value_grad,
+            grads,
+        );
+    }
+
+    /// Backpropagation cốt lõi nhận vector d_logits và value_grad
+    pub fn backward_accumulate_with_d_logits(
+        &self,
+        node_positions: &[(i32, i32)],
+        node_features: &[[f32; 40]],
+        edge_index: &[(usize, usize)],
+        valid_actions: &[crate::env::Action],
+        action_features: &[[f32; 16]],
+        d_logits: &[f32],
+        value_grad: f32,
+        grads: &mut HexGNNModel,
+    ) {
         let n_nodes = node_features.len();
         let num_actions = valid_actions.len();
-        if n_nodes == 0 || num_actions == 0 {
+        if n_nodes == 0 || num_actions == 0 || d_logits.len() != num_actions {
             return;
         }
 
@@ -471,7 +600,7 @@ impl HexGNNModel {
         for i in 0..num_actions * 64 {
             act_relu[i] = if act_hidden[i] > 0.0 { act_hidden[i] } else { 0.0 };
         }
-        let action_logits = self.w_act2.forward(&act_relu, num_actions * 64);
+        let _action_logits = self.w_act2.forward(&act_relu, num_actions * 64);
 
         // Value Forward
         let mut mean_h3 = vec![0.0f32; 64];
@@ -490,19 +619,6 @@ impl HexGNNModel {
         }
 
         // ================= BACKPROPAGATION =================
-        // 1. Policy Gradient on Action Logits
-        let max_logit = action_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let exps: Vec<f32> = action_logits.iter().map(|l| (l - max_logit).exp()).collect();
-        let sum_exp: f32 = exps.iter().sum();
-        let probs: Vec<f32> = exps.iter().map(|e| e / sum_exp.max(1e-8)).collect();
-
-        // dL/dz(a) = -advantage * (1(a == chosen) - prob(a))
-        let mut d_logits = vec![0.0f32; num_actions];
-        for a in 0..num_actions {
-            let target = if a == chosen_action_idx { 1.0 } else { 0.0 };
-            d_logits[a] = -advantage * (target - probs[a]);
-        }
-
         // Backprop through w_act2
         let mut d_act_relu = vec![0.0f32; num_actions * 64];
         for a in 0..num_actions {
@@ -676,5 +792,73 @@ impl HexGNNModel {
         self.w_act2.adam_update(&grads.w_act2.weight, &grads.w_act2.bias, lr, beta1, beta2, eps, t);
         self.w_val1.adam_update(&grads.w_val1.weight, &grads.w_val1.bias, lr, beta1, beta2, eps, t);
         self.w_val2.adam_update(&grads.w_val2.weight, &grads.w_val2.bias, lr, beta1, beta2, eps, t);
+    }
+
+    pub fn save_to_file(&self, path: &str) -> std::io::Result<()> {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::File::create(path)?;
+        let mut writer = std::io::BufWriter::new(file);
+
+        // Magic number & header
+        use std::io::Write;
+        writer.write_all(b"DORF_GNN_V1")?;
+        writer.write_all(&(self.step_count as u64).to_le_bytes())?;
+
+        self.w_self1.save_to_writer(&mut writer)?;
+        self.w_neigh1.save_to_writer(&mut writer)?;
+        self.w_self2.save_to_writer(&mut writer)?;
+        self.w_neigh2.save_to_writer(&mut writer)?;
+        self.w_self3.save_to_writer(&mut writer)?;
+        self.w_neigh3.save_to_writer(&mut writer)?;
+        self.w_act1.save_to_writer(&mut writer)?;
+        self.w_act2.save_to_writer(&mut writer)?;
+        self.w_val1.save_to_writer(&mut writer)?;
+        self.w_val2.save_to_writer(&mut writer)?;
+
+        writer.flush()?;
+        Ok(())
+    }
+
+    pub fn load_from_file(path: &str) -> std::io::Result<Self> {
+        use std::io::Read;
+        let file = std::fs::File::open(path)?;
+        let mut reader = std::io::BufReader::new(file);
+
+        let mut magic = [0u8; 11];
+        reader.read_exact(&mut magic)?;
+        if &magic != b"DORF_GNN_V1" {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid model format"));
+        }
+
+        let mut buf8 = [0u8; 8];
+        reader.read_exact(&mut buf8)?;
+        let step_count = u64::from_le_bytes(buf8) as usize;
+
+        let w_self1 = Linear::load_from_reader(&mut reader)?;
+        let w_neigh1 = Linear::load_from_reader(&mut reader)?;
+        let w_self2 = Linear::load_from_reader(&mut reader)?;
+        let w_neigh2 = Linear::load_from_reader(&mut reader)?;
+        let w_self3 = Linear::load_from_reader(&mut reader)?;
+        let w_neigh3 = Linear::load_from_reader(&mut reader)?;
+        let w_act1 = Linear::load_from_reader(&mut reader)?;
+        let w_act2 = Linear::load_from_reader(&mut reader)?;
+        let w_val1 = Linear::load_from_reader(&mut reader)?;
+        let w_val2 = Linear::load_from_reader(&mut reader)?;
+
+        Ok(Self {
+            w_self1,
+            w_neigh1,
+            w_self2,
+            w_neigh2,
+            w_self3,
+            w_neigh3,
+            w_act1,
+            w_act2,
+            w_val1,
+            w_val2,
+            step_count,
+        })
     }
 }

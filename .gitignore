@@ -1,2 +1,6 @@
 /target
 /.agents
+models/alphazero_latest.bin
+models/alphazero_meta.txt
+models/alphazero_buffer.bin
+models/alphazero_best.bin

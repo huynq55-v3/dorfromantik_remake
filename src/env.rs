@@ -239,6 +239,13 @@ impl DorfromantikEnv {
         }
     }
 
+    /// Kiểm tra trạng thái kết thúc ván đấu
+    pub fn is_game_over(&self) -> bool {
+        self.score_manager.remaining_tiles == 0
+            || self.placed_count >= self.tile_limit
+            || self.get_valid_actions().is_empty()
+    }
+
     /// Trích xuất Đặc trưng Đồ thị (Graph Feature Extraction) cho GNN
     pub fn extract_graph_observation(&self) -> GraphObservation {
         let placed = &self.board.placed_tiles;
