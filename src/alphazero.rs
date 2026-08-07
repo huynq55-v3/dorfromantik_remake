@@ -272,6 +272,28 @@ impl Default for AlphaZeroTrainerConfig {
     }
 }
 
+/// Bản ghi chi tiết từng nước đi trong ván chơi (dùng để lưu kỷ lục và replay)
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GameMoveRecord {
+    pub step: usize,
+    pub q: i32,
+    pub r: i32,
+    pub rotation: usize,
+    pub score_gained: usize,
+    pub total_score: usize,
+    pub remaining_tiles: usize,
+}
+
+/// Bản ghi toàn bộ thông tin của 1 ván chơi (Match Record)
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GameMatchRecord {
+    pub seed: i32,
+    pub total_score: usize,
+    pub total_placed: usize,
+    pub is_eval: bool,
+    pub moves: Vec<GameMoveRecord>,
+}
+
 /// Thu thập dữ liệu 1 ván tự chơi (Self-Play Episode) sử dụng MCTS (200 simulations)
 pub fn run_self_play_episode(
     seed: i32,
@@ -279,11 +301,12 @@ pub fn run_self_play_episode(
     model: &HexGNNModel,
     mcts_config: &MCTSConfig,
     temp_threshold: usize,
-) -> (Vec<AlphaZeroSample>, usize, usize) {
+) -> (Vec<AlphaZeroSample>, GameMatchRecord) {
     let mut env = DorfromantikEnv::new(seed, 10, tile_limit);
     let mcts = MCTSSearch::new(mcts_config.clone());
 
     let mut raw_steps: Vec<(GraphObservation, Vec<f32>, f32)> = Vec::new();
+    let mut move_records: Vec<GameMoveRecord> = Vec::new();
     let mut move_count = 0;
 
     loop {
@@ -301,8 +324,20 @@ pub fn run_self_play_episode(
         };
 
         let (pi_probs, _, chosen_action, _) = mcts.search(&env, model, add_dirichlet, temperature);
+        let prev_score = env.score_manager.total_score;
         let res = env.step(chosen_action);
+        let score_gained = env.score_manager.total_score.saturating_sub(prev_score);
         let scaled_r = res.reward * 0.05;
+
+        move_records.push(GameMoveRecord {
+            step: move_count,
+            q: chosen_action.q,
+            r: chosen_action.r,
+            rotation: chosen_action.rotation,
+            score_gained,
+            total_score: env.score_manager.total_score,
+            remaining_tiles: env.score_manager.remaining_tiles,
+        });
 
         raw_steps.push((obs, pi_probs, scaled_r));
         move_count += 1;
@@ -331,7 +366,14 @@ pub fn run_self_play_episode(
     }
 
     samples.reverse();
-    (samples, final_score, placed_count)
+    let record = GameMatchRecord {
+        seed,
+        total_score: final_score,
+        total_placed: placed_count,
+        is_eval: false,
+        moves: move_records,
+    };
+    (samples, record)
 }
 
 /// Đánh giá sức mạnh của Model hiện tại với MCTS Greedy (Nhiệt độ = 0.0) trên Seed mục tiêu
@@ -340,9 +382,11 @@ pub fn evaluate_alphazero_agent(
     tile_limit: usize,
     model: &HexGNNModel,
     mcts_config: &MCTSConfig,
-) -> (usize, usize) {
+) -> (usize, usize, GameMatchRecord) {
     let mut env = DorfromantikEnv::new(seed, 10, tile_limit);
     let mcts = MCTSSearch::new(mcts_config.clone());
+    let mut move_records: Vec<GameMoveRecord> = Vec::new();
+    let mut move_count = 0;
 
     while !env.is_game_over() {
         let obs = env.extract_graph_observation();
@@ -351,13 +395,35 @@ pub fn evaluate_alphazero_agent(
         }
         // Đánh giá thuần túy: temperature = 0.0 (chọn max visit count), không dirichlet noise
         let (_, _, chosen_action, _) = mcts.search(&env, model, false, 0.0);
+        let prev_score = env.score_manager.total_score;
         let res = env.step(chosen_action);
+        let score_gained = env.score_manager.total_score.saturating_sub(prev_score);
+
+        move_records.push(GameMoveRecord {
+            step: move_count,
+            q: chosen_action.q,
+            r: chosen_action.r,
+            rotation: chosen_action.rotation,
+            score_gained,
+            total_score: env.score_manager.total_score,
+            remaining_tiles: env.score_manager.remaining_tiles,
+        });
+        move_count += 1;
+
         if res.done {
             break;
         }
     }
 
-    (env.score_manager.total_score, env.placed_count)
+    let record = GameMatchRecord {
+        seed,
+        total_score: env.score_manager.total_score,
+        total_placed: env.placed_count,
+        is_eval: true,
+        moves: move_records,
+    };
+
+    (env.score_manager.total_score, env.placed_count, record)
 }
 
 /// Pipeline Huấn luyện AlphaZero / Expert Iteration
@@ -379,7 +445,7 @@ impl AlphaZeroPipeline {
     }
 
     /// Thu thập dữ liệu tự chơi qua Rayon đa luồng (Parallel Self-Play)
-    pub fn collect_self_play_data(&mut self) -> (f32, usize, usize) {
+    pub fn collect_self_play_data(&mut self) -> (f32, usize, usize, Option<GameMatchRecord>) {
         let n_envs = self.config.num_parallel_envs;
         let base_seed = self.config.target_seed;
         let tile_limit = self.config.tile_limit;
@@ -399,7 +465,7 @@ impl AlphaZeroPipeline {
             .collect();
 
         // Chạy đa luồng song song các ván đấu MCTS
-        let results: Vec<(Vec<AlphaZeroSample>, usize, usize)> = seeds
+        let results: Vec<(Vec<AlphaZeroSample>, GameMatchRecord)> = seeds
             .into_par_iter()
             .map(|s| run_self_play_episode(s, tile_limit, model_ref, &mcts_cfg, temp_thresh))
             .collect();
@@ -407,11 +473,15 @@ impl AlphaZeroPipeline {
         let mut total_score = 0;
         let mut max_score = 0;
         let mut total_placed = 0;
+        let mut best_record: Option<GameMatchRecord> = None;
 
-        for (samples, score, placed) in results {
+        for (samples, record) in results {
+            let score = record.total_score;
+            let placed = record.total_placed;
             total_score += score;
-            if score > max_score {
+            if score >= max_score {
                 max_score = score;
+                best_record = Some(record);
             }
             total_placed += placed;
             self.replay_buffer.push_batch(samples);
@@ -419,7 +489,7 @@ impl AlphaZeroPipeline {
 
         let avg_score = total_score as f32 / n_envs as f32;
         let avg_placed = total_placed / n_envs;
-        (avg_score, max_score, avg_placed)
+        (avg_score, max_score, avg_placed, best_record)
     }
 
     /// Huấn luyện mạng GNN trên mini-batches từ Replay Buffer bằng Adam Optimizer

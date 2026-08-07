@@ -1,7 +1,9 @@
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
-use dorfromantik_remake::alphazero::{AlphaZeroPipeline, AlphaZeroTrainerConfig, evaluate_alphazero_agent};
+use dorfromantik_remake::alphazero::{
+    evaluate_alphazero_agent, AlphaZeroPipeline, AlphaZeroTrainerConfig, GameMatchRecord,
+};
 use dorfromantik_remake::mcts::MCTSConfig;
 
 fn main() {
@@ -12,7 +14,7 @@ fn main() {
     let target_seed = -2093096630;
     let tile_limit = 100;
     let parallel_envs = 16;
-    
+
     // Đọc số simulations từ tham số dòng lệnh nếu có (mặc định 200)
     let args: Vec<String> = std::env::args().collect();
     let n_simulations = if args.len() > 1 {
@@ -20,7 +22,7 @@ fn main() {
     } else {
         200
     };
-    
+
     let lr = 0.0003;
 
     let config = AlphaZeroTrainerConfig {
@@ -48,12 +50,27 @@ fn main() {
     let best_model_path = format!("{}/alphazero_best.bin", model_dir);
     let buffer_path = format!("{}/alphazero_buffer.bin", model_dir);
     let meta_path = format!("{}/alphazero_meta.txt", model_dir);
+    let best_game_path = format!("{}/best_game_record.json", model_dir);
 
     let mut pipeline = AlphaZeroPipeline::new(config.clone());
     let mut start_iter = 0;
     let mut best_eval_score = 0;
+    let mut all_time_best_match_score = 0;
 
-    // Tự động kiểm tra và khôi phục từ Checkpoint cũ nếu có
+    // Tự động kiểm tra và khôi phục kỷ lục ván chơi tốt nhất (Best Match Record)
+    if Path::new(&best_game_path).exists() {
+        if let Ok(content) = fs::read_to_string(&best_game_path) {
+            if let Ok(record) = serde_json::from_str::<GameMatchRecord>(&content) {
+                all_time_best_match_score = record.total_score;
+                println!(
+                    ">>> [LOADED BEST MATCH] Record: {} pts | Placed: {} tiles | Seed: {}",
+                    record.total_score, record.total_placed, record.seed
+                );
+            }
+        }
+    }
+
+    // Tự động kiểm tra và khôi phục từ Checkpoint Model cũ nếu có
     if Path::new(&latest_model_path).exists() {
         print!("Loading checkpoint from {} ... ", latest_model_path);
         if pipeline.load_checkpoint(&latest_model_path, &buffer_path).is_ok() {
@@ -65,7 +82,12 @@ fn main() {
                 }
             }
             println!("SUCCESS!");
-            println!(">>> RESUMED from Iter {:04} | Buffer: {:>5} samples | Best Score: {}", start_iter, pipeline.buffer_len(), best_eval_score);
+            println!(
+                ">>> RESUMED from Iter {:04} | Buffer: {:>5} samples | Best Eval Score: {}",
+                start_iter,
+                pipeline.buffer_len(),
+                best_eval_score
+            );
         } else {
             println!("FAILED. Starting from scratch.");
         }
@@ -77,6 +99,7 @@ fn main() {
     println!("Parallel Envs      : {} threads", parallel_envs);
     println!("Learning Rate      : {}", lr);
     println!("Replay Buffer Cap  : 50,000 samples");
+    println!("All-time Match Max : {} pts", all_time_best_match_score);
     println!("Training Mode      : Continuous Infinite Loop (Ctrl+C to stop anytime)");
     println!("------------------------------------------------------------");
 
@@ -85,7 +108,8 @@ fn main() {
 
         // 1. Data Generation via MCTS Self-Play
         let t_gen_start = Instant::now();
-        let (self_play_avg_score, self_play_max_score, self_play_avg_placed) = pipeline.collect_self_play_data();
+        let (self_play_avg_score, self_play_max_score, self_play_avg_placed, sp_best_match) =
+            pipeline.collect_self_play_data();
         let t_gen = t_gen_start.elapsed();
 
         // 2. Training on Replay Buffer (Mini-batches with Adam Optimizer)
@@ -94,14 +118,29 @@ fn main() {
         let t_train = t_train_start.elapsed();
 
         // 3. Evaluation on Target Seed
-        let (eval_score, eval_placed) = evaluate_alphazero_agent(
-            target_seed,
-            tile_limit,
-            &pipeline.model,
-            &config.mcts_config,
-        );
+        let (eval_score, eval_placed, eval_match) =
+            evaluate_alphazero_agent(target_seed, tile_limit, &pipeline.model, &config.mcts_config);
 
         let t_total = t_start.elapsed();
+
+        // Kiểm tra xem có ván đấu nào (Self-Play hoặc Eval) phá vỡ kỷ lục mọi thời đại không
+        let mut new_match_record_saved = false;
+        if let Some(sp_record) = sp_best_match {
+            if sp_record.total_score > all_time_best_match_score {
+                all_time_best_match_score = sp_record.total_score;
+                if let Ok(json_str) = serde_json::to_string_pretty(&sp_record) {
+                    let _ = fs::write(&best_game_path, json_str);
+                    new_match_record_saved = true;
+                }
+            }
+        }
+        if eval_match.total_score > all_time_best_match_score {
+            all_time_best_match_score = eval_match.total_score;
+            if let Ok(json_str) = serde_json::to_string_pretty(&eval_match) {
+                let _ = fs::write(&best_game_path, json_str);
+                new_match_record_saved = true;
+            }
+        }
 
         let is_best = eval_score > best_eval_score;
         if is_best {
@@ -113,8 +152,12 @@ fn main() {
         let _ = pipeline.save_checkpoint(&latest_model_path, &buffer_path);
         let _ = fs::write(&meta_path, format!("{},{}", iter, best_eval_score));
 
-        let flag = if is_best {
-            " [BEST SAVED]"
+        let flag = if is_best && new_match_record_saved {
+            " [BEST EVAL & NEW MATCH RECORD!]"
+        } else if new_match_record_saved {
+            " [NEW ALL-TIME MATCH RECORD!]"
+        } else if is_best {
+            " [BEST EVAL SAVED]"
         } else {
             " [SAVED]"
         };
