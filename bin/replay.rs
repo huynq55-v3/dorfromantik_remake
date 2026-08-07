@@ -120,10 +120,10 @@ async fn main() {
         last_mouse_pos = current_mouse_pos;
 
         let speed = 500.0 / zoom;
-        if is_key_down(KeyCode::W) || is_key_down(KeyCode::Up) { camera_pos.y -= speed * delta; }
-        if is_key_down(KeyCode::S) || is_key_down(KeyCode::Down) { camera_pos.y += speed * delta; }
-        if is_key_down(KeyCode::A) || is_key_down(KeyCode::Left) { camera_pos.x -= speed * delta; }
-        if is_key_down(KeyCode::D) || is_key_down(KeyCode::Right) { camera_pos.x += speed * delta; }
+        if is_key_down(KeyCode::W) { camera_pos.y -= speed * delta; }
+        if is_key_down(KeyCode::S) { camera_pos.y += speed * delta; }
+        if is_key_down(KeyCode::A) { camera_pos.x -= speed * delta; }
+        if is_key_down(KeyCode::D) { camera_pos.x += speed * delta; }
 
         let wheel = mouse_wheel().1;
         if wheel > 0.0 { zoom *= 1.12; }
@@ -138,7 +138,7 @@ async fn main() {
 
         let center_vec = Vec2::new(screen_w * 0.5, screen_h * 0.5);
 
-        // Step Forward/Backward
+        // Step Forward
         if is_key_pressed(KeyCode::Right) || is_key_pressed(KeyCode::Space) {
             if current_step < record.moves.len() {
                 let m = &record.moves[current_step];
@@ -161,6 +161,25 @@ async fn main() {
                 } else {
                     println!("WARNING: Move not legal! Step {} ({}, {}) Rot: {}", current_step, m.q, m.r, m.rotation);
                 }
+            }
+        }
+
+        // Step Backward (Rewind)
+        if is_key_pressed(KeyCode::Left) || is_key_pressed(KeyCode::Backspace) {
+            if current_step > 0 {
+                current_step -= 1;
+                env = DorfromantikEnv::new(record.seed, stack_height, 100);
+                for s in 0..current_step {
+                    let m = &record.moves[s];
+                    let legal_actions = env.get_valid_actions();
+                    for action in legal_actions.iter() {
+                        if action.q == m.q && action.r == m.r && action.rotation == m.rotation {
+                            env.step(*action);
+                            break;
+                        }
+                    }
+                }
+                println!("Step Backward -> Step {}", current_step);
             }
         }
         
@@ -218,15 +237,16 @@ async fn main() {
         }
 
         // UI Overlay
-        draw_rectangle(15.0, 15.0, 380.0, 160.0, Color::from_rgba(10, 12, 18, 230));
-        draw_rectangle_lines(15.0, 15.0, 380.0, 160.0, 2.0, SKYBLUE);
+        draw_rectangle(15.0, 15.0, 390.0, 175.0, Color::from_rgba(10, 12, 18, 230));
+        draw_rectangle_lines(15.0, 15.0, 390.0, 175.0, 2.0, SKYBLUE);
 
         draw_text("REPLAY VISUALIZER", 28.0, 38.0, 20.0, SKYBLUE);
         draw_text(&format!("Step: {} / {}", current_step, record.moves.len()), 28.0, 65.0, 18.0, WHITE);
         draw_text(&format!("Total Score: {} pts", env.score_manager.total_score), 28.0, 88.0, 18.0, GOLD);
         draw_text(&format!("Tile Stack: {} remaining", env.score_manager.remaining_tiles), 28.0, 110.0, 16.0, WHITE);
-        draw_text("Right / Space: Step Forward", 28.0, 132.0, 15.0, LIGHTGRAY);
-        draw_text("R: Reset Replay", 28.0, 150.0, 15.0, LIGHTGRAY);
+        draw_text("Right Arrow / Space: Step Forward", 28.0, 132.0, 14.0, LIGHTGRAY);
+        draw_text("Left Arrow / Backspace: Step Backward", 28.0, 149.0, 14.0, LIGHTGRAY);
+        draw_text("WASD: Move Camera | R: Reset Replay", 28.0, 166.0, 14.0, LIGHTGRAY);
 
         next_frame().await;
     }

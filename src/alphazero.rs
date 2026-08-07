@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 use crate::env::{DorfromantikEnv, GraphObservation};
 use crate::mcts::{MCTSConfig, MCTSSearch};
 use crate::nn::HexGNNModel;
+use crate::gpu_nn::GpuNNExecutor;
 
 /// Mẫu dữ liệu huấn luyện AlphaZero (State Observation, Target Policy Distribution từ MCTS, Target Value từ Game Return)
 #[derive(Debug, Clone)]
@@ -379,7 +380,138 @@ pub fn run_self_play_episode(
     (samples, record)
 }
 
+/// Thu thập dữ liệu 1 ván tự chơi GPU (Self-Play Episode) qua GpuEvalQueue
+pub fn run_self_play_episode_gpu(
+    seed: i32,
+    initial_stack: usize,
+    tile_limit: usize,
+    eval_tx: &crossbeam_channel::Sender<crate::gpu_engine::GpuEvalRequest>,
+    mcts_config: &MCTSConfig,
+    temp_threshold: usize,
+) -> (Vec<AlphaZeroSample>, GameMatchRecord) {
+    let mut env = DorfromantikEnv::new(seed, initial_stack, tile_limit);
+    let mcts = MCTSSearch::new(mcts_config.clone());
+
+    let mut raw_steps: Vec<(GraphObservation, Vec<f32>, f32)> = Vec::new();
+    let mut move_records: Vec<GameMoveRecord> = Vec::new();
+    let mut move_count = 0;
+
+    loop {
+        let obs = env.extract_graph_observation();
+        if obs.valid_actions.is_empty() {
+            break;
+        }
+
+        let (temperature, add_dirichlet) = if move_count < temp_threshold {
+            (1.0f32, true)
+        } else {
+            (0.2f32, false)
+        };
+
+        let (pi_probs, _, chosen_action, _) = mcts.search_gpu(&env, eval_tx, add_dirichlet, temperature);
+        let prev_score = env.score_manager.total_score;
+        let res = env.step(chosen_action);
+        let score_gained = env.score_manager.total_score.saturating_sub(prev_score);
+        let scaled_r = res.reward * 0.01;
+
+        move_records.push(GameMoveRecord {
+            step: move_count,
+            q: chosen_action.q,
+            r: chosen_action.r,
+            rotation: chosen_action.rotation,
+            score_gained,
+            total_score: env.score_manager.total_score,
+            remaining_tiles: env.score_manager.remaining_tiles,
+        });
+
+        raw_steps.push((obs, pi_probs, scaled_r));
+        move_count += 1;
+
+        if res.done {
+            break;
+        }
+    }
+
+    let final_score = env.score_manager.total_score;
+    let placed_count = env.placed_count;
+
+    let total_steps = raw_steps.len();
+    let mut samples = Vec::with_capacity(total_steps);
+    let mut g = 0.0f32;
+
+    for t in (0..total_steps).rev() {
+        let (obs, pi, r) = raw_steps[t].clone();
+        g = r + mcts_config.gamma * g;
+        samples.push(AlphaZeroSample {
+            obs,
+            target_pi: pi,
+            target_val: g,
+        });
+    }
+
+    samples.reverse();
+    let record = GameMatchRecord {
+        seed,
+        total_score: final_score,
+        total_placed: placed_count,
+        is_eval: false,
+        moves: move_records,
+    };
+    (samples, record)
+}
+
+/// Đánh giá sức mạnh của Model hiện tại với MCTS Greedy trên GPU
+pub fn evaluate_alphazero_agent_gpu(
+    seed: i32,
+    initial_stack: usize,
+    tile_limit: usize,
+    eval_tx: &crossbeam_channel::Sender<crate::gpu_engine::GpuEvalRequest>,
+    mcts_config: &MCTSConfig,
+) -> (usize, usize, GameMatchRecord) {
+    let mut env = DorfromantikEnv::new(seed, initial_stack, tile_limit);
+    let mcts = MCTSSearch::new(mcts_config.clone());
+    let mut move_records: Vec<GameMoveRecord> = Vec::new();
+    let mut move_count = 0;
+
+    while !env.is_game_over() {
+        let obs = env.extract_graph_observation();
+        if obs.valid_actions.is_empty() {
+            break;
+        }
+        let (_, _, chosen_action, _) = mcts.search_gpu(&env, eval_tx, false, 0.0);
+        let prev_score = env.score_manager.total_score;
+        let res = env.step(chosen_action);
+        let score_gained = env.score_manager.total_score.saturating_sub(prev_score);
+
+        move_records.push(GameMoveRecord {
+            step: move_count,
+            q: chosen_action.q,
+            r: chosen_action.r,
+            rotation: chosen_action.rotation,
+            score_gained,
+            total_score: env.score_manager.total_score,
+            remaining_tiles: env.score_manager.remaining_tiles,
+        });
+        move_count += 1;
+
+        if res.done {
+            break;
+        }
+    }
+
+    let record = GameMatchRecord {
+        seed,
+        total_score: env.score_manager.total_score,
+        total_placed: env.placed_count,
+        is_eval: true,
+        moves: move_records,
+    };
+
+    (env.score_manager.total_score, env.placed_count, record)
+}
+
 /// Đánh giá sức mạnh của Model hiện tại với MCTS Greedy (Nhiệt độ = 0.0) trên Seed mục tiêu
+
 pub fn evaluate_alphazero_agent(
     seed: i32,
     initial_stack: usize,
@@ -448,7 +580,175 @@ impl AlphaZeroPipeline {
         }
     }
 
-    /// Thu thập dữ liệu tự chơi qua Rayon đa luồng (Parallel Self-Play)
+    /// Thu thập dữ liệu tự chơi GPU (Parallel GPU Self-Play)
+    pub fn collect_self_play_data_gpu(
+        &mut self,
+        eval_tx: &crossbeam_channel::Sender<crate::gpu_engine::GpuEvalRequest>,
+    ) -> (f32, usize, usize, Option<GameMatchRecord>) {
+        let n_envs = self.config.num_parallel_envs;
+        let base_seed = self.config.target_seed;
+        let initial_stack = self.config.initial_stack;
+        let tile_limit = self.config.tile_limit;
+        let mcts_cfg = self.config.mcts_config.clone();
+        let temp_thresh = self.config.temp_threshold_moves;
+
+        let seeds: Vec<i32> = vec![base_seed; n_envs];
+
+        let results: Vec<(Vec<AlphaZeroSample>, GameMatchRecord)> = seeds
+            .into_par_iter()
+            .map(|s| run_self_play_episode_gpu(s, initial_stack, tile_limit, eval_tx, &mcts_cfg, temp_thresh))
+            .collect();
+
+        let mut total_score = 0;
+        let mut max_score = 0;
+        let mut total_placed = 0;
+        let mut best_record: Option<GameMatchRecord> = None;
+
+        for (samples, record) in results {
+            let score = record.total_score;
+            let placed = record.total_placed;
+            total_score += score;
+            if score >= max_score {
+                max_score = score;
+                best_record = Some(record);
+            }
+            total_placed += placed;
+            self.replay_buffer.push_batch(samples);
+        }
+
+        let avg_score = total_score as f32 / n_envs as f32;
+        let avg_placed = total_placed / n_envs;
+        (avg_score, max_score, avg_placed, best_record)
+    }
+
+    /// Thu thập dữ liệu tự chơi bằng Vectorized Batch MCTS (Không channel, không lock-step stall)
+    /// Khi có gpu_exec: dùng GPU inference cho neural network evaluation.
+    pub fn collect_self_play_data_batch(&mut self, gpu_exec: Option<&GpuNNExecutor>) -> (f32, usize, usize, Option<GameMatchRecord>) {
+        let n_envs = self.config.num_parallel_envs;
+        let base_seed = self.config.target_seed;
+        let initial_stack = self.config.initial_stack;
+        let tile_limit = self.config.tile_limit;
+        let mcts_cfg = self.config.mcts_config.clone();
+        let temp_thresh = self.config.temp_threshold_moves;
+        let mcts = MCTSSearch::new(mcts_cfg.clone());
+
+        let mut envs: Vec<DorfromantikEnv> = (0..n_envs)
+            .map(|_| DorfromantikEnv::new(base_seed, initial_stack, tile_limit))
+            .collect();
+
+        let mut raw_steps: Vec<Vec<(GraphObservation, Vec<f32>, f32)>> = vec![Vec::new(); n_envs];
+        let mut move_records: Vec<Vec<GameMoveRecord>> = vec![Vec::new(); n_envs];
+        let mut move_counts = vec![0usize; n_envs];
+        let mut active = vec![true; n_envs];
+        let mut turn_counter = 0usize;
+        use std::io::Write;
+
+        print!("[Self-Play Progress] ");
+        let _ = std::io::stdout().flush();
+
+        while active.iter().any(|&a| a) {
+            let active_indices: Vec<usize> = (0..n_envs).filter(|&i| active[i]).collect();
+            let active_envs: Vec<DorfromantikEnv> = active_indices.iter().map(|&i| envs[i].clone()).collect();
+
+            if active_indices.is_empty() {
+                break;
+            }
+
+            turn_counter += 1;
+            print!(".");
+            if turn_counter % 25 == 0 {
+                print!(" [Turn {} | Active: {}/{}]\n[Self-Play Progress] ", turn_counter, active_indices.len(), n_envs);
+            }
+            let _ = std::io::stdout().flush();
+
+            let add_dirichlet = move_counts[active_indices[0]] < temp_thresh;
+            let temp = if move_counts[active_indices[0]] < temp_thresh { 1.0f32 } else { 0.2f32 };
+
+            let batch_results = mcts.search_batch(&active_envs, &self.model, gpu_exec, add_dirichlet, temp);
+
+            for (k, &idx) in active_indices.iter().enumerate() {
+                let (pi_probs, _, chosen_action, _) = &batch_results[k];
+                let obs = envs[idx].extract_graph_observation();
+
+                if obs.valid_actions.is_empty() {
+                    active[idx] = false;
+                    print!("\n  ✓ [Env #{} Kết thúc] Score: {}, Placed: {} tiles\n[Self-Play Progress] ", idx + 1, envs[idx].score_manager.total_score, envs[idx].placed_count);
+                    let _ = std::io::stdout().flush();
+                    continue;
+                }
+
+                let prev_score = envs[idx].score_manager.total_score;
+                let res = envs[idx].step(*chosen_action);
+                let score_gained = envs[idx].score_manager.total_score.saturating_sub(prev_score);
+                let scaled_r = res.reward * 0.01;
+
+                move_records[idx].push(GameMoveRecord {
+                    step: move_counts[idx],
+                    q: chosen_action.q,
+                    r: chosen_action.r,
+                    rotation: chosen_action.rotation,
+                    score_gained,
+                    total_score: envs[idx].score_manager.total_score,
+                    remaining_tiles: envs[idx].score_manager.remaining_tiles,
+                });
+
+                raw_steps[idx].push((obs, pi_probs.clone(), scaled_r));
+                move_counts[idx] += 1;
+
+                if res.done || envs[idx].is_game_over() {
+                    active[idx] = false;
+                    print!("\n  ✓ [Env #{} Kết thúc] Score: {}, Placed: {} tiles\n[Self-Play Progress] ", idx + 1, envs[idx].score_manager.total_score, envs[idx].placed_count);
+                    let _ = std::io::stdout().flush();
+                }
+            }
+        }
+        println!();
+
+        let mut total_score = 0;
+        let mut max_score = 0;
+        let mut total_placed = 0;
+        let mut best_record: Option<GameMatchRecord> = None;
+
+        for i in 0..n_envs {
+            let final_score = envs[i].score_manager.total_score;
+            let placed_count = envs[i].placed_count;
+            total_score += final_score;
+            if final_score >= max_score {
+                max_score = final_score;
+                best_record = Some(GameMatchRecord {
+                    seed: base_seed,
+                    total_score: final_score,
+                    total_placed: placed_count,
+                    is_eval: false,
+                    moves: move_records[i].clone(),
+                });
+            }
+            total_placed += placed_count;
+
+            let total_steps = raw_steps[i].len();
+            let mut samples = Vec::with_capacity(total_steps);
+            let mut g = 0.0f32;
+
+            for t in (0..total_steps).rev() {
+                let (obs, pi, r) = raw_steps[i][t].clone();
+                g = r + mcts_cfg.gamma * g;
+                samples.push(AlphaZeroSample {
+                    obs,
+                    target_pi: pi,
+                    target_val: g,
+                });
+            }
+            samples.reverse();
+            self.replay_buffer.push_batch(samples);
+        }
+
+        let avg_score = total_score as f32 / n_envs as f32;
+        let avg_placed = total_placed / n_envs;
+        (avg_score, max_score, avg_placed, best_record)
+    }
+
+    /// Thu thập dữ liệu tự chơi qua Rayon đa luồng (Parallel Self-Play CPU)
+
     pub fn collect_self_play_data(&mut self) -> (f32, usize, usize, Option<GameMatchRecord>) {
         let n_envs = self.config.num_parallel_envs;
         let base_seed = self.config.target_seed;

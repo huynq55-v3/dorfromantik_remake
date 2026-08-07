@@ -10,3 +10,7 @@ pub mod quest_manager;
 pub mod score_manager;
 pub mod tile;
 pub mod unity_random;
+pub mod gpu_engine;
+pub mod gpu_nn;
+
+

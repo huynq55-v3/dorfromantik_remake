@@ -11,6 +11,11 @@ rand_distr = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
+crossbeam-channel = "0.5"
+wgpu = "24.0"
+pollster = "0.4"
+bytemuck = { version = "1.14", features = ["derive"] }
+
 [[bin]]
 name = "simulator"
 path = "bin/simulator.rs"
@@ -32,5 +37,10 @@ name = "train_alphazero"
 path = "bin/train_alphazero.rs"
 
 [[bin]]
+name = "train_alphazero_gpu"
+path = "bin/train_alphazero_gpu.rs"
+
+[[bin]]
 name = "debug_seed"
 path = "bin/debug_seed.rs"
+

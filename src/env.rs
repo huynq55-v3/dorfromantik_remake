@@ -86,14 +86,22 @@ impl DorfromantikEnv {
         };
         self.board.place_tile(0, 0, initial_tile, 0);
 
-        // 2. Pre-fill tile queue with 4 upcoming tiles
-        for _ in 0..4 {
-            let active_count = self.quest_manager.pop_next_active_quest_count();
-            let mut tile = self.generator.generate_tile(None, active_count, None, self.quest_manager.level);
-            if matches!(tile, GeneratedTile::Quest { .. }) {
-                crate::quest_manager::initialize_active_quest_tile(&mut tile, &self.board, &mut self.quest_manager);
-            }
+        // 2. Sinh 3 tile preview ban đầu (Tile #1, #2, #3) — khớp với simulator.rs
+        for _ in 0..3 {
+            let active_count = self.quest_manager.pop_next_active_quest_count(); // pops 0, 0, 0
+            let tile = self.generator.generate_tile(None, active_count, None, self.quest_manager.level);
             self.tile_queue.push_back(tile);
+        }
+
+        // Kích hoạt QuestWatcher CHỈ cho ô đầu cọc bài (Active Tile ở vị trí topStackPreview)
+        if let Some(front_tile) = self.tile_queue.front_mut() {
+            if let GeneratedTile::Quest { ref mut quest_data, .. } = front_tile {
+                if quest_data.quest_id.is_none() {
+                    let qid = self.quest_manager.add_quest(&quest_data.quest_type);
+                    quest_data.quest_id = Some(qid);
+                }
+            }
+            crate::quest_manager::initialize_active_quest_tile(front_tile, &self.board, &mut self.quest_manager);
         }
     }
 
@@ -135,21 +143,6 @@ impl DorfromantikEnv {
             };
         };
 
-        // Tính tiến độ nhiệm vụ trước khi đặt tile
-        let prev_quest_progress: usize = self.board.placed_tiles.iter()
-            .filter_map(|(&pos, pt)| {
-                if let GeneratedTile::Quest { quest_data, .. } = &pt.tile {
-                    if !pt.quest_finalized {
-                        let gt = quest_data.primary_group_type();
-                        let target = quest_data.remaining_display_value();
-                        let cur = self.board.get_quest_external_count(pos, gt);
-                        return Some(cur.min(target));
-                    }
-                }
-                None
-            })
-            .sum();
-
         // Đặt tile lên bàn bài
         let (placed_ok, quest_succeeded_count) = self.board.place_tile_with_manager(
             action.q,
@@ -172,7 +165,7 @@ impl DorfromantikEnv {
         self.placed_count += 1;
 
         // Cập nhật điểm số và số lượng tile trong stack qua ScoreManager
-        let breakdown = self.score_manager.on_tile_placed(
+        let _breakdown = self.score_manager.on_tile_placed(
             &self.board,
             action.q,
             action.r,
@@ -180,47 +173,24 @@ impl DorfromantikEnv {
             0,
         );
 
-        // Tính tiến độ nhiệm vụ sau khi đặt tile
-        let new_quest_progress: usize = self.board.placed_tiles.iter()
-            .filter_map(|(&pos, pt)| {
-                if let GeneratedTile::Quest { quest_data, .. } = &pt.tile {
-                    let gt = quest_data.primary_group_type();
-                    let target = quest_data.remaining_display_value();
-                    let cur = self.board.get_quest_external_count(pos, gt);
-                    return Some(cur.min(target));
-                }
-                None
-            })
-            .sum();
-        let quest_progress_delta = new_quest_progress.saturating_sub(prev_quest_progress);
-
         let step_score_delta = self.score_manager.total_score - prev_score;
+        let reward = step_score_delta as f32;
 
-        let mut shaped_reward = step_score_delta as f32;
-        if quest_succeeded_count > 0 {
-            shaped_reward += quest_succeeded_count as f32 * 150.0;
-        }
-        if breakdown.perfect_count > 0 {
-            shaped_reward += breakdown.perfect_count as f32 * 80.0;
-        }
-        if quest_progress_delta > 0 {
-            shaped_reward += quest_progress_delta as f32 * 15.0;
-        }
-        if breakdown.matching_edges > 0 {
-            shaped_reward += breakdown.matching_edges as f32 * 5.0;
-        } else {
-            shaped_reward -= 5.0;
-        }
-        // Thưởng sinh tồn từng bước để Agent muốn duy trì ván chơi
-        shaped_reward += 2.0;
-
-        // Thêm tile mới vào cuối tile_queue
+        // Thêm tile mới vào cuối tile_queue (KHÔNG activate quest ngay — chỉ khi lên front)
         let active_count = self.quest_manager.pop_next_active_quest_count();
-        let mut new_tile = self.generator.generate_tile(None, active_count, None, self.quest_manager.level);
-        if matches!(new_tile, GeneratedTile::Quest { .. }) {
-            crate::quest_manager::initialize_active_quest_tile(&mut new_tile, &self.board, &mut self.quest_manager);
-        }
+        let new_tile = self.generator.generate_tile(None, active_count, None, self.quest_manager.level);
         self.tile_queue.push_back(new_tile);
+
+        // Kích hoạt QuestWatcher CHỈ cho ô đầu cọc bài (front) — giống simulator.rs dòng 350-368
+        if let Some(front_tile) = self.tile_queue.front_mut() {
+            if let GeneratedTile::Quest { ref mut quest_data, .. } = front_tile {
+                if quest_data.quest_id.is_none() {
+                    let qid = self.quest_manager.add_quest(&quest_data.quest_type);
+                    quest_data.quest_id = Some(qid);
+                }
+            }
+            crate::quest_manager::initialize_active_quest_tile(front_tile, &self.board, &mut self.quest_manager);
+        }
 
         // Kiểm tra điều kiện kết thúc
         let valid_actions = self.get_valid_actions();
@@ -228,12 +198,8 @@ impl DorfromantikEnv {
             || self.placed_count >= self.tile_limit
             || valid_actions.is_empty();
 
-        if done && self.placed_count < self.tile_limit {
-            shaped_reward -= 20.0; // Phạt chết sớm
-        }
-
         StepResult {
-            reward: shaped_reward,
+            reward,
             done,
             total_score: self.score_manager.total_score,
             placed_count: self.placed_count,
@@ -421,7 +387,6 @@ impl DorfromantikEnv {
                 let mut feat = [0.0f32; 16];
                 let mut matching_count = 0;
                 let mut mismatching_count = 0;
-                let mut open_count = 0;
                 let mut quest_adj = 0.0f32;
                 let mut quest_connect = 0.0f32;
 
@@ -451,25 +416,21 @@ impl DorfromantikEnv {
                                 quest_adj = 1.0;
                             }
                         }
-                    } else {
-                        open_count += 1;
                     }
                 }
 
                 feat[0] = matching_count as f32 / 6.0;
                 feat[1] = mismatching_count as f32 / 6.0;
-                feat[2] = open_count as f32 / 6.0;
-                feat[3] = if matching_count > 0 && mismatching_count == 0 {
-                    if open_count == 0 { 1.0 } else { 0.5 }
-                } else {
-                    0.0
-                };
+                feat[2] = 0.0; // Bỏ open_count feature tránh gây bias kéo dài ra ô trống ở rìa
+                feat[3] = if matching_count > 0 && mismatching_count == 0 { 1.0 } else { 0.0 };
                 feat[4] = quest_adj;
                 feat[5] = quest_connect;
                 feat[6] = is_quest_tile;
                 feat[7] = act.rotation as f32 / 6.0;
-                feat[14] = (matching_count as f32 * 10.0) / 60.0;
-                feat[15] = if quest_connect > 0.0 { 1.0 } else { 0.0 };
+                // Tọa độ vị trí action (thay thế 2 feature trùng lặp feat[0] & feat[5])
+                // Giúp model nhận biết spatial layout, tránh học diagonal chain bias
+                feat[14] = (act.q as f32 / 30.0).clamp(-1.0, 1.0);
+                feat[15] = (act.r as f32 / 30.0).clamp(-1.0, 1.0);
 
                 action_features.push(feat);
             }
