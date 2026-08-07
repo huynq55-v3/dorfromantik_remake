@@ -4,7 +4,7 @@ use crate::game_config::GroupType;
 use crate::generator::TileGenerator;
 use crate::quest_manager::QuestManager;
 use crate::score_manager::ScoreManager;
-use crate::tile::{EqualityComparison, GeneratedTile};
+use crate::tile::{EqualityComparison, GeneratedTile, EdgeType};
 
 /// Hành động đặt tile trong môi trường RL
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -141,7 +141,6 @@ impl DorfromantikEnv {
         );
 
         if !placed_ok {
-            // Hành động không hợp lệ -> Kết thúc ván đấu
             return StepResult {
                 reward: -100.0,
                 done: true,
@@ -154,7 +153,7 @@ impl DorfromantikEnv {
         self.placed_count += 1;
 
         // Cập nhật điểm số và số lượng tile trong stack qua ScoreManager
-        self.score_manager.on_tile_placed(
+        let breakdown = self.score_manager.on_tile_placed(
             &self.board,
             action.q,
             action.r,
@@ -163,6 +162,14 @@ impl DorfromantikEnv {
         );
 
         let step_score_delta = self.score_manager.total_score - prev_score;
+
+        let mut shaped_reward = step_score_delta as f32;
+        if quest_succeeded_count > 0 {
+            shaped_reward += quest_succeeded_count as f32 * 100.0;
+        }
+        if breakdown.matching_edges > 0 {
+            shaped_reward += breakdown.matching_edges as f32 * 5.0;
+        }
 
         // Thêm tile mới vào cuối tile_queue
         let active_count = self.quest_manager.pop_next_active_quest_count();
@@ -179,7 +186,7 @@ impl DorfromantikEnv {
             || valid_actions.is_empty();
 
         StepResult {
-            reward: step_score_delta as f32,
+            reward: shaped_reward,
             done,
             total_score: self.score_manager.total_score,
             placed_count: self.placed_count,
@@ -195,13 +202,11 @@ impl DorfromantikEnv {
         let mut node_positions = Vec::new();
         let mut pos_to_idx = HashMap::new();
 
-        // 1. Thu thập tất cả Placed nodes
         for &pos in placed.keys() {
             pos_to_idx.insert(pos, node_positions.len());
             node_positions.push(pos);
         }
 
-        // 2. Thu thập tất cả Candidate nodes
         for &pos in &candidates {
             if !pos_to_idx.contains_key(&pos) {
                 pos_to_idx.insert(pos, node_positions.len());
@@ -211,8 +216,9 @@ impl DorfromantikEnv {
 
         let mut node_features = Vec::with_capacity(node_positions.len());
 
-        let tile_1 = self.tile_queue.get(0);
-        let tile_2 = self.tile_queue.get(1);
+        let tile_curr = self.tile_queue.get(0);
+        let tile_1 = self.tile_queue.get(1);
+        let tile_2 = self.tile_queue.get(2);
 
         for &pos in &node_positions {
             let mut feature = [0.0f32; 38];
@@ -253,7 +259,7 @@ impl DorfromantikEnv {
                 feature[14] = ((1.0 + max_group_count as f32).log2() / (100.0_f32).log2()).clamp(0.0, 1.0);
                 feature[15] = (max_open_edges as f32 / 12.0).clamp(0.0, 1.0);
 
-                // 16..29: Quest features
+                // 16..27: Quest features
                 if let GeneratedTile::Quest { quest_data, .. } = &pt.tile {
                     feature[16] = if pt.quest_finalized { 0.0 } else { 1.0 };
                     let gt = quest_data.primary_group_type();
@@ -279,6 +285,40 @@ impl DorfromantikEnv {
 
                     if quest_data.equality == EqualityComparison::Exactly && current_ext > target_val {
                         feature[26] = 1.0; // Overfilled Exact Quest
+                    }
+                }
+            } else {
+                // CANDIDATE NODE FEATURES (Đặc trưng ô trống ứng viên)
+                // 2..8: Terrain của các ô đã đặt vây quanh
+                for dir in 0..6 {
+                    let n_pos = get_neighbor_pos(pos.0, pos.1, dir);
+                    if let Some(n_tile) = placed.get(&n_pos) {
+                        let opp_dir = (dir + 3) % 6;
+                        let edge_type = n_tile.edge_config.edges[opp_dir];
+                        feature[2 + dir] = (edge_type as usize as f32) / 7.0;
+                    }
+                }
+
+                // 8..14: Số cạnh GHÉP KHỚP HOÀN HẢO (Perfect Terrain Match) cho 6 góc xoay
+                if let Some(curr) = tile_curr {
+                    let curr_cfg = curr.to_hex_edge_config();
+                    for rot in 0..6 {
+                        if self.board.can_place_tile(pos.0, pos.1, curr, rot) {
+                            let mut perfect_matches = 0;
+                            for dir in 0..6 {
+                                let n_pos = get_neighbor_pos(pos.0, pos.1, dir);
+                                if let Some(n_tile) = placed.get(&n_pos) {
+                                    let opp_dir = (dir + 3) % 6;
+                                    let n_edge = n_tile.edge_config.edges[opp_dir];
+                                    let c_edge = curr_cfg.edge_at(dir, rot);
+
+                                    if c_edge == n_edge || (c_edge.to_group_type().is_some() && c_edge.to_group_type() == n_edge.to_group_type()) {
+                                        perfect_matches += 1;
+                                    }
+                                }
+                            }
+                            feature[8 + rot] = (perfect_matches as f32) / 6.0;
+                        }
                     }
                 }
             }

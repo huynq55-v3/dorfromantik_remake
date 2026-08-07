@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 macroquad = "0.4"
 rayon = "1.8"
+rand = "0.8"
 
 [[bin]]
 name = "simulator"
@@ -14,3 +15,11 @@ path = "bin/simulator.rs"
 [[bin]]
 name = "rl_benchmark"
 path = "bin/rl_benchmark.rs"
+
+[[bin]]
+name = "train"
+path = "bin/train.rs"
+
+[[bin]]
+name = "debug_seed"
+path = "bin/debug_seed.rs"
