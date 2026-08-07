@@ -4,7 +4,7 @@ use crate::game_config::GroupType;
 use crate::generator::TileGenerator;
 use crate::quest_manager::QuestManager;
 use crate::score_manager::ScoreManager;
-use crate::tile::{EqualityComparison, GeneratedTile, EdgeType};
+use crate::tile::{EqualityComparison, GeneratedTile};
 
 /// Hành động đặt tile trong môi trường RL
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -30,7 +30,7 @@ pub struct GraphObservation {
     /// Danh sách vị trí tọa độ của tất cả các node trong đồ thị (Placed + Candidates)
     pub node_positions: Vec<(i32, i32)>,
     /// Tensor đặc trưng của các node: [N, 38]
-    pub node_features: Vec<[f32; 38]>,
+    pub node_features: Vec<[f32; 40]>,
     /// Danh sách các cạnh nối giữa các node kề nhau: Vec<(from_idx, to_idx)>
     pub edge_index: Vec<(usize, usize)>,
     /// Danh sách tất cả các Action hợp lệ ở bước đi hiện tại (vị trí ô trống + góc xoay hợp lệ)
@@ -131,6 +131,21 @@ impl DorfromantikEnv {
             };
         };
 
+        // Tính tiến độ nhiệm vụ trước khi đặt tile
+        let prev_quest_progress: usize = self.board.placed_tiles.iter()
+            .filter_map(|(&pos, pt)| {
+                if let GeneratedTile::Quest { quest_data, .. } = &pt.tile {
+                    if !pt.quest_finalized {
+                        let gt = quest_data.primary_group_type();
+                        let target = quest_data.remaining_display_value();
+                        let cur = self.board.get_quest_external_count(pos, gt);
+                        return Some(cur.min(target));
+                    }
+                }
+                None
+            })
+            .sum();
+
         // Đặt tile lên bàn bài
         let (placed_ok, quest_succeeded_count) = self.board.place_tile_with_manager(
             action.q,
@@ -161,15 +176,39 @@ impl DorfromantikEnv {
             0,
         );
 
+        // Tính tiến độ nhiệm vụ sau khi đặt tile
+        let new_quest_progress: usize = self.board.placed_tiles.iter()
+            .filter_map(|(&pos, pt)| {
+                if let GeneratedTile::Quest { quest_data, .. } = &pt.tile {
+                    let gt = quest_data.primary_group_type();
+                    let target = quest_data.remaining_display_value();
+                    let cur = self.board.get_quest_external_count(pos, gt);
+                    return Some(cur.min(target));
+                }
+                None
+            })
+            .sum();
+        let quest_progress_delta = new_quest_progress.saturating_sub(prev_quest_progress);
+
         let step_score_delta = self.score_manager.total_score - prev_score;
 
         let mut shaped_reward = step_score_delta as f32;
         if quest_succeeded_count > 0 {
-            shaped_reward += quest_succeeded_count as f32 * 100.0;
+            shaped_reward += quest_succeeded_count as f32 * 150.0;
+        }
+        if breakdown.perfect_count > 0 {
+            shaped_reward += breakdown.perfect_count as f32 * 80.0;
+        }
+        if quest_progress_delta > 0 {
+            shaped_reward += quest_progress_delta as f32 * 15.0;
         }
         if breakdown.matching_edges > 0 {
             shaped_reward += breakdown.matching_edges as f32 * 5.0;
+        } else {
+            shaped_reward -= 5.0;
         }
+        // Thưởng sinh tồn từng bước để Agent muốn duy trì ván chơi
+        shaped_reward += 2.0;
 
         // Thêm tile mới vào cuối tile_queue
         let active_count = self.quest_manager.pop_next_active_quest_count();
@@ -184,6 +223,10 @@ impl DorfromantikEnv {
         let done = self.score_manager.remaining_tiles == 0
             || self.placed_count >= self.tile_limit
             || valid_actions.is_empty();
+
+        if done && self.placed_count < self.tile_limit {
+            shaped_reward -= 20.0; // Phạt chết sớm
+        }
 
         StepResult {
             reward: shaped_reward,
@@ -221,7 +264,7 @@ impl DorfromantikEnv {
         let tile_2 = self.tile_queue.get(2);
 
         for &pos in &node_positions {
-            let mut feature = [0.0f32; 38];
+            let mut feature = [0.0f32; 40];
             let is_placed = placed.contains_key(&pos);
 
             feature[0] = if is_placed { 1.0 } else { 0.0 };
@@ -323,24 +366,24 @@ impl DorfromantikEnv {
                 }
             }
 
-            // 27..32: Upcoming Tile 1 Features
+            // 27..33: Upcoming Tile 1 Features
             if let Some(t1) = tile_1 {
                 let cfg = t1.to_hex_edge_config();
-                for i in 0..5 {
+                for i in 0..6 {
                     feature[27 + i] = (cfg.edges[i] as usize as f32) / 7.0;
                 }
             }
 
-            // 32..37: Upcoming Tile 2 Features
+            // 33..39: Upcoming Tile 2 Features
             if let Some(t2) = tile_2 {
                 let cfg = t2.to_hex_edge_config();
-                for i in 0..5 {
-                    feature[32 + i] = (cfg.edges[i] as usize as f32) / 7.0;
+                for i in 0..6 {
+                    feature[33 + i] = (cfg.edges[i] as usize as f32) / 7.0;
                 }
             }
 
-            // 37: Step ratio
-            feature[37] = (self.placed_count as f32 / self.tile_limit as f32).clamp(0.0, 1.0);
+            // 39: Step ratio
+            feature[39] = (self.placed_count as f32 / self.tile_limit as f32).clamp(0.0, 1.0);
 
             node_features.push(feature);
         }

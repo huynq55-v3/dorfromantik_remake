@@ -80,7 +80,7 @@ impl Linear {
         let beta2_t = 1.0 - beta2.powi(t as i32);
 
         for i in 0..self.weight.len() {
-            let g = grad_w[i].clamp(-1.0, 1.0);
+            let g = grad_w[i];
             self.m_w[i] = beta1 * self.m_w[i] + (1.0 - beta1) * g;
             self.v_w[i] = beta2 * self.v_w[i] + (1.0 - beta2) * g * g;
 
@@ -91,7 +91,7 @@ impl Linear {
         }
 
         for i in 0..self.bias.len() {
-            let g = grad_b[i].clamp(-1.0, 1.0);
+            let g = grad_b[i];
             self.m_b[i] = beta1 * self.m_b[i] + (1.0 - beta1) * g;
             self.v_b[i] = beta2 * self.v_b[i] + (1.0 - beta2) * g * g;
 
@@ -106,8 +106,8 @@ impl Linear {
 /// Mạng Neural Graph Neural Network (GNN Hex Model) cho Dorfromantik trên CPU
 #[derive(Debug, Clone)]
 pub struct HexGNNModel {
-    pub w_self: Linear,     // 38 -> 64
-    pub w_neigh: Linear,    // 38 -> 64
+    pub w_self: Linear,     // 40 -> 64
+    pub w_neigh: Linear,    // 40 -> 64
     pub w_policy: Linear,   // 64 -> 6 (Logits cho 6 góc xoay)
     pub w_val1: Linear,     // 64 -> 64
     pub w_val2: Linear,     // 64 -> 1 (Scalar Value V(s))
@@ -117,8 +117,8 @@ pub struct HexGNNModel {
 impl HexGNNModel {
     pub fn new() -> Self {
         Self {
-            w_self: Linear::new(38, 64),
-            w_neigh: Linear::new(38, 64),
+            w_self: Linear::new(40, 64),
+            w_neigh: Linear::new(40, 64),
             w_policy: Linear::new(64, 6),
             w_val1: Linear::new(64, 64),
             w_val2: Linear::new(64, 1),
@@ -128,12 +128,46 @@ impl HexGNNModel {
 
     pub fn new_zero() -> Self {
         Self {
-            w_self: Linear::new_zero(38, 64),
-            w_neigh: Linear::new_zero(38, 64),
+            w_self: Linear::new_zero(40, 64),
+            w_neigh: Linear::new_zero(40, 64),
             w_policy: Linear::new_zero(64, 6),
             w_val1: Linear::new_zero(64, 64),
             w_val2: Linear::new_zero(64, 1),
             step_count: 0,
+        }
+    }
+
+    pub fn scale_assign(&mut self, factor: f32) {
+        let scale = |w: &mut Vec<f32>| {
+            for x in w.iter_mut() {
+                *x *= factor;
+            }
+        };
+        scale(&mut self.w_self.weight);
+        scale(&mut self.w_self.bias);
+        scale(&mut self.w_neigh.weight);
+        scale(&mut self.w_neigh.bias);
+        scale(&mut self.w_policy.weight);
+        scale(&mut self.w_policy.bias);
+        scale(&mut self.w_val1.weight);
+        scale(&mut self.w_val1.bias);
+        scale(&mut self.w_val2.weight);
+        scale(&mut self.w_val2.bias);
+    }
+
+    pub fn clip_grad_norm(&mut self, max_norm: f32) {
+        let mut total_sq = 0.0f32;
+        let sum_sq = |w: &[f32]| -> f32 { w.iter().map(|x| x * x).sum() };
+        total_sq += sum_sq(&self.w_self.weight) + sum_sq(&self.w_self.bias);
+        total_sq += sum_sq(&self.w_neigh.weight) + sum_sq(&self.w_neigh.bias);
+        total_sq += sum_sq(&self.w_policy.weight) + sum_sq(&self.w_policy.bias);
+        total_sq += sum_sq(&self.w_val1.weight) + sum_sq(&self.w_val1.bias);
+        total_sq += sum_sq(&self.w_val2.weight) + sum_sq(&self.w_val2.bias);
+
+        let norm = total_sq.sqrt();
+        if norm > max_norm && norm > 1e-8 {
+            let scale = max_norm / norm;
+            self.scale_assign(scale);
         }
     }
 
@@ -158,7 +192,7 @@ impl HexGNNModel {
     /// Forward pass trên Graph Observation:
     pub fn forward(
         &self,
-        node_features: &[[f32; 38]],
+        node_features: &[[f32; 40]],
         edge_index: &[(usize, usize)],
     ) -> (Vec<Vec<f32>>, f32) {
         let n_nodes = node_features.len();
@@ -166,33 +200,33 @@ impl HexGNNModel {
             return (Vec::new(), 0.0);
         }
 
-        let mut neighbor_sum = vec![[0.0f32; 38]; n_nodes];
+        let mut neighbor_sum = vec![[0.0f32; 40]; n_nodes];
         let mut neighbor_count = vec![0usize; n_nodes];
 
         for &(u, v) in edge_index {
             if u < n_nodes && v < n_nodes {
-                for i in 0..38 {
+                for i in 0..40 {
                     neighbor_sum[u][i] += node_features[v][i];
                 }
                 neighbor_count[u] += 1;
             }
         }
 
-        let mut neighbor_mean = vec![0.0f32; n_nodes * 38];
+        let mut neighbor_mean = vec![0.0f32; n_nodes * 40];
         for u in 0..n_nodes {
             let count = neighbor_count[u].max(1) as f32;
-            for i in 0..38 {
-                neighbor_mean[u * 38 + i] = neighbor_sum[u][i] / count;
+            for i in 0..40 {
+                neighbor_mean[u * 40 + i] = neighbor_sum[u][i] / count;
             }
         }
 
-        let mut self_flat = vec![0.0f32; n_nodes * 38];
+        let mut self_flat = vec![0.0f32; n_nodes * 40];
         for u in 0..n_nodes {
-            self_flat[u * 38..(u + 1) * 38].copy_from_slice(&node_features[u]);
+            self_flat[u * 40..(u + 1) * 40].copy_from_slice(&node_features[u]);
         }
 
-        let out_self = self.w_self.forward(&self_flat, n_nodes * 38);
-        let out_neigh = self.w_neigh.forward(&neighbor_mean, n_nodes * 38);
+        let out_self = self.w_self.forward(&self_flat, n_nodes * 40);
+        let out_neigh = self.w_neigh.forward(&neighbor_mean, n_nodes * 40);
 
         let mut h = vec![0.0f32; n_nodes * 64];
         for i in 0..n_nodes * 64 {
@@ -230,11 +264,50 @@ impl HexGNNModel {
         (node_logits, state_value)
     }
 
+    /// Evaluate a specific action: compute log_prob and value WITHOUT re-sampling
+    pub fn evaluate_action(
+        &self,
+        obs: &crate::env::GraphObservation,
+        _chosen_action: &crate::env::Action,
+        chosen_action_idx: usize,
+    ) -> (f32, f32, f32) {
+        let (node_logits, state_value) = self.forward(&obs.node_features, &obs.edge_index);
+
+        let mut action_logits = Vec::with_capacity(obs.valid_actions.len());
+        for act in &obs.valid_actions {
+            let pos_idx = obs.node_positions.iter().position(|&p| p == (act.q, act.r));
+            let logit = if let Some(idx) = pos_idx {
+                if idx < node_logits.len() {
+                    node_logits[idx][act.rotation]
+                } else {
+                    -1e9
+                }
+            } else {
+                -1e9
+            };
+            action_logits.push(logit);
+        }
+
+        let max_logit = action_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = action_logits.iter().map(|l| (l - max_logit).exp()).collect();
+        let sum_exp: f32 = exps.iter().sum();
+        let probs: Vec<f32> = exps.iter().map(|e| e / sum_exp.max(1e-8)).collect();
+
+        let chosen_prob = probs[chosen_action_idx].max(1e-8);
+        let log_prob = chosen_prob.ln();
+
+        let entropy: f32 = probs.iter()
+            .map(|&p| if p > 1e-8 { -p * p.ln() } else { 0.0 })
+            .sum();
+
+        (log_prob, state_value, entropy)
+    }
+
     /// Backpropagation: Tính đạo hàm chính xác trên toàn bộ Action Space và tích lũy gradients
     pub fn backward_accumulate(
         &self,
         node_positions: &[(i32, i32)],
-        node_features: &[[f32; 38]],
+        node_features: &[[f32; 40]],
         edge_index: &[(usize, usize)],
         valid_actions: &[crate::env::Action],
         chosen_action_idx: usize,
@@ -247,32 +320,32 @@ impl HexGNNModel {
             return;
         }
 
-        let mut neighbor_sum = vec![[0.0f32; 38]; n_nodes];
+        let mut neighbor_sum = vec![[0.0f32; 40]; n_nodes];
         let mut neighbor_count = vec![0usize; n_nodes];
         for &(u, v) in edge_index {
             if u < n_nodes && v < n_nodes {
-                for i in 0..38 {
+                for i in 0..40 {
                     neighbor_sum[u][i] += node_features[v][i];
                 }
                 neighbor_count[u] += 1;
             }
         }
 
-        let mut neighbor_mean = vec![0.0f32; n_nodes * 38];
+        let mut neighbor_mean = vec![0.0f32; n_nodes * 40];
         for u in 0..n_nodes {
             let count = neighbor_count[u].max(1) as f32;
-            for i in 0..38 {
-                neighbor_mean[u * 38 + i] = neighbor_sum[u][i] / count;
+            for i in 0..40 {
+                neighbor_mean[u * 40 + i] = neighbor_sum[u][i] / count;
             }
         }
 
-        let mut self_flat = vec![0.0f32; n_nodes * 38];
+        let mut self_flat = vec![0.0f32; n_nodes * 40];
         for u in 0..n_nodes {
-            self_flat[u * 38..(u + 1) * 38].copy_from_slice(&node_features[u]);
+            self_flat[u * 40..(u + 1) * 40].copy_from_slice(&node_features[u]);
         }
 
-        let out_self = self.w_self.forward(&self_flat, n_nodes * 38);
-        let out_neigh = self.w_neigh.forward(&neighbor_mean, n_nodes * 38);
+        let out_self = self.w_self.forward(&self_flat, n_nodes * 40);
+        let out_neigh = self.w_neigh.forward(&neighbor_mean, n_nodes * 40);
 
         let mut h = vec![0.0f32; n_nodes * 64];
         let mut h_pre_relu = vec![0.0f32; n_nodes * 64];
@@ -387,14 +460,14 @@ impl HexGNNModel {
 
         for u in 0..n_nodes {
             let h_off = u * 64;
-            let self_off = u * 38;
+            let self_off = u * 40;
             for o in 0..64 {
                 let d_l = d_h_pre[h_off + o];
                 grads.w_self.bias[o] += d_l;
                 grads.w_neigh.bias[o] += d_l;
-                for i in 0..38 {
-                    grads.w_self.weight[o * 38 + i] += d_l * self_flat[self_off + i];
-                    grads.w_neigh.weight[o * 38 + i] += d_l * neighbor_mean[self_off + i];
+                for i in 0..40 {
+                    grads.w_self.weight[o * 40 + i] += d_l * self_flat[self_off + i];
+                    grads.w_neigh.weight[o * 40 + i] += d_l * neighbor_mean[self_off + i];
                 }
             }
         }

@@ -1,3 +1,4 @@
+use rand::seq::SliceRandom;
 use rand::Rng;
 use rayon::prelude::*;
 use crate::env::{Action, DorfromantikEnv, GraphObservation};
@@ -32,6 +33,8 @@ pub struct PPOAgent {
     pub gamma: f32,
     pub gae_lambda: f32,
     pub clip_eps: f32,
+    pub ppo_epochs: usize,
+    pub mini_batch_size: usize,
 }
 
 impl PPOAgent {
@@ -44,6 +47,8 @@ impl PPOAgent {
             gamma: 0.99,
             gae_lambda: 0.95,
             clip_eps: 0.2,
+            ppo_epochs: 4,
+            mini_batch_size: 128,
         }
     }
 
@@ -92,11 +97,12 @@ impl PPOAgent {
         } else {
             // Sample ngẫu nhiên theo xác suất khi Train
             let mut rng = rand::thread_rng();
-            let mut r: f32 = rng.gen_range(0.0..1.0);
-            let mut selected = 0;
+            let r: f32 = rng.gen_range(0.0..1.0);
+            let mut cum = 0.0f32;
+            let mut selected = probs.len() - 1;
             for (i, &p) in probs.iter().enumerate() {
-                r -= p;
-                if r <= 0.0 {
+                cum += p;
+                if r <= cum {
                     selected = i;
                     break;
                 }
@@ -133,11 +139,14 @@ impl PPOAgent {
                     let (action, act_idx, log_prob, val) = Self::select_action(model_ref, &obs, false);
                     let res = env.step(action);
 
+                    // Reward scaling 0.05 đưa reward về dải [-1.0, 10.0] hoàn hảo cho Neural Network
+                    let scaled_reward = res.reward * 0.05;
+
                     transitions.push(Transition {
                         obs,
                         action,
                         action_idx: act_idx,
-                        reward: res.reward,
+                        reward: scaled_reward,
                         value: val,
                         log_prob,
                         done: res.done,
@@ -151,100 +160,148 @@ impl PPOAgent {
             })
             .collect();
 
-        // Gom tất cả transitions về 1 mảng phẳng
+        // Tính GAE RIÊNG cho từng env (tránh boundary leakage giữa các env)
         let mut all_transitions = Vec::new();
-        for mut env_tr in env_rollouts {
-            all_transitions.append(&mut env_tr);
-        }
+        let mut all_returns = Vec::new();
+        let mut all_advantages = Vec::new();
 
-        // GAE (Generalized Advantage Estimation) calculation
-        let n = all_transitions.len();
-        let mut returns = vec![0.0f32; n];
-        let mut advantages = vec![0.0f32; n];
+        for env_tr in env_rollouts {
+            let n = env_tr.len();
+            if n == 0 {
+                continue;
+            }
 
-        let mut gae = 0.0f32;
-        for i in (0..n).rev() {
-            let next_value = if i + 1 < n && !all_transitions[i].done {
-                all_transitions[i + 1].value
-            } else {
-                0.0
-            };
-            let delta = all_transitions[i].reward + self.gamma * next_value - all_transitions[i].value;
-            gae = delta + self.gamma * self.gae_lambda * (if all_transitions[i].done { 0.0 } else { 1.0 }) * gae;
-            advantages[i] = gae;
-            returns[i] = gae + all_transitions[i].value;
+            let mut returns = vec![0.0f32; n];
+            let mut advantages = vec![0.0f32; n];
+            let mut gae = 0.0f32;
+
+            for i in (0..n).rev() {
+                let next_value = if i + 1 < n && !env_tr[i].done {
+                    env_tr[i + 1].value
+                } else {
+                    0.0
+                };
+                let delta = env_tr[i].reward + self.gamma * next_value - env_tr[i].value;
+                gae = delta + self.gamma * self.gae_lambda * (if env_tr[i].done { 0.0 } else { 1.0 }) * gae;
+                advantages[i] = gae;
+                returns[i] = gae + env_tr[i].value;
+            }
+
+            all_transitions.extend(env_tr);
+            all_returns.extend(returns);
+            all_advantages.extend(advantages);
         }
 
         RolloutBatch {
             transitions: all_transitions,
-            returns,
-            advantages,
+            returns: all_returns,
+            advantages: all_advantages,
         }
     }
 
-    /// TRAINING PIPELINE: Cập nhật trọng số Policy & Value bằng Parallel Backpropagation trên Rayon + Adam Optimizer
+    /// TRAINING PIPELINE: Cập nhật trọng số Policy & Value bằng Multi-Epoch Mini-Batch PPO + Adam
     pub fn train_step(&mut self, batch: &RolloutBatch) -> f32 {
         if batch.transitions.is_empty() {
             return 0.0;
         }
 
         let n = batch.transitions.len();
+        let value_coef: f32 = 0.5;
+        let entropy_coef: f32 = 0.01;
 
-        // 1. Advantage Normalization
+        // Advantage Normalization trên toàn bộ Batch
         let mean_adv = batch.advantages.iter().sum::<f32>() / n as f32;
         let var_adv = batch.advantages.iter().map(|a| (a - mean_adv).powi(2)).sum::<f32>() / n as f32;
         let std_adv = (var_adv + 1e-8).sqrt();
 
-        let model_ref = &self.model;
-        let clip_eps = self.clip_eps;
+        let norm_advantages: Vec<f32> = batch.advantages.iter().map(|&a| (a - mean_adv) / std_adv).collect();
 
-        // 2. Parallel Backpropagation qua các CPU Worker Threads bằng Rayon
-        let (accumulated_grads, total_loss) = (0..n)
-            .into_par_iter()
-            .map(|i| {
-                let tr = &batch.transitions[i];
-                let norm_adv = (batch.advantages[i] - mean_adv) / std_adv;
-                let norm_return = batch.returns[i] / 100.0;
+        let mut total_loss_accum = 0.0f32;
+        let mut total_updates = 0;
 
-                let (_new_action, _new_idx, new_log_prob, new_val) = Self::select_action(model_ref, &tr.obs, false);
+        let mut rng = rand::thread_rng();
+        let mut indices: Vec<usize> = (0..n).collect();
 
-                let ratio = (new_log_prob - tr.log_prob).exp();
-                let surr1 = ratio * norm_adv;
-                let surr2 = ratio.clamp(1.0 - clip_eps, 1.0 + clip_eps) * norm_adv;
-                let policy_loss = -surr1.min(surr2);
+        for _epoch in 0..self.ppo_epochs {
+            indices.shuffle(&mut rng);
 
-                let value_loss = 0.5 * (new_val - norm_return).powi(2);
-                let loss = policy_loss + 0.5 * value_loss;
+            for chunk in indices.chunks(self.mini_batch_size) {
+                let model_ref = &self.model;
+                let clip_eps = self.clip_eps;
 
-                let val_grad = (new_val - norm_return) * 0.1;
+                let (mb_grads, mb_loss) = chunk
+                    .into_par_iter()
+                    .map(|&i| {
+                        let tr = &batch.transitions[i];
+                        let norm_adv = norm_advantages[i];
+                        let target_return = batch.returns[i];
 
-                let mut local_grads = HexGNNModel::new_zero();
+                        let (new_log_prob, new_val, entropy) = model_ref.evaluate_action(
+                            &tr.obs,
+                            &tr.action,
+                            tr.action_idx,
+                        );
 
-                model_ref.backward_accumulate(
-                    &tr.obs.node_positions,
-                    &tr.obs.node_features,
-                    &tr.obs.edge_index,
-                    &tr.obs.valid_actions,
-                    tr.action_idx,
-                    norm_adv,
-                    val_grad,
-                    &mut local_grads,
-                );
+                        // PPO Clipped Objective
+                        let ratio = (new_log_prob - tr.log_prob).exp();
+                        let surr1 = ratio * norm_adv;
+                        let surr2 = ratio.clamp(1.0 - clip_eps, 1.0 + clip_eps) * norm_adv;
+                        let policy_loss = -surr1.min(surr2);
 
-                (local_grads, loss)
-            })
-            .reduce(
-                || (HexGNNModel::new_zero(), 0.0f32),
-                |(mut g1, l1), (g2, l2)| {
-                    g1.add_assign(&g2);
-                    (g1, l1 + l2)
-                },
-            );
+                        let is_clipped = (norm_adv > 0.0 && ratio > 1.0 + clip_eps)
+                            || (norm_adv < 0.0 && ratio < 1.0 - clip_eps);
+                        let effective_policy_adv = if is_clipped { 0.0 } else { norm_adv * ratio };
 
-        // Cập nhật trọng số qua Adam Optimizer
-        self.model.update_weights_adam(&accumulated_grads, self.lr / n as f32);
+                        // Value loss: Sử dụng Huber Loss (Smooth L1) để tránh bùng nổ gradient khi Returns lớn
+                        let diff = new_val - target_return;
+                        let abs_diff = diff.abs();
+                        let (value_loss, val_grad) = if abs_diff <= 1.0 {
+                            (0.5 * diff.powi(2), diff * value_coef)
+                        } else {
+                            (abs_diff - 0.5, diff.signum() * value_coef)
+                        };
 
-        total_loss / n as f32
+                        let loss = policy_loss + value_coef * value_loss - entropy_coef * entropy;
+
+                        let mut local_grads = HexGNNModel::new_zero();
+                        model_ref.backward_accumulate(
+                            &tr.obs.node_positions,
+                            &tr.obs.node_features,
+                            &tr.obs.edge_index,
+                            &tr.obs.valid_actions,
+                            tr.action_idx,
+                            effective_policy_adv,
+                            val_grad,
+                            &mut local_grads,
+                        );
+
+                        (local_grads, loss)
+                    })
+                    .reduce(
+                        || (HexGNNModel::new_zero(), 0.0f32),
+                        |(mut g1, l1), (g2, l2)| {
+                            g1.add_assign(&g2);
+                            (g1, l1 + l2)
+                        },
+                    );
+
+                let mb_len = chunk.len() as f32;
+                let mut scaled_grads = mb_grads;
+                scaled_grads.scale_assign(1.0 / mb_len);
+                scaled_grads.clip_grad_norm(1.0);
+
+                self.model.update_weights_adam(&scaled_grads, self.lr);
+
+                total_loss_accum += mb_loss / mb_len;
+                total_updates += 1;
+            }
+        }
+
+        if total_updates > 0 {
+            total_loss_accum / total_updates as f32
+        } else {
+            0.0
+        }
     }
 
     /// EVALUATION PIPELINE: Chạy thử nghiệm ván chơi đánh giá điểm số thực tế bằng Policy hiện tại (Deterministic)
