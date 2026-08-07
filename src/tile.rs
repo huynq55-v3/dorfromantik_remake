@@ -487,4 +487,85 @@ impl GeneratedTile {
 
         HexEdgeConfig::new(edges)
     }
+
+    /// Lấy danh sách các segment cụ thể (TileSegmentData) của ô tile khi đã xoay góc placement_rotation
+    pub fn get_segments(&self, placement_rotation: usize) -> Vec<TileSegmentData> {
+        let mut result = Vec::new();
+        match self {
+            GeneratedTile::Normal { segments, .. } => {
+                for seg in segments {
+                    let base = seg.segment_type.base_edges();
+                    let rotated_edges: Vec<usize> = base
+                        .iter()
+                        .map(|&b| (b + seg.rotation + placement_rotation) % 6)
+                        .collect();
+                    let element_count = crate::game_config::get_segment_element_count(seg.group_type, seg.segment_type);
+                    result.push(TileSegmentData {
+                        group_type: seg.group_type,
+                        segment_type: seg.segment_type,
+                        element_count,
+                        edges: rotated_edges,
+                    });
+                }
+            }
+            GeneratedTile::Quest { quest_data, .. } => {
+                let preset_str = quest_data.config_string();
+                let parts: Vec<&str> = preset_str.split_whitespace().collect();
+                let mut occupied = [false; 6];
+
+                for part in parts {
+                    if let Some((seg_type, group_type, _)) = parse_segment_code(part) {
+                        let base = seg_type.base_edges();
+                        let mut best_rot = 0;
+                        for rot in 0..6 {
+                            let fits = base.iter().all(|&b| !occupied[(b + rot) % 6]);
+                            if fits {
+                                best_rot = rot;
+                                break;
+                            }
+                        }
+                        for &b in base {
+                            let idx = (b + best_rot) % 6;
+                            occupied[idx] = true;
+                        }
+                        let rotated_edges: Vec<usize> = base
+                            .iter()
+                            .map(|&b| (b + best_rot + placement_rotation) % 6)
+                            .collect();
+                        let element_count = crate::game_config::get_segment_element_count(group_type, seg_type);
+                        result.push(TileSegmentData {
+                            group_type,
+                            segment_type: seg_type,
+                            element_count,
+                            edges: rotated_edges,
+                        });
+                    }
+                }
+
+                if result.is_empty() {
+                    let gt = quest_data.primary_group_type();
+                    let mut cfg = self.to_hex_edge_config();
+                    cfg.rotate(placement_rotation);
+                    let edges: Vec<usize> = (0..6).filter(|&d| cfg.edges[d].to_group_type() == Some(gt)).collect();
+                    let element_count = quest_data.own_elements_for_group(gt);
+                    result.push(TileSegmentData {
+                        group_type: gt,
+                        segment_type: SegmentType::ST1A,
+                        element_count,
+                        edges,
+                    });
+                }
+            }
+        }
+        result
+    }
 }
+
+#[derive(Debug, Clone)]
+pub struct TileSegmentData {
+    pub group_type: GroupType,
+    pub segment_type: SegmentType,
+    pub element_count: usize,
+    pub edges: Vec<usize>,
+}
+

@@ -101,8 +101,8 @@ impl QuestManager {
             GroupType::Water => 0.09,
             GroupType::TrainTracks => 0.09,
             GroupType::Agriculture => 0.20,
-            GroupType::Forest => 0.20,
-            GroupType::Village => 0.20,
+            GroupType::Forest => 1.70,
+            GroupType::Village => 0.30,
         }
     }
 
@@ -189,6 +189,11 @@ impl QuestManager {
     /// Xóa một Quest khi hoàn thành/đóng nhiệm vụ (RemoveQuest C# dòng 24201)
     pub fn remove_quest(&mut self, quest_id: usize) {
         self.active_quests.retain(|q| q.quest_id != quest_id);
+    }
+
+    /// Tăng level của game session khi hoàn thành Quest (GainLevels C# dòng 28574)
+    pub fn gain_levels(&mut self, count: usize) {
+        self.level += count;
     }
 
     /// Xóa sạch tất cả quest active khi reset bàn chơi (Clear C# dòng 24270)

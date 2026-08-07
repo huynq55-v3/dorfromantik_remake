@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use crate::game_config::GroupType;
 use crate::tile::{GeneratedTile, HexEdgeConfig, EqualityComparison};
+
+static LAST_LOGGED_HOVER: Mutex<Option<((i32, i32), usize, String)>> = Mutex::new(None);
 
 /// Trạng thái hoàn thành của Quest
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,7 +80,7 @@ pub struct ElementGroup {
 pub struct Board {
     pub placed_tiles: HashMap<(i32, i32), PlacedTile>,
     pub groups: HashMap<usize, ElementGroup>,
-    pub tile_to_group: HashMap<((i32, i32), GroupType), usize>,
+    pub edge_to_group: HashMap<((i32, i32), usize), usize>,
     next_group_id: usize,
 }
 
@@ -92,9 +95,24 @@ impl Board {
         Self {
             placed_tiles: HashMap::new(),
             groups: HashMap::new(),
-            tile_to_group: HashMap::new(),
+            edge_to_group: HashMap::new(),
             next_group_id: 1,
         }
+    }
+
+    /// Lấy danh sách các Group ID duy nhất của ô tile tại vị trí pos tương ứng với group_type
+    pub fn get_group_ids_for_tile(&self, pos: (i32, i32), group_type: GroupType) -> HashSet<usize> {
+        let mut set = HashSet::new();
+        if let Some(pt) = self.placed_tiles.get(&pos) {
+            for dir in 0..6 {
+                if pt.edge_config.edges[dir].to_group_type() == Some(group_type) {
+                    if let Some(&gid) = self.edge_to_group.get(&(pos, dir)) {
+                        set.insert(gid);
+                    }
+                }
+            }
+        }
+        set
     }
 
     /// Trả về số lượng object/segment của cụm địa hình lớn nhất chưa đóng trên bàn (ReferenceGroupCount)
@@ -198,32 +216,29 @@ impl Board {
         }
     }
 
-    /// Cập nhật và hợp nhất cụm địa hình liên thông (ElementGroupManager)
+    /// Cập nhật và hợp nhất cụm địa hình liên thông theo từng Segment (ElementGroupManager C#)
     fn update_element_groups(&mut self, q: i32, r: i32) {
         let placed = match self.placed_tiles.get(&(q, r)) {
             Some(t) => t.clone(),
             None => return,
         };
 
-        let mut present_groups = HashSet::new();
-        for &edge in &placed.edge_config.edges {
-            if let Some(gt) = edge.to_group_type() {
-                present_groups.insert(gt);
-            }
-        }
+        let tile_segments = placed.tile.get_segments(placed.rotation);
 
-        for gt in present_groups {
-            let element_count = self.get_tile_element_count(&placed.tile, gt);
+        for seg in tile_segments {
+            let gt = seg.group_type;
+            let element_count = seg.element_count;
             let segment_count = 1;
 
             let mut connected_group_ids = HashSet::new();
-            for dir in 0..6 {
+            for &dir in &seg.edges {
                 let neighbor_pos = get_neighbor_pos(q, r, dir);
+                let neighbor_dir = opposite_direction(dir);
                 if let Some(neighbor) = self.placed_tiles.get(&neighbor_pos) {
                     let my_edge = placed.edge_config.edges[dir];
-                    let neighbor_edge = neighbor.edge_config.edges[opposite_direction(dir)];
+                    let neighbor_edge = neighbor.edge_config.edges[neighbor_dir];
                     if my_edge.to_group_type() == Some(gt) && neighbor_edge.to_group_type() == Some(gt) {
-                        if let Some(&gid) = self.tile_to_group.get(&(neighbor_pos, gt)) {
+                        if let Some(&gid) = self.edge_to_group.get(&(neighbor_pos, neighbor_dir)) {
                             connected_group_ids.insert(gid);
                         }
                     }
@@ -245,12 +260,17 @@ impl Board {
                     is_closed: false,
                 };
                 self.groups.insert(gid, group);
-                self.tile_to_group.insert(((q, r), gt), gid);
+                for &dir in &seg.edges {
+                    self.edge_to_group.insert(((q, r), dir), gid);
+                }
             } else {
                 let group_ids_vec: Vec<usize> = connected_group_ids.into_iter().collect();
                 let main_gid = group_ids_vec[0];
 
-                self.tile_to_group.insert(((q, r), gt), main_gid);
+                for &dir in &seg.edges {
+                    self.edge_to_group.insert(((q, r), dir), main_gid);
+                }
+
                 if let Some(main_group) = self.groups.get_mut(&main_gid) {
                     main_group.member_tiles.insert((q, r));
                     main_group.total_element_count += element_count;
@@ -259,13 +279,15 @@ impl Board {
 
                 for &other_gid in &group_ids_vec[1..] {
                     if let Some(other_group) = self.groups.remove(&other_gid) {
-                        for &member_pos in &other_group.member_tiles {
-                            self.tile_to_group.insert((member_pos, gt), main_gid);
-                        }
                         if let Some(main_group) = self.groups.get_mut(&main_gid) {
                             main_group.member_tiles.extend(other_group.member_tiles);
                             main_group.total_element_count += other_group.total_element_count;
                             main_group.total_segment_count += other_group.total_segment_count;
+                        }
+                        for g in self.edge_to_group.values_mut() {
+                            if *g == other_gid {
+                                *g = main_gid;
+                            }
                         }
                     }
                 }
@@ -273,7 +295,10 @@ impl Board {
         }
     }
 
-    /// Trả về số lượng element/cạnh địa hình của ô bài đối với GroupType
+    /// Trả về tổng số lượng element/cạnh địa hình của toàn bộ ô bài đối với GroupType.
+    /// LƯU Ý: Hàm này trả về tổng số nhà/cây của TẤT CẢ các segment trên ô bài.
+    /// NẾU CẦN ĐẾM SỐ PHẦN TỬ CỦA 1 CỤM LIÊN THÔNG (ElementGroup), KHÔNG DÙNG HÀM NÀY
+    /// mà phải dùng `group.total_element_count` để tránh đếm nhầm các segment biệt lập chưa nối.
     pub fn get_tile_element_count(&self, tile: &GeneratedTile, gt: GroupType) -> usize {
         match tile {
             GeneratedTile::Quest { quest_data, .. } => quest_data.own_elements_for_group(gt),
@@ -347,24 +372,32 @@ impl Board {
 
     /// Lấy số lượng element/segment NGOÀI (không tính ô Quest bản thân nó) đã kết nối vào cụm chứa pos
     pub fn get_quest_external_count(&self, pos: (i32, i32), group_type: GroupType) -> usize {
-        if let Some(&gid) = self.tile_to_group.get(&(pos, group_type)) {
+        let gids = self.get_group_ids_for_tile(pos, group_type);
+        if gids.is_empty() {
+            return 0;
+        }
+
+        let quest_own_elements = if let Some(pt) = self.placed_tiles.get(&pos) {
+            match group_type {
+                GroupType::Forest | GroupType::Village | GroupType::Water | GroupType::Agriculture => self.get_tile_element_count(&pt.tile, group_type),
+                _ => 1,
+            }
+        } else {
+            0
+        };
+
+        let mut total = 0;
+        for gid in gids {
             if let Some(group) = self.groups.get(&gid) {
-                let mut external_count = 0;
-                for &m_pos in &group.member_tiles {
-                    if m_pos != pos {
-                        if let Some(pt) = self.placed_tiles.get(&m_pos) {
-                            let count = match group_type {
-                                GroupType::Forest | GroupType::Village | GroupType::Water | GroupType::Agriculture => self.get_tile_element_count(&pt.tile, group_type),
-                                _ => 1,
-                            };
-                            external_count += count;
-                        }
-                    }
-                }
-                return external_count;
+                let count = match group_type {
+                    GroupType::Forest | GroupType::Village | GroupType::Water | GroupType::Agriculture => group.total_element_count,
+                    _ => group.total_segment_count,
+                };
+                total += count;
             }
         }
-        0
+
+        total.saturating_sub(quest_own_elements)
     }
 
     /// Đếm số cạnh mở cho một danh sách các ô thuộc cụm (tính cả hover_tile nếu có)
@@ -405,19 +438,21 @@ impl Board {
 
     /// Đếm số cạnh mở (open edges) của cụm địa hình chứa `pos` cho `group_type`
     pub fn count_group_open_edges(&self, pos: (i32, i32), group_type: GroupType) -> usize {
-        let member_tiles: HashSet<(i32, i32)> = if let Some(&gid) = self.tile_to_group.get(&(pos, group_type)) {
-            if let Some(group) = self.groups.get(&gid) {
-                group.member_tiles.clone()
-            } else {
-                let mut set = HashSet::new();
-                set.insert(pos);
-                set
-            }
+        let gids = self.get_group_ids_for_tile(pos, group_type);
+        let mut member_tiles = HashSet::new();
+
+        if gids.is_empty() {
+            member_tiles.insert(pos);
         } else {
-            let mut set = HashSet::new();
-            set.insert(pos);
-            set
-        };
+            for gid in gids {
+                if let Some(group) = self.groups.get(&gid) {
+                    member_tiles.extend(group.member_tiles.iter().copied());
+                }
+            }
+            if member_tiles.is_empty() {
+                member_tiles.insert(pos);
+            }
+        }
 
         self.count_open_edges_for_tiles(&member_tiles, group_type, None)
     }
@@ -493,6 +528,9 @@ impl Board {
                 pt.quest_status = Some(new_status);
                 if new_status == FulfillmentStatus::Success {
                     succeeded_count += 1;
+                    if let Some(ref mut qm) = quest_manager {
+                        qm.gain_levels(1);
+                    }
                 }
                 if new_status == FulfillmentStatus::Success || new_status == FulfillmentStatus::Failed {
                     resolved_count += 1;
@@ -516,8 +554,9 @@ impl Board {
             if matches!(pt.tile, GeneratedTile::Quest { .. }) && !pt.quest_finalized {
                 if let GeneratedTile::Quest { quest_data, .. } = &pt.tile {
                     let gt = quest_data.primary_group_type();
-                    if let Some(&gid) = self.tile_to_group.get(&(pos, gt)) {
-                        active_gids.insert(gid);
+                    let gids = self.get_group_ids_for_tile(pos, gt);
+                    if !gids.is_empty() {
+                        active_gids.extend(gids);
                     } else {
                         active_gids.insert((pos.0 as isize * 100000 + pos.1 as isize) as usize);
                     }
@@ -563,92 +602,141 @@ impl Board {
             };
 
             let current_external = self.get_quest_external_count(pos, group_type);
-            let mut added_external = 0;
+            let gids = self.get_group_ids_for_tile(pos, group_type);
 
-            let mut member_tiles: HashSet<(i32, i32)> = if let Some(&gid) = self.tile_to_group.get(&(pos, group_type)) {
-                if let Some(group) = self.groups.get(&gid) {
-                    group.member_tiles.clone()
-                } else {
-                    let mut set = HashSet::new();
-                    set.insert(pos);
-                    set
-                }
-            } else {
-                let mut set = HashSet::new();
-                set.insert(pos);
-                set
-            };
-
-            // Kiểm tra xem tile đang ướm thử có cạnh MATCHING group_type nối vào pos hay cụm của pos không
-            let mut hover_connects = false;
+            // Tìm tất cả các group_id chạm vào hover_tile ở những cạnh matching group_type
+            let mut connected_gids = HashSet::new();
             for dir in 0..6 {
-                let n_pos = get_neighbor_pos(hover_q, hover_r, dir);
-                if n_pos == pos {
-                    let my_edge = preview_cfg.edges[dir];
-                    let quest_edge = self.placed_tiles[&pos].edge_config.edges[opposite_direction(dir)];
-
-                    if my_edge.to_group_type() == Some(group_type) && quest_edge.to_group_type() == Some(group_type) {
-                        let delta = match group_type {
-                            GroupType::Forest | GroupType::Village | GroupType::Agriculture | GroupType::Water => self.get_tile_element_count(hover_tile, group_type),
-                            _ => 1,
-                        };
-                        added_external = delta;
-                        hover_connects = true;
-                        break;
-                    }
-                } else if let Some(&gid) = self.tile_to_group.get(&(pos, group_type)) {
-                    let my_edge = preview_cfg.edges[dir];
-                    if my_edge.to_group_type() == Some(group_type) {
-                        if let Some(&n_gid) = self.tile_to_group.get(&(n_pos, group_type)) {
-                            if n_gid == gid {
-                                let neighbor_edge = self.placed_tiles[&n_pos].edge_config.edges[opposite_direction(dir)];
-                                if neighbor_edge.to_group_type() == Some(group_type) {
-                                    let delta = match group_type {
-                                        GroupType::Forest | GroupType::Village | GroupType::Agriculture | GroupType::Water => self.get_tile_element_count(hover_tile, group_type),
-                                        _ => 1,
-                                    };
-                                    added_external = delta;
-                                    hover_connects = true;
-                                    break;
-                                }
+                let my_edge = preview_cfg.edges[dir];
+                if my_edge.to_group_type() == Some(group_type) {
+                    let n_pos = get_neighbor_pos(hover_q, hover_r, dir);
+                    let neighbor_dir = opposite_direction(dir);
+                    if let Some(neighbor) = self.placed_tiles.get(&n_pos) {
+                        let neighbor_edge = neighbor.edge_config.edges[neighbor_dir];
+                        if neighbor_edge.to_group_type() == Some(group_type) {
+                            if let Some(&n_gid) = self.edge_to_group.get(&(n_pos, neighbor_dir)) {
+                                connected_gids.insert(n_gid);
                             }
                         }
                     }
                 }
             }
 
-            if hover_connects {
-                member_tiles.insert(hover_pos);
-            }
-
-            let simulated_external = current_external + added_external;
-            let simulated_open_edges = self.count_open_edges_for_tiles(&member_tiles, group_type, Some((hover_pos, &preview_cfg)));
-            let remaining_target = target_count.saturating_sub(simulated_external);
-
-            let preview_status = match equality {
-                EqualityComparison::MoreThan => {
-                    if simulated_external >= target_count {
-                        FulfillmentStatus::Success
-                    } else if simulated_open_edges == 0 {
-                        FulfillmentStatus::Failed
-                    } else {
-                        FulfillmentStatus::Incomplete
-                    }
-                }
-                EqualityComparison::Exactly => {
-                    if simulated_external == target_count {
-                        FulfillmentStatus::Success
-                    } else if simulated_external > target_count {
-                        FulfillmentStatus::Failed
-                    } else if simulated_open_edges == 0 {
-                        FulfillmentStatus::Failed
-                    } else {
-                        FulfillmentStatus::Incomplete
-                    }
-                }
+            // Kiểm tra xem hover_tile có chạm vào bất kỳ group nào thuộc quest này (hoặc chạm vào pos nếu gids rỗng)
+            let hover_connects = if gids.is_empty() {
+                (0..6).any(|dir| {
+                    let n_pos = get_neighbor_pos(hover_q, hover_r, dir);
+                    n_pos == pos && preview_cfg.edges[dir].to_group_type() == Some(group_type)
+                })
+            } else {
+                connected_gids.iter().any(|gid| gids.contains(gid))
             };
 
-            preview_results.insert(pos, (remaining_target, preview_status));
+            if hover_connects {
+                let delta_hover = match group_type {
+                    GroupType::Forest | GroupType::Village | GroupType::Agriculture | GroupType::Water => self.get_tile_element_count(hover_tile, group_type),
+                    _ => 1,
+                };
+
+                let mut delta_extra_groups = 0;
+                for &n_gid in &connected_gids {
+                    if !gids.contains(&n_gid) {
+                        if let Some(group) = self.groups.get(&n_gid) {
+                            let count = match group_type {
+                                GroupType::Forest | GroupType::Village | GroupType::Agriculture | GroupType::Water => group.total_element_count,
+                                _ => group.total_segment_count,
+                            };
+                            delta_extra_groups += count;
+                        }
+                    }
+                }
+
+                let simulated_external = current_external + delta_hover + delta_extra_groups;
+
+                let current_key = (hover_pos, hover_rotation, hover_tile.tile_preset_string());
+                let should_log = {
+                    let mut last = LAST_LOGGED_HOVER.lock().unwrap();
+                    if last.as_ref() != Some(&current_key) {
+                        *last = Some(current_key);
+                        true
+                    } else {
+                        false
+                    }
+                };
+
+                let mut member_tiles = HashSet::new();
+                for gid in &gids {
+                    if let Some(group) = self.groups.get(gid) {
+                        member_tiles.extend(group.member_tiles.iter().copied());
+                    }
+                }
+                for gid in &connected_gids {
+                    if let Some(group) = self.groups.get(gid) {
+                        member_tiles.extend(group.member_tiles.iter().copied());
+                    }
+                }
+                member_tiles.insert(hover_pos);
+
+                let simulated_open_edges = self.count_open_edges_for_tiles(&member_tiles, group_type, Some((hover_pos, &preview_cfg)));
+                let remaining_target = target_count.saturating_sub(simulated_external);
+
+                let preview_status = match equality {
+                    EqualityComparison::MoreThan => {
+                        if simulated_external >= target_count {
+                            FulfillmentStatus::Success
+                        } else if simulated_open_edges == 0 {
+                            FulfillmentStatus::Failed
+                        } else {
+                            FulfillmentStatus::Incomplete
+                        }
+                    }
+                    EqualityComparison::Exactly => {
+                        if simulated_external == target_count {
+                            FulfillmentStatus::Success
+                        } else if simulated_external > target_count {
+                            FulfillmentStatus::Failed
+                        } else if simulated_open_edges == 0 {
+                            FulfillmentStatus::Failed
+                        } else {
+                            FulfillmentStatus::Incomplete
+                        }
+                    }
+                };
+
+                if should_log {
+                    println!(
+                        "[HOVER PREVIEW DETAILED LOG] HoverPos={:?} Tile='{}' Rot={} | QuestPos={:?} GroupType={:?} | TargetCount={} | CurrentExternal={} | DeltaHover={} | DeltaExtraGroups={}",
+                        hover_pos, hover_tile.tile_preset_string(), hover_rotation, pos, group_type, target_count, current_external, delta_hover, delta_extra_groups
+                    );
+                    for &n_gid in &connected_gids {
+                        if !gids.contains(&n_gid) {
+                            if let Some(group) = self.groups.get(&n_gid) {
+                                println!(
+                                    "   [EXTRA GROUP CONNECTED] GID={} | ElementCount={} | SegmentCount={} | MemberTiles={:?}",
+                                    n_gid, group.total_element_count, group.total_segment_count, group.member_tiles
+                                );
+                            }
+                        } else {
+                            println!("   [MAIN QUEST GROUP CONNECTED] GID={}", n_gid);
+                            if let Some(group) = self.groups.get(&n_gid) {
+                                println!("      -> MAIN GROUP GID={} DETAILS: TotalElements={}", n_gid, group.total_element_count);
+                                for &(mq, mr) in &group.member_tiles {
+                                    if let Some(pt) = self.placed_tiles.get(&(mq, mr)) {
+                                        let elem_cnt = self.get_tile_element_count(&pt.tile, group_type);
+                                        println!("         - Tile at ({}, {}) = '{}' | Houses={}", mq, mr, pt.tile.tile_preset_string(), elem_cnt);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    println!(
+                        "   => RESULT: SimulatedExternal={} | OpenEdges={} | RemainingTargetDisplayed={} | Status={:?}",
+                        simulated_external, simulated_open_edges, remaining_target, preview_status
+                    );
+                }
+
+                preview_results.insert(pos, (remaining_target, preview_status));
+            }
         }
 
         // Thêm tính toán preview cho chính ô hover_tile (nếu hover_tile bản thân nó là 1 ô Quest)
@@ -670,7 +758,7 @@ impl Board {
                     if let Some(neighbor) = self.placed_tiles.get(&n_pos) {
                         let neighbor_edge = neighbor.edge_config.edges[opposite_direction(dir)];
                         if neighbor_edge.to_group_type() == Some(group_type) {
-                            if let Some(&gid) = self.tile_to_group.get(&(n_pos, group_type)) {
+                            if let Some(&gid) = self.edge_to_group.get(&(n_pos, opposite_direction(dir))) {
                                 if !connected_gids.contains(&gid) {
                                     connected_gids.insert(gid);
                                     if let Some(group) = self.groups.get(&gid) {
@@ -849,5 +937,49 @@ mod tests {
 
         // Re-eval should not fail it because it is already finalized with Success
         assert_eq!(board.placed_tiles[&(0, 0)].quest_status, Some(FulfillmentStatus::Success));
+    }
+
+    #[test]
+    fn test_quest_with_unconnected_multi_segment_tile() {
+        let mut board = Board::new();
+
+        // Quest Tile Village 6AV (7 own houses, target = 12, remaining target = 5)
+        let quest_tile = create_test_quest_tile(1, "QuestTile_Village_6AV", 12, EqualityComparison::MoreThan);
+        assert!(board.place_tile(0, 0, quest_tile, 0));
+
+        // Multi-segment tile with 2 separate 1AV segments:
+        // Seg #0 (1AV) on edge 3 (connects to (0,0) Edge 0)
+        // Seg #1 (1AV) on edge 1 (faces empty hex (1,1) Edge 1)
+        let multi_seg_tile = GeneratedTile::Normal {
+            base_tile: BaseTile::new(2, 20, "2AV_Tile"),
+            segments: vec![
+                SegmentData {
+                    index: 0,
+                    group_type: GroupType::Village,
+                    segment_type: SegmentType::ST1A,
+                    occupied_edges: vec![3],
+                    rotation: 3,
+                    is_hybrid: false,
+                },
+                SegmentData {
+                    index: 1,
+                    group_type: GroupType::Village,
+                    segment_type: SegmentType::ST1A,
+                    occupied_edges: vec![1],
+                    rotation: 1,
+                    is_hybrid: false,
+                },
+            ],
+        };
+
+        assert!(board.place_tile(0, 1, multi_seg_tile, 0));
+
+        // External count must be 1 house (only Seg #0 connected), NOT 2 houses!
+        let ext_count = board.get_quest_external_count((0, 0), GroupType::Village);
+        assert_eq!(ext_count, 1);
+
+        // Remaining target must be 4 houses (5 - 1 = 4), NOT 3 houses!
+        let remaining = board.get_quest_remaining_target((0, 0));
+        assert_eq!(remaining, 4);
     }
 }
