@@ -65,7 +65,7 @@ impl TileGenerator {
     }
 
     /// 3. Sinh QuestTile chuẩn theo 3 lượt quay ngẫu nhiên trọng số C# (có lọc excludedGroupTypes và usedFilter)
-    pub fn generate_quest_tile(&mut self, quest_seed: i32, used_filter: TileGenFilter) -> QuestTileData {
+    pub fn generate_quest_tile(&mut self, quest_seed: i32, used_filter: TileGenFilter, level: usize) -> QuestTileData {
         let quest_seed_mul2 = quest_seed.wrapping_mul(2);
         let mut rng = UnityRandom::init_state(quest_seed_mul2);
         let quest_configs = QuestConfigurations::from_file("monthly_game_info.txt");
@@ -121,14 +121,14 @@ impl TileGenerator {
             .unwrap_or_else(|| (selected_sub.quest_tiles[0].clone(), 0.0, 0.0, 0.0));
         println!("  [Roll 3: Option] Prob Ratio: {:.8}, Total Prob: {}, Roll Val: {:.4}, Chosen Prefab: '{}'\n", opt_ratio, opt_total, opt_roll, selected_opt.prefab_name);
 
-        let (equality, _) = crate::game_config::get_quest_prefab_condition_target_value(&selected_opt.prefab_name, selected_col.group_type, quest_seed);
+        let (equality, _) = crate::game_config::get_quest_prefab_condition_target_value_with_level(&selected_opt.prefab_name, selected_col.group_type, quest_seed, level);
 
         QuestTileData {
             seed: quest_seed,
             quest_type: selected_opt.prefab_name.clone(),
             target_count: 0,
             equality,
-            level: 0,
+            level,
             quest_id: None,
             stack_quest_id: None,
         }
@@ -140,6 +140,7 @@ impl TileGenerator {
         base_tile_opt: Option<BaseTile>,
         active_quest_count: i32,
         overwrite_quest_prob: Option<f32>,
+        level: usize,
     ) -> GeneratedTile {
         let mut base_tile = base_tile_opt.unwrap_or_else(|| {
             self.generate_base_tile(-1, "Stacked Tile")
@@ -192,8 +193,7 @@ impl TileGenerator {
             // Dòng 43178 C#: GeneratedQuestCount++
             self.generated_quest_count += 1;
 
-            let mut quest_data = self.generate_quest_tile(num2, used_filter);
-            quest_data.level = 0;
+            let quest_data = self.generate_quest_tile(num2, used_filter, level);
             println!("  ==> ACTUAL RETURNED QUEST TILE: '{}'", quest_data.quest_type);
             println!("================================----------------------------------\n");
 
@@ -350,7 +350,7 @@ mod tests {
         let mut gen = TileGenerator::new(-2093096630);
         let mut quest_count = 0;
         for i in 1..=22 {
-            let tile = gen.generate_tile(None, quest_count, None);
+            let tile = gen.generate_tile(None, quest_count, None, 0);
             if let GeneratedTile::Quest { ref quest_data, .. } = tile {
                 quest_count += 1;
                 println!("Tile #{}: Prefab='{}', Equality={:?}", i, quest_data.quest_type, quest_data.equality);

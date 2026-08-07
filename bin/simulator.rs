@@ -114,7 +114,7 @@ async fn main() {
     // 2. Sinh 3 tile preview ban đầu (Tile #1, #2, #3) — pop queue để consume đúng 3 slot count = 0
     for _ in 0..3 {
         let active_count = quest_manager.pop_next_active_quest_count(); // pops 0, 0, 0
-        let t = generator.generate_tile(None, active_count, None);
+        let t = generator.generate_tile(None, active_count, None, quest_manager.level);
         tile_queue.push_back(t);
     }
 
@@ -359,7 +359,7 @@ async fn main() {
 
                     // Sinh Tile tiếp theo (Tile N+3) sau khi đặt ô xuống bàn chơi
                     let active_count = quest_manager.pop_next_active_quest_count();
-                    let next_gen = generator.generate_tile(None, active_count, None);
+                    let next_gen = generator.generate_tile(None, active_count, None, quest_manager.level);
                     tile_queue.push_back(next_gen);
 
                     // Update TargetValue cho ô mới ở đầu cọc bài dựa theo trạng thái bàn chơi
