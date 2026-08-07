@@ -52,7 +52,7 @@ impl PPOAgent {
         }
     }
 
-    /// Chọn Action bằng Softmax Sampling từ Logits đã được Action Masking
+    /// Chọn Action bằng Softmax Sampling từ Logits đã được Action Masking & Action MLP Head
     pub fn select_action(
         model: &HexGNNModel,
         obs: &GraphObservation,
@@ -62,25 +62,15 @@ impl PPOAgent {
             return (Action { q: 0, r: 0, rotation: 0 }, 0, 0.0, 0.0);
         }
 
-        let (node_logits, state_value) = model.forward(&obs.node_features, &obs.edge_index);
+        let (action_logits, state_value) = model.forward(
+            &obs.node_positions,
+            &obs.node_features,
+            &obs.edge_index,
+            &obs.valid_actions,
+            &obs.action_features,
+        );
 
-        // Ánh xạ valid_actions sang Logits tương ứng
-        let mut action_logits = Vec::with_capacity(obs.valid_actions.len());
-        for act in &obs.valid_actions {
-            let pos_idx = obs.node_positions.iter().position(|&p| p == (act.q, act.r));
-            let logit = if let Some(idx) = pos_idx {
-                if idx < node_logits.len() {
-                    node_logits[idx][act.rotation]
-                } else {
-                    -1e9
-                }
-            } else {
-                -1e9
-            };
-            action_logits.push(logit);
-        }
-
-        // Softmax
+        // Softmax over all valid action logits
         let max_logit = action_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let exps: Vec<f32> = action_logits.iter().map(|l| (l - max_logit).exp()).collect();
         let sum_exp: f32 = exps.iter().sum();
@@ -269,6 +259,7 @@ impl PPOAgent {
                             &tr.obs.node_features,
                             &tr.obs.edge_index,
                             &tr.obs.valid_actions,
+                            &tr.obs.action_features,
                             tr.action_idx,
                             effective_policy_adv,
                             val_grad,

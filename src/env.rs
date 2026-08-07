@@ -29,12 +29,14 @@ pub struct StepResult {
 pub struct GraphObservation {
     /// Danh sách vị trí tọa độ của tất cả các node trong đồ thị (Placed + Candidates)
     pub node_positions: Vec<(i32, i32)>,
-    /// Tensor đặc trưng của các node: [N, 38]
+    /// Tensor đặc trưng của các node: [N, 40]
     pub node_features: Vec<[f32; 40]>,
     /// Danh sách các cạnh nối giữa các node kề nhau: Vec<(from_idx, to_idx)>
     pub edge_index: Vec<(usize, usize)>,
-    /// Danh sách tất cả các Action hợp lệ ở bước đi hiện tại (vị trí ô trống + góc xoay hợp lệ)
+    /// Danh sách tất cả các Action hợp lệ ở bước đi hiện tại
     pub valid_actions: Vec<Action>,
+    /// Đặc trưng Hình học Tường minh (Explicit Geometric Features) cho từng valid action: [Num_Actions, 16]
+    pub action_features: Vec<[f32; 16]>,
 }
 
 /// Môi trường RL Headless cho Dorfromantik
@@ -400,12 +402,76 @@ impl DorfromantikEnv {
         }
 
         let valid_actions = self.get_valid_actions();
+        let mut action_features = Vec::with_capacity(valid_actions.len());
+
+        if let Some(curr) = tile_curr {
+            let curr_cfg = curr.to_hex_edge_config();
+            let is_quest_tile = if matches!(curr, GeneratedTile::Quest { .. }) { 1.0 } else { 0.0 };
+
+            for act in &valid_actions {
+                let mut feat = [0.0f32; 16];
+                let mut matching_count = 0;
+                let mut mismatching_count = 0;
+                let mut open_count = 0;
+                let mut quest_adj = 0.0f32;
+                let mut quest_connect = 0.0f32;
+
+                for dir in 0..6 {
+                    let n_pos = get_neighbor_pos(act.q, act.r, dir);
+                    let c_edge = curr_cfg.edge_at(dir, act.rotation);
+                    feat[8 + dir] = (c_edge as usize as f32) / 7.0;
+
+                    if let Some(n_tile) = placed.get(&n_pos) {
+                        let opp_dir = (dir + 3) % 6;
+                        let n_edge = n_tile.edge_config.edges[opp_dir];
+                        let is_match = c_edge == n_edge || (c_edge.to_group_type().is_some() && c_edge.to_group_type() == n_edge.to_group_type());
+
+                        if is_match {
+                            matching_count += 1;
+                            if let GeneratedTile::Quest { quest_data, .. } = &n_tile.tile {
+                                if !n_tile.quest_finalized && Some(quest_data.primary_group_type()) == c_edge.to_group_type() {
+                                    quest_connect = 1.0;
+                                }
+                            }
+                        } else {
+                            mismatching_count += 1;
+                        }
+
+                        if let GeneratedTile::Quest { quest_data, .. } = &n_tile.tile {
+                            if !n_tile.quest_finalized && Some(quest_data.primary_group_type()) == c_edge.to_group_type() {
+                                quest_adj = 1.0;
+                            }
+                        }
+                    } else {
+                        open_count += 1;
+                    }
+                }
+
+                feat[0] = matching_count as f32 / 6.0;
+                feat[1] = mismatching_count as f32 / 6.0;
+                feat[2] = open_count as f32 / 6.0;
+                feat[3] = if matching_count > 0 && mismatching_count == 0 {
+                    if open_count == 0 { 1.0 } else { 0.5 }
+                } else {
+                    0.0
+                };
+                feat[4] = quest_adj;
+                feat[5] = quest_connect;
+                feat[6] = is_quest_tile;
+                feat[7] = act.rotation as f32 / 6.0;
+                feat[14] = (matching_count as f32 * 10.0) / 60.0;
+                feat[15] = if quest_connect > 0.0 { 1.0 } else { 0.0 };
+
+                action_features.push(feat);
+            }
+        }
 
         GraphObservation {
             node_positions,
             node_features,
             edge_index,
             valid_actions,
+            action_features,
         }
     }
 }

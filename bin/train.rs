@@ -5,7 +5,7 @@ fn main() {
     let target_seed = -2093096630;
     let tile_limit = 100;
     let lr = 0.001;
-    let num_iterations = 200;
+    let num_iterations = 2000;
     let num_envs_parallel = 32;   // 32 worker threads CPU
     let steps_per_env = 50;       // 1,600 transitions per rollout iteration
 
