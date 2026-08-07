@@ -246,6 +246,7 @@ pub struct AlphaZeroTrainerConfig {
     pub temp_threshold_moves: usize,
     pub num_parallel_envs: usize,
     pub target_seed: i32,
+    pub initial_stack: usize,
     pub tile_limit: usize,
 }
 
@@ -267,6 +268,7 @@ impl Default for AlphaZeroTrainerConfig {
             temp_threshold_moves: 12,
             num_parallel_envs: 16,
             target_seed: -2093096630,
+            initial_stack: 10,
             tile_limit: 100,
         }
     }
@@ -297,12 +299,13 @@ pub struct GameMatchRecord {
 /// Thu thập dữ liệu 1 ván tự chơi (Self-Play Episode) sử dụng MCTS (200 simulations)
 pub fn run_self_play_episode(
     seed: i32,
+    initial_stack: usize,
     tile_limit: usize,
     model: &HexGNNModel,
     mcts_config: &MCTSConfig,
     temp_threshold: usize,
 ) -> (Vec<AlphaZeroSample>, GameMatchRecord) {
-    let mut env = DorfromantikEnv::new(seed, 10, tile_limit);
+    let mut env = DorfromantikEnv::new(seed, initial_stack, tile_limit);
     let mcts = MCTSSearch::new(mcts_config.clone());
 
     let mut raw_steps: Vec<(GraphObservation, Vec<f32>, f32)> = Vec::new();
@@ -327,7 +330,7 @@ pub fn run_self_play_episode(
         let prev_score = env.score_manager.total_score;
         let res = env.step(chosen_action);
         let score_gained = env.score_manager.total_score.saturating_sub(prev_score);
-        let scaled_r = res.reward * 0.05;
+        let scaled_r = res.reward * 0.01;
 
         move_records.push(GameMoveRecord {
             step: move_count,
@@ -379,11 +382,12 @@ pub fn run_self_play_episode(
 /// Đánh giá sức mạnh của Model hiện tại với MCTS Greedy (Nhiệt độ = 0.0) trên Seed mục tiêu
 pub fn evaluate_alphazero_agent(
     seed: i32,
+    initial_stack: usize,
     tile_limit: usize,
     model: &HexGNNModel,
     mcts_config: &MCTSConfig,
 ) -> (usize, usize, GameMatchRecord) {
-    let mut env = DorfromantikEnv::new(seed, 10, tile_limit);
+    let mut env = DorfromantikEnv::new(seed, initial_stack, tile_limit);
     let mcts = MCTSSearch::new(mcts_config.clone());
     let mut move_records: Vec<GameMoveRecord> = Vec::new();
     let mut move_count = 0;
@@ -448,26 +452,19 @@ impl AlphaZeroPipeline {
     pub fn collect_self_play_data(&mut self) -> (f32, usize, usize, Option<GameMatchRecord>) {
         let n_envs = self.config.num_parallel_envs;
         let base_seed = self.config.target_seed;
+        let initial_stack = self.config.initial_stack;
         let tile_limit = self.config.tile_limit;
         let mcts_cfg = self.config.mcts_config.clone();
         let temp_thresh = self.config.temp_threshold_moves;
         let model_ref = &self.model;
 
-        // Sinh danh sách seeds ngẫu nhiên xoay quanh target_seed để mô hình học tổng quát
-        let seeds: Vec<i32> = (0..n_envs)
-            .map(|i| {
-                if i == 0 {
-                    base_seed
-                } else {
-                    base_seed.wrapping_add((i as i32) * 98765 + 13)
-                }
-            })
-            .collect();
+        // 100% tất cả luồng chạy trên cùng target_seed của file monthly
+        let seeds: Vec<i32> = vec![base_seed; n_envs];
 
         // Chạy đa luồng song song các ván đấu MCTS
         let results: Vec<(Vec<AlphaZeroSample>, GameMatchRecord)> = seeds
             .into_par_iter()
-            .map(|s| run_self_play_episode(s, tile_limit, model_ref, &mcts_cfg, temp_thresh))
+            .map(|s| run_self_play_episode(s, initial_stack, tile_limit, model_ref, &mcts_cfg, temp_thresh))
             .collect();
 
         let mut total_score = 0;
@@ -611,6 +608,17 @@ impl AlphaZeroPipeline {
         }
         if std::path::Path::new(buffer_path).exists() {
             let _ = self.replay_buffer.load_from_file(buffer_path)?;
+            // Tự động chuẩn hóa target_val nếu dữ liệu cũ đang ở scale 0.05 (target_val > 20.0)
+            let avg_val: f32 = if !self.replay_buffer.is_empty() {
+                self.replay_buffer.buffer.iter().take(100).map(|s| s.target_val).sum::<f32>() / 100.0f32.min(self.replay_buffer.len() as f32)
+            } else {
+                0.0
+            };
+            if avg_val > 20.0 {
+                for sample in self.replay_buffer.buffer.iter_mut() {
+                    sample.target_val *= 0.2; // Chuyển từ scale 0.05 sang 0.01 (0.01 / 0.05 = 0.2)
+                }
+            }
         }
         Ok(())
     }

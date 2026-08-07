@@ -6,21 +6,55 @@ use dorfromantik_remake::alphazero::{
 };
 use dorfromantik_remake::mcts::MCTSConfig;
 
+fn load_monthly_game_config() -> (i32, usize, usize) {
+    let mut seed = -2093096630;
+    let mut initial_stack = 10;
+    let mut tile_limit = 100;
+
+    if let Ok(content) = fs::read_to_string("monthly_game_info.txt") {
+        for line in content.lines() {
+            if let Some((key, val)) = line.split_once('=') {
+                let key = key.trim();
+                let val = val.trim();
+                match key {
+                    "REAL_TILE_SEED" => {
+                        if let Ok(v) = val.parse::<i32>() {
+                            seed = v;
+                        }
+                    }
+                    "ACTIVE_TileStackHeight" => {
+                        if let Ok(v) = val.parse::<usize>() {
+                            initial_stack = v;
+                        }
+                    }
+                    "ACTIVE_TileLimit" => {
+                        if let Ok(v) = val.parse::<usize>() {
+                            tile_limit = v;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    (seed, initial_stack, tile_limit)
+}
+
 fn main() {
     println!("============================================================");
     println!("=== DORFROMANTIK ALPHAZERO (MCTS + GNN) CONTINUOUS TRAIN ===");
     println!("============================================================");
 
-    let target_seed = -2093096630;
-    let tile_limit = 100;
+    let (target_seed, initial_stack, tile_limit) = load_monthly_game_config();
     let parallel_envs = 16;
 
-    // Đọc số simulations từ tham số dòng lệnh nếu có (mặc định 200)
+    // Đọc số simulations từ tham số dòng lệnh nếu có (mặc định 400)
     let args: Vec<String> = std::env::args().collect();
     let n_simulations = if args.len() > 1 {
-        args[1].parse::<usize>().unwrap_or(200)
+        args[1].parse::<usize>().unwrap_or(400)
     } else {
-        200
+        400
     };
 
     let lr = 0.0003;
@@ -41,6 +75,7 @@ fn main() {
         temp_threshold_moves: 12,
         num_parallel_envs: parallel_envs,
         target_seed,
+        initial_stack,
         tile_limit,
     };
 
@@ -94,16 +129,41 @@ fn main() {
     }
 
     println!("Target Seed        : {}", target_seed);
+    println!("Initial Stack      : {} tiles", initial_stack);
     println!("Tile Limit / Game  : {}", tile_limit);
     println!("MCTS Simulations   : {}", n_simulations);
     println!("Parallel Envs      : {} threads", parallel_envs);
     println!("Learning Rate      : {}", lr);
     println!("Replay Buffer Cap  : 50,000 samples");
+    // Đọc và hiển thị quest probability multiplier để xác nhận đã load đúng từ file
+    {
+        let qpm = dorfromantik_remake::generator::TileGenerator::new(target_seed).global_quest_probability_multiplier;
+        println!("Quest Prob Mult    : {:.2}x  (from monthly_game_info.txt)", qpm);
+    }
     println!("All-time Match Max : {} pts", all_time_best_match_score);
     println!("Training Mode      : Continuous Infinite Loop (Ctrl+C to stop anytime)");
     println!("------------------------------------------------------------");
 
+    // let server_state = dorfromantik_remake::server::SharedTrainingState::new();
+    // let _server_thread = dorfromantik_remake::server::start_server(3030, server_state.clone());
+
+    // // Khởi tạo trạng thái ban đầu cho server
+    // {
+    //     let mut s = server_state.status.lock().unwrap();
+    //     s.iter = start_iter;
+    //     s.buffer_len = pipeline.buffer_len();
+    //     s.eval_score = best_eval_score;
+    //     s.all_time_best_score = all_time_best_match_score;
+    //     s.n_simulations = n_simulations;
+    // }
+    // *server_state.landscape.lock().unwrap() = dorfromantik_remake::server::compute_landscape_points(&pipeline.replay_buffer, 250);
+
     for iter in (start_iter + 1).. {
+        // Kiểm tra xem người dùng có bấm PAUSE từ Web UI không
+        // while server_state.is_paused.load(std::sync::atomic::Ordering::Relaxed) {
+        //     std::thread::sleep(std::time::Duration::from_millis(500));
+        // }
+
         let t_start = Instant::now();
 
         // 1. Data Generation via MCTS Self-Play
@@ -119,7 +179,7 @@ fn main() {
 
         // 3. Evaluation on Target Seed
         let (eval_score, eval_placed, eval_match) =
-            evaluate_alphazero_agent(target_seed, tile_limit, &pipeline.model, &config.mcts_config);
+            evaluate_alphazero_agent(target_seed, initial_stack, tile_limit, &pipeline.model, &config.mcts_config);
 
         let t_total = t_start.elapsed();
 
@@ -151,6 +211,28 @@ fn main() {
         // Tự động lưu Checkpoint Model + Replay Buffer + Metadata sau MỖI iteration
         let _ = pipeline.save_checkpoint(&latest_model_path, &buffer_path);
         let _ = fs::write(&meta_path, format!("{},{}", iter, best_eval_score));
+
+        // Cập nhật trạng thái thời gian thực và tọa độ Landscape lên Web Server
+        // let landscape_data = dorfromantik_remake::server::compute_landscape_points(&pipeline.replay_buffer, 250);
+        // {
+        //     let mut s = server_state.status.lock().unwrap();
+        //     s.iter = iter;
+        //     s.buffer_len = pipeline.buffer_len();
+        //     s.sp_time_sec = t_gen.as_secs_f32();
+        //     s.train_time_sec = t_train.as_secs_f32();
+        //     s.total_time_sec = t_total.as_secs_f32();
+        //     s.total_loss = loss;
+        //     s.policy_loss = pi_loss;
+        //     s.value_loss = val_loss;
+        //     s.sp_avg_score = self_play_avg_score;
+        //     s.sp_max_score = self_play_max_score;
+        //     s.sp_avg_placed = self_play_avg_placed;
+        //     s.eval_score = eval_score;
+        //     s.eval_placed = eval_placed;
+        //     s.all_time_best_score = all_time_best_match_score;
+        //     s.n_simulations = n_simulations;
+        // }
+        // *server_state.landscape.lock().unwrap() = landscape_data;
 
         let flag = if is_best && new_match_record_saved {
             " [BEST EVAL & NEW MATCH RECORD!]"

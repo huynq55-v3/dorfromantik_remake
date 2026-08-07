@@ -21,9 +21,27 @@ pub struct TileGenerator {
 
 impl TileGenerator {
     pub fn new(seed: i32) -> Self {
+        Self::from_file(seed, "monthly_game_info.txt")
+    }
+
+    pub fn from_file<P: AsRef<std::path::Path>>(seed: i32, path: P) -> Self {
         // Tính toán tile_seed_increment_step ngẫu nhiên từ Unity InitState LCG formula
         let mut rng = UnityRandom::init_state(seed);
         let tile_seed_increment_step = rng.range_i32(-100000, 100000);
+
+        // Đọc ACTIVE_QuestProbability từ file cấu hình (mặc định = 1.0 nếu không tìm thấy)
+        let mut global_quest_probability_multiplier = 1.0_f32;
+        if let Ok(content) = std::fs::read_to_string(path) {
+            for line in content.lines() {
+                if let Some((key, val)) = line.split_once('=') {
+                    if key.trim() == "ACTIVE_QuestProbability" {
+                        if let Ok(v) = val.trim().parse::<f32>() {
+                            global_quest_probability_multiplier = v;
+                        }
+                    }
+                }
+            }
+        }
 
         Self {
             tile_generation_seed: seed,
@@ -32,7 +50,7 @@ impl TileGenerator {
             tile_seed_increment_step,
             at_least_two_empty_edges_for_x_turns: 5,
             base_tile_counter: 0,
-            global_quest_probability_multiplier: 1.0,
+            global_quest_probability_multiplier,
         }
     }
 

@@ -16,6 +16,10 @@ name = "simulator"
 path = "bin/simulator.rs"
 
 [[bin]]
+name = "replay"
+path = "bin/replay.rs"
+
+[[bin]]
 name = "rl_benchmark"
 path = "bin/rl_benchmark.rs"
 

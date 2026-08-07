@@ -168,7 +168,7 @@ impl MCTSSearch {
 
                 let (chosen_action, _) = curr.children[best_idx];
                 let res = sim_env.step(chosen_action);
-                let scaled_r = res.reward * 0.05;
+                let scaled_r = res.reward * 0.01;
 
                 node_path.push(best_idx);
                 step_rewards.push(scaled_r);

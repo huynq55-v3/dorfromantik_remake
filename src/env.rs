@@ -43,6 +43,7 @@ pub struct GraphObservation {
 #[derive(Debug, Clone)]
 pub struct DorfromantikEnv {
     pub seed: i32,
+    pub initial_stack: usize,
     pub tile_limit: usize,
     pub board: Board,
     pub generator: TileGenerator,
@@ -56,6 +57,7 @@ impl DorfromantikEnv {
     pub fn new(seed: i32, initial_stack: usize, tile_limit: usize) -> Self {
         let mut env = Self {
             seed,
+            initial_stack,
             tile_limit,
             board: Board::new(),
             generator: TileGenerator::new(seed),
@@ -73,7 +75,7 @@ impl DorfromantikEnv {
         self.board = Board::new();
         self.generator = TileGenerator::new(self.seed);
         self.quest_manager = QuestManager::new();
-        self.score_manager = ScoreManager::new(10);
+        self.score_manager = ScoreManager::new(self.initial_stack);
         self.tile_queue.clear();
         self.placed_count = 0;
 
