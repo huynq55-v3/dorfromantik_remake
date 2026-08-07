@@ -260,10 +260,10 @@ pub fn initialize_active_quest_tile(
             quest_data.equality = eq;
             quest_data.level = reward_level;
 
-            println!(
-                "  [INIT QUEST TARGET] Prefab='{}' Seed={} | GroupType={:?} | BoardRefOnTable={} | TileOwnCount={} | BoardRef={} | MinTarget={} | Base={} | CondVal={} | Level={} | DiffIncrease={} | TargetValue={} | RemainingValue (Displayed)={}",
-                quest_data.quest_type, quest_data.seed, gt, board_ref_on_table, tile_own_count, board_ref, min_target, base, cond_val, quest_manager.level, diff, quest_data.target_count, quest_data.remaining_display_value()
-            );
+            // println!(
+            //     "  [INIT QUEST TARGET] Prefab='{}' Seed={} | GroupType={:?} | BoardRefOnTable={} | TileOwnCount={} | BoardRef={} | MinTarget={} | Base={} | CondVal={} | Level={} | DiffIncrease={} | TargetValue={} | RemainingValue (Displayed)={}",
+            //     quest_data.quest_type, quest_data.seed, gt, board_ref_on_table, tile_own_count, board_ref, min_target, base, cond_val, quest_manager.level, diff, quest_data.target_count, quest_data.remaining_display_value()
+            // );
         }
     }
 }

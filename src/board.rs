@@ -132,7 +132,27 @@ impl Board {
         max_count
     }
 
+    /// Trả về tất cả các vị trí ô trống ứng viên (kề cạnh với ít nhất 1 ô đã đặt)
+    pub fn get_candidate_placements(&self) -> Vec<(i32, i32)> {
+        if self.placed_tiles.is_empty() {
+            return vec![(0, 0)];
+        }
+        let mut candidates = HashSet::new();
+        for &(q, r) in self.placed_tiles.keys() {
+            for dir in 0..6 {
+                let n_pos = get_neighbor_pos(q, r, dir);
+                if !self.placed_tiles.contains_key(&n_pos) {
+                    candidates.insert(n_pos);
+                }
+            }
+        }
+        let mut vec: Vec<(i32, i32)> = candidates.into_iter().collect();
+        vec.sort_unstable();
+        vec
+    }
+
     /// Kiểm tra quy tắc đặt tile có hợp lệ không (Placement Validation)
+
     /// - Water edge chỉ được nối với Water edge (hoặc ô trống)
     /// - TrainTrack edge chỉ được nối với TrainTrack edge (hoặc ô trống)
     pub fn can_place_tile(&self, q: i32, r: i32, tile: &GeneratedTile, rotation: usize) -> bool {

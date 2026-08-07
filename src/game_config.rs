@@ -741,11 +741,11 @@ pub fn select_random_quest(
         (c2_equality, c2_val)
     };
 
-    println!(
-        "  [SelectRandomQuest] Prefab='{}' GroupType={:?} Seed={} Level={} | w1(+)={:.4} w2(=)={:.4} total={:.4} | roll={:.8} | => {:?} val={}",
-        _prefab_name, group_type, quest_seed, level, w1, w2, total_weight, roll_val,
-        result.0, result.1
-    );
+    // println!(
+    //     "  [SelectRandomQuest] Prefab='{}' GroupType={:?} Seed={} Level={} | w1(+)={:.4} w2(=)={:.4} total={:.4} | roll={:.8} | => {:?} val={}",
+    //     _prefab_name, group_type, quest_seed, level, w1, w2, total_weight, roll_val,
+    //     result.0, result.1
+    // );
 
     result
 }

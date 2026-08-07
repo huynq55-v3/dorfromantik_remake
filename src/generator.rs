@@ -8,6 +8,7 @@ pub enum TileGenFilter {
     AtLeastTwoEmptyEdges,
 }
 
+#[derive(Debug, Clone)]
 pub struct TileGenerator {
     pub tile_generation_seed: i32,
     pub generated_tile_count: i32,
@@ -70,8 +71,8 @@ impl TileGenerator {
         let mut rng = UnityRandom::init_state(quest_seed_mul2);
         let quest_configs = QuestConfigurations::from_file("monthly_game_info.txt");
 
-        println!("\n=== GENERATE QUEST TILE DETAILS (Quest Seed: {}, InitState Seed: {}, Filter: {:?}) ===", quest_seed, quest_seed_mul2, used_filter);
-        println!("  [Excluded Group Types]: {:?}", quest_configs.excluded_group_types);
+        // println!("\n=== GENERATE QUEST TILE DETAILS (Quest Seed: {}, InitState Seed: {}, Filter: {:?}) ===", quest_seed, quest_seed_mul2, used_filter);
+        // println!("  [Excluded Group Types]: {:?}", quest_configs.excluded_group_types);
 
         // Roll 1: Chọn QuestCollection
         let col_options: Vec<_> = quest_configs
@@ -79,10 +80,10 @@ impl TileGenerator {
             .iter()
             .map(|c| (c.clone(), c.probability))
             .collect();
-        let (selected_col, col_roll, col_ratio, col_total) = rng
+        let (selected_col, _col_roll, col_ratio, col_total) = rng
             .select_weighted_info(&col_options)
             .unwrap_or_else(|| (quest_configs.collections[0].clone(), 0.0, 0.0, 0.0));
-        println!("  [Roll 1: Collection] CollProb: {:.8}, RawProb: {}, Total Prob: {}, Roll Val: {:.4}, Chosen: '{}'", col_ratio, selected_col.probability, col_total, col_roll, selected_col.name);
+        // println!("  [Roll 1: Collection] CollProb: {:.8}, RawProb: {}, Total Prob: {}, Roll Val: {:.4}, Chosen: '{}'", col_ratio, selected_col.probability, col_total, col_roll, selected_col.name);
 
         // 1. Lọc danh sách SubCollection theo excludedGroupTypes (C# dòng 24421: loại bỏ subcollection chứa group_type bị cấm)
         let mut filtered_sub_cols: Vec<_> = selected_col
@@ -104,11 +105,11 @@ impl TileGenerator {
             .iter()
             .map(|s| (s.clone(), s.probability))
             .collect();
-        let (selected_sub, sub_roll, _sub_ratio, sub_total) = rng
+        let (selected_sub, _sub_roll, _sub_ratio, sub_total) = rng
             .select_weighted_info(&sub_options)
             .unwrap_or_else(|| (filtered_sub_cols[0].clone(), 0.0, 0.0, 0.0));
-        let sub_coll_prob = if col_total == 0.0 || sub_total == 0.0 { 0.0 } else { (selected_sub.probability / sub_total) * col_ratio };
-        println!("  [Roll 2: SubCollection (Filtered)] subCollectionProbability: {:.8}, SubRawProb: {:.4}, Total Filtered SubProb: {:.4}, Roll Val: {:.4}, OccupiedEdges: {}", sub_coll_prob, selected_sub.probability, sub_total, sub_roll, selected_sub.occupied_edges);
+        let _sub_coll_prob = if col_total == 0.0 || sub_total == 0.0 { 0.0 } else { (selected_sub.probability / sub_total) * col_ratio };
+        // println!("  [Roll 2: SubCollection (Filtered)] subCollectionProbability: {:.8}, SubRawProb: {:.4}, Total Filtered SubProb: {:.4}, Roll Val: {:.4}, OccupiedEdges: {}", sub_coll_prob, selected_sub.probability, sub_total, sub_roll, selected_sub.occupied_edges);
 
         // Roll 3: Chọn QuestOption từ SubCollection đã chọn
         let opt_options: Vec<_> = selected_sub
@@ -116,10 +117,10 @@ impl TileGenerator {
             .iter()
             .map(|o| (o.clone(), o.probability))
             .collect();
-        let (selected_opt, opt_roll, opt_ratio, opt_total) = rng
+        let (selected_opt, _opt_roll, _opt_ratio, _opt_total) = rng
             .select_weighted_info(&opt_options)
             .unwrap_or_else(|| (selected_sub.quest_tiles[0].clone(), 0.0, 0.0, 0.0));
-        println!("  [Roll 3: Option] Prob Ratio: {:.8}, Total Prob: {}, Roll Val: {:.4}, Chosen Prefab: '{}'\n", opt_ratio, opt_total, opt_roll, selected_opt.prefab_name);
+        // println!("  [Roll 3: Option] Prob Ratio: {:.8}, Total Prob: {}, Roll Val: {:.4}, Chosen Prefab: '{}'\n", opt_ratio, opt_total, opt_roll, selected_opt.prefab_name);
 
         let (equality, _) = crate::game_config::get_quest_prefab_condition_target_value_with_level(&selected_opt.prefab_name, selected_col.group_type, quest_seed, level);
 
@@ -165,25 +166,25 @@ impl TileGenerator {
             TileGenFilter::None
         };
 
-        println!("\n================================----------------------------------");
-        println!("[TILE GENERATION LOG] Tile #{}", self.generated_tile_count);
-        println!("  - Generated Tile Count (Before): {}", before_tile_count);
-        println!("  - Generated Quest Count (Before): {}", before_quest_count);
-        println!("  - Active Quest Count (Board): {}", active_quest_count);
-        println!("  - Tile Seed (num): {}", num);
-        println!("Tile Generation Seed: {}, Tile Seed Increment Step: {}", self.tile_generation_seed, self.tile_seed_increment_step);
+        // println!("\n================================----------------------------------");
+        // println!("[TILE GENERATION LOG] Tile #{}", self.generated_tile_count);
+        // println!("  - Generated Tile Count (Before): {}", before_tile_count);
+        // println!("  - Generated Quest Count (Before): {}", before_quest_count);
+        // println!("  - Active Quest Count (Board): {}", active_quest_count);
+        // println!("  - Tile Seed (num): {}", num);
+        // println!("Tile Generation Seed: {}, Tile Seed Increment Step: {}", self.tile_generation_seed, self.tile_seed_increment_step);
 
         let seed_quest_check = self.tile_generation_seed
             .wrapping_add(self.generated_tile_count.wrapping_mul(self.tile_seed_increment_step));
-        println!("Seed Quest Check: {}", seed_quest_check);
+        // println!("Seed Quest Check: {}", seed_quest_check);
 
         let mut rng_quest = UnityRandom::init_state(seed_quest_check);
         let quest_roll = rng_quest.value();
         let quest_prob = overwrite_quest_prob.unwrap_or_else(|| self.quest_tile_probability(active_quest_count));
 
         let is_quest = quest_roll <= quest_prob;
-        println!("  - Quest Roll: {:.8} | Threshold (Prob): {:.8}", quest_roll, quest_prob);
-        println!("  ==> DECISION ROLL: {}", if is_quest { "QUEST TILE" } else { "NORMAL TILE" });
+        // println!("  - Quest Roll: {:.8} | Threshold (Prob): {:.8}", quest_roll, quest_prob);
+        // println!("  ==> DECISION ROLL: {}", if is_quest { "QUEST TILE" } else { "NORMAL TILE" });
 
         if is_quest {
             // Dòng 43176 C#: Tính num2 (Quest Seed) dùng generatedQuestCount TRƯỚC KHI TĂNG
@@ -194,8 +195,8 @@ impl TileGenerator {
             self.generated_quest_count += 1;
 
             let quest_data = self.generate_quest_tile(num2, used_filter, level);
-            println!("  ==> ACTUAL RETURNED QUEST TILE: '{}'", quest_data.quest_type);
-            println!("================================----------------------------------\n");
+            // println!("  ==> ACTUAL RETURNED QUEST TILE: '{}'", quest_data.quest_type);
+            // println!("================================----------------------------------\n");
 
             return GeneratedTile::Quest {
                 base_tile,
@@ -228,7 +229,7 @@ impl TileGenerator {
             .select_weighted(&preset_options)
             .unwrap_or_else(|| filtered_presets[0].clone());
 
-        println!("  ==> ACTUAL RETURNED TILE OBJECT: '{}'", selected_preset.name);
+        // println!("  ==> ACTUAL RETURNED TILE OBJECT: '{}'", selected_preset.name);
 
         fn segments_adjacent(edges1: &[usize], edges2: &[usize]) -> bool {
             for &e1 in edges1 {
@@ -327,12 +328,12 @@ impl TileGenerator {
             });
         }
 
-        println!("      [NORMAL TILE DETAILS] Total Segments: {}", segments.len());
-        for (idx, seg) in segments.iter().enumerate() {
-            println!("        - Segment #{}: GroupType = {:?}, SegmentType = {:?}, Rotation = {}, Edges = {:?}",
-                idx, seg.group_type, seg.segment_type, seg.rotation, seg.occupied_edges);
-        }
-        println!("================================----------------------------------\n");
+        // println!("      [NORMAL TILE DETAILS] Total Segments: {}", segments.len());
+        // for (idx, seg) in segments.iter().enumerate() {
+        //     println!("        - Segment #{}: GroupType = {:?}, SegmentType = {:?}, Rotation = {}, Edges = {:?}",
+        //         idx, seg.group_type, seg.segment_type, seg.rotation, seg.occupied_edges);
+        // }
+        // println!("================================----------------------------------\n");
 
         GeneratedTile::Normal {
             base_tile,

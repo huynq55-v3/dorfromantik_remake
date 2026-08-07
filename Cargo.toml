@@ -5,8 +5,12 @@ edition = "2021"
 
 [dependencies]
 macroquad = "0.4"
+rayon = "1.8"
 
 [[bin]]
 name = "simulator"
 path = "bin/simulator.rs"
 
+[[bin]]
+name = "rl_benchmark"
+path = "bin/rl_benchmark.rs"

@@ -1,0 +1,328 @@
+use std::collections::{HashMap, VecDeque};
+use crate::board::{Board, get_neighbor_pos};
+use crate::game_config::GroupType;
+use crate::generator::TileGenerator;
+use crate::quest_manager::QuestManager;
+use crate::score_manager::ScoreManager;
+use crate::tile::{EqualityComparison, GeneratedTile};
+
+/// Hành động đặt tile trong môi trường RL
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Action {
+    pub q: i32,
+    pub r: i32,
+    pub rotation: usize, // 0..6
+}
+
+/// Kết quả thu được sau mỗi bước đi (Step Result)
+#[derive(Debug, Clone)]
+pub struct StepResult {
+    pub reward: f32,
+    pub done: bool,
+    pub total_score: usize,
+    pub placed_count: usize,
+    pub stack_height: usize,
+}
+
+/// Trạng thái Đồ thị cho GNN Feature Extraction
+#[derive(Debug, Clone)]
+pub struct GraphObservation {
+    /// Danh sách vị trí tọa độ của tất cả các node trong đồ thị (Placed + Candidates)
+    pub node_positions: Vec<(i32, i32)>,
+    /// Tensor đặc trưng của các node: [N, 38]
+    pub node_features: Vec<[f32; 38]>,
+    /// Danh sách các cạnh nối giữa các node kề nhau: Vec<(from_idx, to_idx)>
+    pub edge_index: Vec<(usize, usize)>,
+    /// Danh sách tất cả các Action hợp lệ ở bước đi hiện tại (vị trí ô trống + góc xoay hợp lệ)
+    pub valid_actions: Vec<Action>,
+}
+
+/// Môi trường RL Headless cho Dorfromantik
+#[derive(Debug, Clone)]
+pub struct DorfromantikEnv {
+    pub seed: i32,
+    pub tile_limit: usize,
+    pub board: Board,
+    pub generator: TileGenerator,
+    pub quest_manager: QuestManager,
+    pub score_manager: ScoreManager,
+    pub tile_queue: VecDeque<GeneratedTile>,
+    pub placed_count: usize,
+}
+
+impl DorfromantikEnv {
+    pub fn new(seed: i32, initial_stack: usize, tile_limit: usize) -> Self {
+        let mut env = Self {
+            seed,
+            tile_limit,
+            board: Board::new(),
+            generator: TileGenerator::new(seed),
+            quest_manager: QuestManager::new(),
+            score_manager: ScoreManager::new(initial_stack),
+            tile_queue: VecDeque::new(),
+            placed_count: 0,
+        };
+        env.reset();
+        env
+    }
+
+    /// Khởi tạo lại môi trường (Reset State)
+    pub fn reset(&mut self) {
+        self.board = Board::new();
+        self.generator = TileGenerator::new(self.seed);
+        self.quest_manager = QuestManager::new();
+        self.score_manager = ScoreManager::new(10);
+        self.tile_queue.clear();
+        self.placed_count = 0;
+
+        // 1. Place initial starting tile at center (0, 0)
+        let initial_tile = GeneratedTile::Normal {
+            base_tile: crate::tile::BaseTile::new(0, self.seed, "Initial Center Plain Tile"),
+            segments: Vec::new(),
+        };
+        self.board.place_tile(0, 0, initial_tile, 0);
+
+        // 2. Pre-fill tile queue with 4 upcoming tiles
+        for _ in 0..4 {
+            let active_count = self.quest_manager.pop_next_active_quest_count();
+            let mut tile = self.generator.generate_tile(None, active_count, None, self.quest_manager.level);
+            if matches!(tile, GeneratedTile::Quest { .. }) {
+                crate::quest_manager::initialize_active_quest_tile(&mut tile, &self.board, &mut self.quest_manager);
+            }
+            self.tile_queue.push_back(tile);
+        }
+    }
+
+    /// Tile hiện tại cần đặt ở lượt này
+    pub fn current_tile(&self) -> Option<&GeneratedTile> {
+        self.tile_queue.front()
+    }
+
+    /// Trả về danh sách tất cả các Action hợp lệ tại lượt hiện tại
+    pub fn get_valid_actions(&self) -> Vec<Action> {
+        let mut valid = Vec::new();
+        let Some(current_tile) = self.current_tile() else {
+            return valid;
+        };
+
+        let candidates = self.board.get_candidate_placements();
+        for (q, r) in candidates {
+            for rotation in 0..6 {
+                if self.board.can_place_tile(q, r, current_tile, rotation) {
+                    valid.push(Action { q, r, rotation });
+                }
+            }
+        }
+
+        valid
+    }
+
+    /// Thực hiện 1 bước đi (Step Action)
+    pub fn step(&mut self, action: Action) -> StepResult {
+        let prev_score = self.score_manager.total_score;
+
+        let Some(current_tile) = self.tile_queue.pop_front() else {
+            return StepResult {
+                reward: 0.0,
+                done: true,
+                total_score: self.score_manager.total_score,
+                placed_count: self.placed_count,
+                stack_height: self.score_manager.remaining_tiles,
+            };
+        };
+
+        // Đặt tile lên bàn bài
+        let (placed_ok, quest_succeeded_count) = self.board.place_tile_with_manager(
+            action.q,
+            action.r,
+            current_tile,
+            action.rotation,
+            Some(&mut self.quest_manager),
+        );
+
+        if !placed_ok {
+            // Hành động không hợp lệ -> Kết thúc ván đấu
+            return StepResult {
+                reward: -100.0,
+                done: true,
+                total_score: self.score_manager.total_score,
+                placed_count: self.placed_count,
+                stack_height: self.score_manager.remaining_tiles,
+            };
+        }
+
+        self.placed_count += 1;
+
+        // Cập nhật điểm số và số lượng tile trong stack qua ScoreManager
+        self.score_manager.on_tile_placed(
+            &self.board,
+            action.q,
+            action.r,
+            quest_succeeded_count,
+            0,
+        );
+
+        let step_score_delta = self.score_manager.total_score - prev_score;
+
+        // Thêm tile mới vào cuối tile_queue
+        let active_count = self.quest_manager.pop_next_active_quest_count();
+        let mut new_tile = self.generator.generate_tile(None, active_count, None, self.quest_manager.level);
+        if matches!(new_tile, GeneratedTile::Quest { .. }) {
+            crate::quest_manager::initialize_active_quest_tile(&mut new_tile, &self.board, &mut self.quest_manager);
+        }
+        self.tile_queue.push_back(new_tile);
+
+        // Kiểm tra điều kiện kết thúc
+        let valid_actions = self.get_valid_actions();
+        let done = self.score_manager.remaining_tiles == 0
+            || self.placed_count >= self.tile_limit
+            || valid_actions.is_empty();
+
+        StepResult {
+            reward: step_score_delta as f32,
+            done,
+            total_score: self.score_manager.total_score,
+            placed_count: self.placed_count,
+            stack_height: self.score_manager.remaining_tiles,
+        }
+    }
+
+    /// Trích xuất Đặc trưng Đồ thị (Graph Feature Extraction) cho GNN
+    pub fn extract_graph_observation(&self) -> GraphObservation {
+        let placed = &self.board.placed_tiles;
+        let candidates = self.board.get_candidate_placements();
+
+        let mut node_positions = Vec::new();
+        let mut pos_to_idx = HashMap::new();
+
+        // 1. Thu thập tất cả Placed nodes
+        for &pos in placed.keys() {
+            pos_to_idx.insert(pos, node_positions.len());
+            node_positions.push(pos);
+        }
+
+        // 2. Thu thập tất cả Candidate nodes
+        for &pos in &candidates {
+            if !pos_to_idx.contains_key(&pos) {
+                pos_to_idx.insert(pos, node_positions.len());
+                node_positions.push(pos);
+            }
+        }
+
+        let mut node_features = Vec::with_capacity(node_positions.len());
+
+        let tile_1 = self.tile_queue.get(0);
+        let tile_2 = self.tile_queue.get(1);
+
+        for &pos in &node_positions {
+            let mut feature = [0.0f32; 38];
+            let is_placed = placed.contains_key(&pos);
+
+            feature[0] = if is_placed { 1.0 } else { 0.0 };
+            feature[1] = if !is_placed { 1.0 } else { 0.0 };
+
+            if is_placed {
+                let pt = &placed[&pos];
+                // 2..8: 6 Edges terrain normalized (0.0 .. 1.0)
+                for dir in 0..6 {
+                    let edge_type = pt.edge_config.edges[dir];
+                    feature[2 + dir] = (edge_type as usize as f32) / 7.0;
+                }
+
+                // 8..14: Open/Closed edge flags
+                for dir in 0..6 {
+                    let n_pos = get_neighbor_pos(pos.0, pos.1, dir);
+                    feature[8 + dir] = if placed.contains_key(&n_pos) { 0.0 } else { 1.0 };
+                }
+
+                // 14 & 15: Group Element Count & Group Open Edges
+                let mut max_group_count = 0;
+                let mut max_open_edges = 0;
+                for dir in 0..6 {
+                    if let Some(gt) = pt.edge_config.edges[dir].to_group_type() {
+                        let open = self.board.count_group_open_edges(pos, gt);
+                        let count = self.board.get_quest_external_count(pos, gt);
+                        if count > max_group_count {
+                            max_group_count = count;
+                        }
+                        if open > max_open_edges {
+                            max_open_edges = open;
+                        }
+                    }
+                }
+                feature[14] = ((1.0 + max_group_count as f32).log2() / (100.0_f32).log2()).clamp(0.0, 1.0);
+                feature[15] = (max_open_edges as f32 / 12.0).clamp(0.0, 1.0);
+
+                // 16..29: Quest features
+                if let GeneratedTile::Quest { quest_data, .. } = &pt.tile {
+                    feature[16] = if pt.quest_finalized { 0.0 } else { 1.0 };
+                    let gt = quest_data.primary_group_type();
+                    let gt_idx = match gt {
+                        GroupType::Agriculture => 0,
+                        GroupType::Forest => 1,
+                        GroupType::Village => 2,
+                        GroupType::Water => 3,
+                        GroupType::TrainTracks => 4,
+                    };
+                    feature[17 + gt_idx] = 1.0;
+
+                    match quest_data.equality {
+                        EqualityComparison::MoreThan => feature[22] = 1.0,
+                        EqualityComparison::Exactly => feature[23] = 1.0,
+                    }
+
+                    let target_val = quest_data.target_count as f32;
+                    let current_ext = self.board.get_quest_external_count(pos, gt) as f32;
+
+                    feature[24] = ((1.0 + target_val).log2() / (101.0_f32).log2()).clamp(0.0, 1.0);
+                    feature[25] = if target_val > 0.0 { (current_ext / target_val).clamp(0.0, 2.0) } else { 0.0 };
+
+                    if quest_data.equality == EqualityComparison::Exactly && current_ext > target_val {
+                        feature[26] = 1.0; // Overfilled Exact Quest
+                    }
+                }
+            }
+
+            // 27..32: Upcoming Tile 1 Features
+            if let Some(t1) = tile_1 {
+                let cfg = t1.to_hex_edge_config();
+                for i in 0..5 {
+                    feature[27 + i] = (cfg.edges[i] as usize as f32) / 7.0;
+                }
+            }
+
+            // 32..37: Upcoming Tile 2 Features
+            if let Some(t2) = tile_2 {
+                let cfg = t2.to_hex_edge_config();
+                for i in 0..5 {
+                    feature[32 + i] = (cfg.edges[i] as usize as f32) / 7.0;
+                }
+            }
+
+            // 37: Step ratio
+            feature[37] = (self.placed_count as f32 / self.tile_limit as f32).clamp(0.0, 1.0);
+
+            node_features.push(feature);
+        }
+
+        // Build Graph Edge Index
+        let mut edge_index = Vec::new();
+        for (idx, &pos) in node_positions.iter().enumerate() {
+            for dir in 0..6 {
+                let n_pos = get_neighbor_pos(pos.0, pos.1, dir);
+                if let Some(&n_idx) = pos_to_idx.get(&n_pos) {
+                    edge_index.push((idx, n_idx));
+                }
+            }
+        }
+
+        let valid_actions = self.get_valid_actions();
+
+        GraphObservation {
+            node_positions,
+            node_features,
+            edge_index,
+            valid_actions,
+        }
+    }
+}
