@@ -815,12 +815,21 @@ impl AlphaZeroPipeline {
         }
 
         let num_batches = (buf_len / self.config.batch_size).clamp(4, 32);
+        let total_epochs = self.config.train_epochs_per_iter;
+        let train_start = std::time::Instant::now();
+        println!(
+            "[Train] Bắt đầu: {} epochs × {} batches (batch_size={}) trên CPU...",
+            total_epochs, num_batches, self.config.batch_size
+        );
         let mut total_policy_loss = 0.0f32;
         let mut total_value_loss = 0.0f32;
         let mut step_count = 0;
 
-        for _ in 0..self.config.train_epochs_per_iter {
-            for _ in 0..num_batches {
+        for epoch in 0..total_epochs {
+            use std::io::Write;
+            print!("[Train Epoch {}/{}] ", epoch + 1, total_epochs);
+            let _ = std::io::stdout().flush();
+            for batch in 0..num_batches {
                 let indices = self.replay_buffer.sample_batch_indices(self.config.batch_size);
                 if indices.is_empty() {
                     continue;
@@ -899,10 +908,17 @@ impl AlphaZeroPipeline {
                 // Cập nhật trọng số mạng bằng Adam Optimizer
                 self.model.update_weights_adam(&scaled_grads, self.config.lr);
 
+                if (batch + 1) % 4 == 0 || batch + 1 == num_batches {
+                    print!("{}/{} ", batch + 1, num_batches);
+                    let _ = std::io::stdout().flush();
+                }
+
                 total_policy_loss += mb_pi_loss / mb_len;
                 total_value_loss += mb_val_loss / mb_len;
                 step_count += 1;
             }
+            let elapsed = train_start.elapsed();
+            println!("({:.1}s)", elapsed.as_secs_f32());
         }
 
         let avg_pi_loss = if step_count > 0 { total_policy_loss / step_count as f32 } else { 0.0 };
