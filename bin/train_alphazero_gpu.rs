@@ -59,7 +59,7 @@ fn main() {
     }
 
     let (target_seed, initial_stack, tile_limit) = load_monthly_game_config();
-    let parallel_envs = 1024;
+    let parallel_envs = 512;
 
     // Đọc số simulations từ tham số dòng lệnh nếu có (mặc định 400)
     let args: Vec<String> = std::env::args().collect();
@@ -75,7 +75,7 @@ fn main() {
         lr,
         gamma: 0.99,
         value_loss_coeff: 0.5,
-        batch_size: 1024,
+        batch_size: 512,
         train_epochs_per_iter: 4,
         mcts_config: MCTSConfig {
             c_puct: 1.5,

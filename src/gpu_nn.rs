@@ -1,7 +1,10 @@
 use std::sync::Arc;
 use rayon::prelude::*;
-use crate::nn::HexGNNModel;
+use crate::nn::{HexGNNModel, HIDDEN_DIM, ACTION_FEAT_DIM, NODE_FEAT_DIM};
 use crate::env::GraphObservation;
+
+/// GEMM dims: số chiều input (k) và output (n) được truyền động qua uniform, nên layer-1 (k=40,
+/// n=128) và các layer 2-4 (k=n=128) đều tái sử dụng cùng một pipeline.
 
 /// WGSL GEMM Shader: Y[row, col] = X[row, :] · W[col, :]^T + B[col], optional ReLU
 const GEMM_SHADER: &str = r#"
@@ -27,7 +30,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-/// WGSL CSR Aggregation Shader: h_out[u, d] = mean_{v in N(u)} h_in[v, d] - O(Deg(u)) siêu tốc!
+/// WGSL CSR Aggregation Shader: h_out[u, d] = mean_{v in N(u)} h_in[v, d]
 const AGG_CSR_SHADER: &str = r#"
 struct AggCsrDims { n_nodes: u32, dim: u32, _p1: u32, _p2: u32 };
 
@@ -85,14 +88,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-/// WGSL Action Head Gather Shader: Gộp h3[u] (64 dims) + action_features (16 dims) -> act_in (80 dims)
+/// WGSL Action Head Gather Shader:
+/// Gộp hN[u] (HIDDEN_DIM dims) + action_features (ACTION_FEAT_DIM dims) -> act_in (HIDDEN+ACTION dims).
+/// Kích thước hidden & action được truyền qua uniform dims để linh hoạt.
 const GATHER_ACT_SHADER: &str = r#"
-struct GatherDims { total_actions: u32, _p1: u32, _p2: u32, _p3: u32 };
+struct GatherDims { total_actions: u32, hidden_dim: u32, action_dim: u32, _p3: u32 };
 
 @group(0) @binding(0) var<uniform>          dims:        GatherDims;
-@group(0) @binding(1) var<storage, read>    h3:          array<f32>;
+@group(0) @binding(1) var<storage, read>    hN:          array<f32>;
 @group(0) @binding(2) var<storage, read>    act_node_u:  array<u32>;
-@group(0) @binding(3) var<storage, read>    act_feat_16: array<f32>;
+@group(0) @binding(3) var<storage, read>    act_feat:    array<f32>;
 @group(0) @binding(4) var<storage, read_write> act_in:   array<f32>;
 
 @compute @workgroup_size(64)
@@ -101,23 +106,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (a >= dims.total_actions) { return; }
 
     let u = act_node_u[a];
-    let in_off = a * 80u;
+    let in_dim = dims.hidden_dim + dims.action_dim;
+    let in_off = a * in_dim;
 
-    for (var i: u32 = 0u; i < 64u; i = i + 1u) {
-        act_in[in_off + i] = h3[u * 64u + i];
+    for (var i: u32 = 0u; i < dims.hidden_dim; i = i + 1u) {
+        act_in[in_off + i] = hN[u * dims.hidden_dim + i];
     }
-    for (var j: u32 = 0u; j < 16u; j = j + 1u) {
-        act_in[in_off + 64u + j] = act_feat_16[a * 16u + j];
+    for (var j: u32 = 0u; j < dims.action_dim; j = j + 1u) {
+        act_in[in_off + dims.hidden_dim + j] = act_feat[a * dims.action_dim + j];
     }
 }
 "#;
 
-/// WGSL Value Head Mean Pool Shader: Gom h3 theo node_offsets -> val_in (64 dims per env)
+/// WGSL Value Head Mean Pool Shader:
+/// Gom hN theo node_offsets -> val_in (HIDDEN_DIM dims per env). Kích thước hidden truyền qua uniform.
 const MEAN_POOL_VAL_SHADER: &str = r#"
-struct PoolDims { batch: u32, _p1: u32, _p2: u32, _p3: u32 };
+struct PoolDims { batch: u32, hidden_dim: u32, _p2: u32, _p3: u32 };
 
 @group(0) @binding(0) var<uniform>          dims:         PoolDims;
-@group(0) @binding(1) var<storage, read>    h3:           array<f32>;
+@group(0) @binding(1) var<storage, read>    hN:           array<f32>;
 @group(0) @binding(2) var<storage, read>    node_offsets: array<u32>;
 @group(0) @binding(3) var<storage, read_write> val_in:    array<f32>;
 
@@ -131,12 +138,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let count = end - start;
     let inv   = select(1.0 / f32(count), 0.0, count == 0u);
 
-    for (var d: u32 = 0u; d < 64u; d = d + 1u) {
+    for (var d: u32 = 0u; d < dims.hidden_dim; d = d + 1u) {
         var sum: f32 = 0.0;
         for (var u: u32 = start; u < end; u = u + 1u) {
-            sum = sum + h3[u * 64u + d];
+            sum = sum + hN[u * dims.hidden_dim + d];
         }
-        val_in[b * 64u + d] = sum * inv;
+        val_in[b * dims.hidden_dim + d] = sum * inv;
     }
 }
 "#;
@@ -155,16 +162,17 @@ struct CombineDims { n_nodes: u32, dim: u32, residual: u32, _p1: u32 }
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct GatherDims { total_actions: u32, _p1: u32, _p2: u32, _p3: u32 }
+struct GatherDims { total_actions: u32, hidden_dim: u32, action_dim: u32, _p3: u32 }
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct PoolDims { batch: u32, _p1: u32, _p2: u32, _p3: u32 }
+struct PoolDims { batch: u32, hidden_dim: u32, _p2: u32, _p3: u32 }
 
 const MAX_NODES: usize = 262_144;
 const MAX_EDGES: usize = 1_572_864;
 const MAX_ACTIONS: usize = 262_144;
 const MAX_BATCH: usize = 4_096;
+const ACT_IN_DIM: usize = HIDDEN_DIM + ACTION_FEAT_DIM; // 144
 
 /// Kế hoạch thực thi GPU chưa hoàn tất chờ Readback (Async Non-blocking Handle)
 pub struct PendingGpuResult {
@@ -211,7 +219,7 @@ struct GpuSlot {
     csr_offsets: wgpu::Buffer,
     csr_targets: wgpu::Buffer,
     act_node_u: wgpu::Buffer,
-    act_feat_16: wgpu::Buffer,
+    act_feat: wgpu::Buffer,
     node_offsets: wgpu::Buffer,
 
     act_o: wgpu::Buffer,
@@ -234,6 +242,11 @@ struct GpuSlot {
     u_gemm_n3: wgpu::Buffer,
     u_comb3: wgpu::Buffer,
 
+    u_agg4: wgpu::Buffer,
+    u_gemm_s4: wgpu::Buffer,
+    u_gemm_n4: wgpu::Buffer,
+    u_comb4: wgpu::Buffer,
+
     u_gather: wgpu::Buffer,
     u_pool: wgpu::Buffer,
     u_act1: wgpu::Buffer,
@@ -255,6 +268,11 @@ struct GpuSlot {
     bg_gemm_s3: wgpu::BindGroup,
     bg_gemm_n3: wgpu::BindGroup,
     bg_comb3: wgpu::BindGroup,
+
+    bg_agg4: wgpu::BindGroup,
+    bg_gemm_s4: wgpu::BindGroup,
+    bg_gemm_n4: wgpu::BindGroup,
+    bg_comb4: wgpu::BindGroup,
 
     bg_gather: wgpu::BindGroup,
     bg_pool: wgpu::BindGroup,
@@ -283,6 +301,8 @@ pub struct GpuNNExecutor {
     w_neigh2: wgpu::Buffer, b_neigh2: wgpu::Buffer,
     w_self3: wgpu::Buffer, b_self3: wgpu::Buffer,
     w_neigh3: wgpu::Buffer, b_neigh3: wgpu::Buffer,
+    w_self4: wgpu::Buffer, b_self4: wgpu::Buffer,
+    w_neigh4: wgpu::Buffer, b_neigh4: wgpu::Buffer,
     w_act1: wgpu::Buffer, b_act1: wgpu::Buffer,
     w_act2: wgpu::Buffer, b_act2: wgpu::Buffer,
     w_val1: wgpu::Buffer, b_val1: wgpu::Buffer,
@@ -456,34 +476,39 @@ impl GpuNNExecutor {
         let w_neigh2 = wb!(&model.w_neigh2.weight); let b_neigh2 = wb!(&model.w_neigh2.bias);
         let w_self3  = wb!(&model.w_self3.weight);  let b_self3  = wb!(&model.w_self3.bias);
         let w_neigh3 = wb!(&model.w_neigh3.weight); let b_neigh3 = wb!(&model.w_neigh3.bias);
+        let w_self4  = wb!(&model.w_self4.weight);  let b_self4  = wb!(&model.w_self4.bias);
+        let w_neigh4 = wb!(&model.w_neigh4.weight); let b_neigh4 = wb!(&model.w_neigh4.bias);
         let w_act1   = wb!(&model.w_act1.weight);   let b_act1   = wb!(&model.w_act1.bias);
         let w_act2   = wb!(&model.w_act2.weight);   let b_act2   = wb!(&model.w_act2.bias);
         let w_val1   = wb!(&model.w_val1.weight);   let b_val1   = wb!(&model.w_val1.bias);
         let w_val2   = wb!(&model.w_val2.weight);   let b_val2   = wb!(&model.w_val2.bias);
 
         let make_slot = || {
-            let h0 = Self::create_storage(&device, MAX_NODES * 40 * 4);
-            let h1 = Self::create_storage(&device, MAX_NODES * 64 * 4);
-            let h2 = Self::create_storage(&device, MAX_NODES * 64 * 4);
-            let h3 = Self::create_storage(&device, MAX_NODES * 64 * 4);
+            // h0: node features (NODE_FEAT_DIM). h1..h4: HIDDEN_DIM.
+            let h0 = Self::create_storage(&device, MAX_NODES * NODE_FEAT_DIM * 4);
+            let h1 = Self::create_storage(&device, MAX_NODES * HIDDEN_DIM * 4);
+            let h2 = Self::create_storage(&device, MAX_NODES * HIDDEN_DIM * 4);
+            let h3 = Self::create_storage(&device, MAX_NODES * HIDDEN_DIM * 4);
+            let h4 = Self::create_storage(&device, MAX_NODES * HIDDEN_DIM * 4);
 
-            let agg0 = Self::create_storage(&device, MAX_NODES * 40 * 4);
-            let agg1 = Self::create_storage(&device, MAX_NODES * 64 * 4);
-            let agg2 = Self::create_storage(&device, MAX_NODES * 64 * 4);
+            let agg0 = Self::create_storage(&device, MAX_NODES * NODE_FEAT_DIM * 4);
+            let agg1 = Self::create_storage(&device, MAX_NODES * HIDDEN_DIM * 4);
+            let agg2 = Self::create_storage(&device, MAX_NODES * HIDDEN_DIM * 4);
+            let agg3 = Self::create_storage(&device, MAX_NODES * HIDDEN_DIM * 4);
 
-            let ys = Self::create_storage(&device, MAX_NODES * 64 * 4);
-            let yn = Self::create_storage(&device, MAX_NODES * 64 * 4);
+            let ys = Self::create_storage(&device, MAX_NODES * HIDDEN_DIM * 4);
+            let yn = Self::create_storage(&device, MAX_NODES * HIDDEN_DIM * 4);
 
             let csr_offsets = Self::create_storage(&device, (MAX_NODES + 1) * 4);
             let csr_targets = Self::create_storage(&device, MAX_EDGES * 4);
             let act_node_u  = Self::create_storage(&device, MAX_ACTIONS * 4);
-            let act_feat_16 = Self::create_storage(&device, MAX_ACTIONS * 16 * 4);
+            let act_feat    = Self::create_storage(&device, MAX_ACTIONS * ACTION_FEAT_DIM * 4);
             let node_offsets = Self::create_storage(&device, (MAX_BATCH + 1) * 4);
 
-            let act_in = Self::create_storage(&device, MAX_ACTIONS * 80 * 4);
-            let val_in = Self::create_storage(&device, MAX_BATCH * 64 * 4);
-            let act_h  = Self::create_storage(&device, MAX_ACTIONS * 64 * 4);
-            let val_h  = Self::create_storage(&device, MAX_BATCH * 64 * 4);
+            let act_in = Self::create_storage(&device, MAX_ACTIONS * ACT_IN_DIM * 4);
+            let val_in = Self::create_storage(&device, MAX_BATCH * HIDDEN_DIM * 4);
+            let act_h  = Self::create_storage(&device, MAX_ACTIONS * HIDDEN_DIM * 4);
+            let val_h  = Self::create_storage(&device, MAX_BATCH * HIDDEN_DIM * 4);
             let act_o  = Self::create_storage(&device, MAX_ACTIONS * 4);
             let val_o  = Self::create_storage(&device, MAX_BATCH * 4);
 
@@ -504,6 +529,11 @@ impl GpuNNExecutor {
             let u_gemm_s3 = Self::create_uniform(&device, 16);
             let u_gemm_n3 = Self::create_uniform(&device, 16);
             let u_comb3 = Self::create_uniform(&device, 16);
+
+            let u_agg4 = Self::create_uniform(&device, 16);
+            let u_gemm_s4 = Self::create_uniform(&device, 16);
+            let u_gemm_n4 = Self::create_uniform(&device, 16);
+            let u_comb4 = Self::create_uniform(&device, 16);
 
             let u_gather = Self::create_uniform(&device, 16);
             let u_pool = Self::create_uniform(&device, 16);
@@ -556,8 +586,13 @@ impl GpuNNExecutor {
             let bg_gemm_n3 = bg_5!(&gemm_layout, &u_gemm_n3, &agg2, &w_neigh3, &b_neigh3, &yn);
             let bg_comb3   = bg_5!(&combine_layout, &u_comb3, &ys, &yn, &h2, &h3);
 
-            let bg_gather  = bg_5!(&gather_layout, &u_gather, &h3, &act_node_u, &act_feat_16, &act_in);
-            let bg_pool    = bg_4!(&pool_layout, &u_pool, &h3, &node_offsets, &val_in);
+            let bg_agg4    = bg_5!(&agg_layout, &u_agg4, &h3, &csr_offsets, &csr_targets, &agg3);
+            let bg_gemm_s4 = bg_5!(&gemm_layout, &u_gemm_s4, &h3, &w_self4, &b_self4, &ys);
+            let bg_gemm_n4 = bg_5!(&gemm_layout, &u_gemm_n4, &agg3, &w_neigh4, &b_neigh4, &yn);
+            let bg_comb4   = bg_5!(&combine_layout, &u_comb4, &ys, &yn, &h3, &h4);
+
+            let bg_gather  = bg_5!(&gather_layout, &u_gather, &h4, &act_node_u, &act_feat, &act_in);
+            let bg_pool    = bg_4!(&pool_layout, &u_pool, &h4, &node_offsets, &val_in);
 
             let bg_act1    = bg_5!(&gemm_layout, &u_act1, &act_in, &w_act1, &b_act1, &act_h);
             let bg_val1    = bg_5!(&gemm_layout, &u_val1, &val_in, &w_val1, &b_val1, &val_h);
@@ -565,15 +600,17 @@ impl GpuNNExecutor {
             let bg_val2    = bg_5!(&gemm_layout, &u_val2, &val_h,  &w_val2, &b_val2, &val_o);
 
             GpuSlot {
-                h0, csr_offsets, csr_targets, act_node_u, act_feat_16, node_offsets,
+                h0, csr_offsets, csr_targets, act_node_u, act_feat, node_offsets,
                 act_o, val_o, staging_act, staging_val,
                 u_agg1, u_gemm_s1, u_gemm_n1, u_comb1,
                 u_agg2, u_gemm_s2, u_gemm_n2, u_comb2,
                 u_agg3, u_gemm_s3, u_gemm_n3, u_comb3,
+                u_agg4, u_gemm_s4, u_gemm_n4, u_comb4,
                 u_gather, u_pool, u_act1, u_val1, u_act2, u_val2,
                 bg_agg1, bg_gemm_s1, bg_gemm_n1, bg_comb1,
                 bg_agg2, bg_gemm_s2, bg_gemm_n2, bg_comb2,
                 bg_agg3, bg_gemm_s3, bg_gemm_n3, bg_comb3,
+                bg_agg4, bg_gemm_s4, bg_gemm_n4, bg_comb4,
                 bg_gather, bg_pool, bg_act1, bg_val1, bg_act2, bg_val2,
             }
         };
@@ -591,6 +628,7 @@ impl GpuNNExecutor {
             w_self1, b_self1, w_neigh1, b_neigh1,
             w_self2, b_self2, w_neigh2, b_neigh2,
             w_self3, b_self3, w_neigh3, b_neigh3,
+            w_self4, b_self4, w_neigh4, b_neigh4,
             w_act1, b_act1, w_act2, b_act2,
             w_val1, b_val1, w_val2, b_val2,
         }
@@ -608,6 +646,8 @@ impl GpuNNExecutor {
         ww!(self.w_neigh2, &model.w_neigh2.weight); ww!(self.b_neigh2, &model.w_neigh2.bias);
         ww!(self.w_self3,  &model.w_self3.weight);  ww!(self.b_self3,  &model.w_self3.bias);
         ww!(self.w_neigh3, &model.w_neigh3.weight); ww!(self.b_neigh3, &model.w_neigh3.bias);
+        ww!(self.w_self4,  &model.w_self4.weight);  ww!(self.b_self4,  &model.w_self4.bias);
+        ww!(self.w_neigh4, &model.w_neigh4.weight); ww!(self.b_neigh4, &model.w_neigh4.bias);
         ww!(self.w_act1,   &model.w_act1.weight);   ww!(self.b_act1,   &model.w_act1.bias);
         ww!(self.w_act2,   &model.w_act2.weight);   ww!(self.b_act2,   &model.w_act2.bias);
         ww!(self.w_val1,   &model.w_val1.weight);   ww!(self.b_val1,   &model.w_val1.bias);
@@ -649,11 +689,11 @@ impl GpuNNExecutor {
         // Build mảng GPU song song bằng Rayon (Tối ưu 3C): phần tính nặng (dựng feature,
         // degree, tìm node index của action, ...) chạy song song trên từng obs độc lập,
         // rồi ghép (splice) vào mảng bằng offset đã biết trước.
-        let mut h0: Vec<f32> = Vec::with_capacity(total_nodes * 40);
+        let mut h0: Vec<f32> = Vec::with_capacity(total_nodes * NODE_FEAT_DIM);
         let mut csr_offsets: Vec<u32> = Vec::with_capacity(total_nodes + 1);
         let mut csr_targets: Vec<u32> = Vec::with_capacity(total_nodes * 6);
         let mut act_node_u: Vec<u32> = Vec::with_capacity(total_actions);
-        let mut act_feat_16: Vec<f32> = Vec::with_capacity(total_actions * 16);
+        let mut act_feat: Vec<f32> = Vec::with_capacity(total_actions * ACTION_FEAT_DIM);
         csr_offsets.push(0u32);
 
         let per_obs: Vec<(usize, Vec<f32>, Vec<u32>, Vec<u32>, Vec<u32>, Vec<f32>)> = observations
@@ -692,7 +732,7 @@ impl GpuNNExecutor {
 
                 // action node index (local) + action features
                 let mut act_u_seg = Vec::with_capacity(obs.valid_actions.len());
-                let mut act_feat_seg = Vec::with_capacity(obs.valid_actions.len() * 16);
+                let mut act_feat_seg = Vec::with_capacity(obs.valid_actions.len() * ACTION_FEAT_DIM);
                 for (a_idx, act) in obs.valid_actions.iter().enumerate() {
                     let pos = obs.node_positions.iter().position(|&p| p == (act.q, act.r)).unwrap_or(0);
                     let u = pos.min(n.saturating_sub(1)) as u32;
@@ -700,7 +740,7 @@ impl GpuNNExecutor {
                     if a_idx < obs.action_features.len() {
                         act_feat_seg.extend_from_slice(&obs.action_features[a_idx]);
                     } else {
-                        act_feat_seg.extend_from_slice(&[0.0f32; 16]);
+                        act_feat_seg.extend_from_slice(&[0.0f32; ACTION_FEAT_DIM]);
                     }
                 }
 
@@ -723,7 +763,7 @@ impl GpuNNExecutor {
             }
 
             act_node_u.extend_from_slice(&act_u_seg);
-            act_feat_16.extend_from_slice(&act_feat_seg);
+            act_feat.extend_from_slice(&act_feat_seg);
         }
 
         // 1. Zero-Allocation Fast Memcpy to Persistent GPU Buffers
@@ -731,36 +771,44 @@ impl GpuNNExecutor {
         self.queue.write_buffer(&slot.csr_offsets, 0, bytemuck::cast_slice(&csr_offsets));
         self.queue.write_buffer(&slot.csr_targets, 0, bytemuck::cast_slice(&csr_targets));
         self.queue.write_buffer(&slot.act_node_u, 0, bytemuck::cast_slice(&act_node_u));
-        self.queue.write_buffer(&slot.act_feat_16, 0, bytemuck::cast_slice(&act_feat_16));
+        self.queue.write_buffer(&slot.act_feat, 0, bytemuck::cast_slice(&act_feat));
         self.queue.write_buffer(&slot.node_offsets, 0, bytemuck::cast_slice(&node_offsets));
 
         // 2. Uniform Dimensions
         let tn = total_nodes as u32;
         let ta = total_actions as u32;
         let b = batch as u32;
+        let hd = HIDDEN_DIM as u32;
 
-        self.queue.write_buffer(&slot.u_agg1, 0, bytemuck::bytes_of(&AggCsrDims { n_nodes: tn, dim: 40, _p1: 0, _p2: 0 }));
-        self.queue.write_buffer(&slot.u_gemm_s1, 0, bytemuck::bytes_of(&GemmDims { m: tn, k: 40, n: 64, relu: 0 }));
-        self.queue.write_buffer(&slot.u_gemm_n1, 0, bytemuck::bytes_of(&GemmDims { m: tn, k: 40, n: 64, relu: 0 }));
-        self.queue.write_buffer(&slot.u_comb1, 0, bytemuck::bytes_of(&CombineDims { n_nodes: tn, dim: 64, residual: 0, _p1: 0 }));
+        self.queue.write_buffer(&slot.u_agg1, 0, bytemuck::bytes_of(&AggCsrDims { n_nodes: tn, dim: NODE_FEAT_DIM as u32, _p1: 0, _p2: 0 }));
+        self.queue.write_buffer(&slot.u_gemm_s1, 0, bytemuck::bytes_of(&GemmDims { m: tn, k: NODE_FEAT_DIM as u32, n: hd, relu: 0 }));
+        self.queue.write_buffer(&slot.u_gemm_n1, 0, bytemuck::bytes_of(&GemmDims { m: tn, k: NODE_FEAT_DIM as u32, n: hd, relu: 0 }));
+        self.queue.write_buffer(&slot.u_comb1, 0, bytemuck::bytes_of(&CombineDims { n_nodes: tn, dim: hd, residual: 0, _p1: 0 }));
 
-        self.queue.write_buffer(&slot.u_agg2, 0, bytemuck::bytes_of(&AggCsrDims { n_nodes: tn, dim: 64, _p1: 0, _p2: 0 }));
-        self.queue.write_buffer(&slot.u_gemm_s2, 0, bytemuck::bytes_of(&GemmDims { m: tn, k: 64, n: 64, relu: 0 }));
-        self.queue.write_buffer(&slot.u_gemm_n2, 0, bytemuck::bytes_of(&GemmDims { m: tn, k: 64, n: 64, relu: 0 }));
-        self.queue.write_buffer(&slot.u_comb2, 0, bytemuck::bytes_of(&CombineDims { n_nodes: tn, dim: 64, residual: 1, _p1: 0 }));
+        self.queue.write_buffer(&slot.u_agg2, 0, bytemuck::bytes_of(&AggCsrDims { n_nodes: tn, dim: hd, _p1: 0, _p2: 0 }));
+        self.queue.write_buffer(&slot.u_gemm_s2, 0, bytemuck::bytes_of(&GemmDims { m: tn, k: hd, n: hd, relu: 0 }));
+        self.queue.write_buffer(&slot.u_gemm_n2, 0, bytemuck::bytes_of(&GemmDims { m: tn, k: hd, n: hd, relu: 0 }));
+        self.queue.write_buffer(&slot.u_comb2, 0, bytemuck::bytes_of(&CombineDims { n_nodes: tn, dim: hd, residual: 1, _p1: 0 }));
 
-        self.queue.write_buffer(&slot.u_agg3, 0, bytemuck::bytes_of(&AggCsrDims { n_nodes: tn, dim: 64, _p1: 0, _p2: 0 }));
-        self.queue.write_buffer(&slot.u_gemm_s3, 0, bytemuck::bytes_of(&GemmDims { m: tn, k: 64, n: 64, relu: 0 }));
-        self.queue.write_buffer(&slot.u_gemm_n3, 0, bytemuck::bytes_of(&GemmDims { m: tn, k: 64, n: 64, relu: 0 }));
-        self.queue.write_buffer(&slot.u_comb3, 0, bytemuck::bytes_of(&CombineDims { n_nodes: tn, dim: 64, residual: 1, _p1: 0 }));
+        self.queue.write_buffer(&slot.u_agg3, 0, bytemuck::bytes_of(&AggCsrDims { n_nodes: tn, dim: hd, _p1: 0, _p2: 0 }));
+        self.queue.write_buffer(&slot.u_gemm_s3, 0, bytemuck::bytes_of(&GemmDims { m: tn, k: hd, n: hd, relu: 0 }));
+        self.queue.write_buffer(&slot.u_gemm_n3, 0, bytemuck::bytes_of(&GemmDims { m: tn, k: hd, n: hd, relu: 0 }));
+        self.queue.write_buffer(&slot.u_comb3, 0, bytemuck::bytes_of(&CombineDims { n_nodes: tn, dim: hd, residual: 1, _p1: 0 }));
 
-        self.queue.write_buffer(&slot.u_gather, 0, bytemuck::bytes_of(&GatherDims { total_actions: ta, _p1: 0, _p2: 0, _p3: 0 }));
-        self.queue.write_buffer(&slot.u_pool, 0, bytemuck::bytes_of(&PoolDims { batch: b, _p1: 0, _p2: 0, _p3: 0 }));
+        self.queue.write_buffer(&slot.u_agg4, 0, bytemuck::bytes_of(&AggCsrDims { n_nodes: tn, dim: hd, _p1: 0, _p2: 0 }));
+        self.queue.write_buffer(&slot.u_gemm_s4, 0, bytemuck::bytes_of(&GemmDims { m: tn, k: hd, n: hd, relu: 0 }));
+        self.queue.write_buffer(&slot.u_gemm_n4, 0, bytemuck::bytes_of(&GemmDims { m: tn, k: hd, n: hd, relu: 0 }));
+        self.queue.write_buffer(&slot.u_comb4, 0, bytemuck::bytes_of(&CombineDims { n_nodes: tn, dim: hd, residual: 1, _p1: 0 }));
 
-        self.queue.write_buffer(&slot.u_act1, 0, bytemuck::bytes_of(&GemmDims { m: ta, k: 80, n: 64, relu: 1 }));
-        self.queue.write_buffer(&slot.u_val1, 0, bytemuck::bytes_of(&GemmDims { m: b,  k: 64, n: 64, relu: 1 }));
-        self.queue.write_buffer(&slot.u_act2, 0, bytemuck::bytes_of(&GemmDims { m: ta, k: 64, n: 1,  relu: 0 }));
-        self.queue.write_buffer(&slot.u_val2, 0, bytemuck::bytes_of(&GemmDims { m: b,  k: 64, n: 1,  relu: 0 }));
+        self.queue.write_buffer(&slot.u_gather, 0, bytemuck::bytes_of(&GatherDims { total_actions: ta, hidden_dim: hd, action_dim: ACTION_FEAT_DIM as u32, _p3: 0 }));
+        self.queue.write_buffer(&slot.u_pool, 0, bytemuck::bytes_of(&PoolDims { batch: b, hidden_dim: hd, _p2: 0, _p3: 0 }));
+
+        self.queue.write_buffer(&slot.u_act1, 0, bytemuck::bytes_of(&GemmDims { m: ta, k: ACT_IN_DIM as u32, n: hd, relu: 1 }));
+        self.queue.write_buffer(&slot.u_val1, 0, bytemuck::bytes_of(&GemmDims { m: b,  k: hd, n: hd, relu: 1 }));
+        self.queue.write_buffer(&slot.u_act2, 0, bytemuck::bytes_of(&GemmDims { m: ta, k: hd, n: 1,  relu: 0 }));
+        self.queue.write_buffer(&slot.u_val2, 0, bytemuck::bytes_of(&GemmDims { m: b,  k: hd, n: 1,  relu: 0 }));
+
+        let wg_d = || (hd + 15) / 16;
 
         // 3. One Single Command Encoder and Compute Pass Execution
         let mut enc = self.device.create_command_encoder(&Default::default());
@@ -770,50 +818,66 @@ impl GpuNNExecutor {
             // Layer 1
             pass.set_pipeline(&self.agg_pipeline);
             pass.set_bind_group(0, &slot.bg_agg1, &[]);
-            pass.dispatch_workgroups((tn + 15) / 16, (40 + 15) / 16, 1);
+            pass.dispatch_workgroups((tn + 15) / 16, ((NODE_FEAT_DIM as u32) + 15) / 16, 1);
 
             pass.set_pipeline(&self.gemm_pipeline);
             pass.set_bind_group(0, &slot.bg_gemm_s1, &[]);
-            pass.dispatch_workgroups((tn + 15) / 16, (64 + 15) / 16, 1);
+            pass.dispatch_workgroups((tn + 15) / 16, wg_d(), 1);
 
             pass.set_bind_group(0, &slot.bg_gemm_n1, &[]);
-            pass.dispatch_workgroups((tn + 15) / 16, (64 + 15) / 16, 1);
+            pass.dispatch_workgroups((tn + 15) / 16, wg_d(), 1);
 
             pass.set_pipeline(&self.combine_pipeline);
             pass.set_bind_group(0, &slot.bg_comb1, &[]);
-            pass.dispatch_workgroups((tn + 15) / 16, (64 + 15) / 16, 1);
+            pass.dispatch_workgroups((tn + 15) / 16, wg_d(), 1);
 
             // Layer 2
             pass.set_pipeline(&self.agg_pipeline);
             pass.set_bind_group(0, &slot.bg_agg2, &[]);
-            pass.dispatch_workgroups((tn + 15) / 16, (64 + 15) / 16, 1);
+            pass.dispatch_workgroups((tn + 15) / 16, wg_d(), 1);
 
             pass.set_pipeline(&self.gemm_pipeline);
             pass.set_bind_group(0, &slot.bg_gemm_s2, &[]);
-            pass.dispatch_workgroups((tn + 15) / 16, (64 + 15) / 16, 1);
+            pass.dispatch_workgroups((tn + 15) / 16, wg_d(), 1);
 
             pass.set_bind_group(0, &slot.bg_gemm_n2, &[]);
-            pass.dispatch_workgroups((tn + 15) / 16, (64 + 15) / 16, 1);
+            pass.dispatch_workgroups((tn + 15) / 16, wg_d(), 1);
 
             pass.set_pipeline(&self.combine_pipeline);
             pass.set_bind_group(0, &slot.bg_comb2, &[]);
-            pass.dispatch_workgroups((tn + 15) / 16, (64 + 15) / 16, 1);
+            pass.dispatch_workgroups((tn + 15) / 16, wg_d(), 1);
 
             // Layer 3
             pass.set_pipeline(&self.agg_pipeline);
             pass.set_bind_group(0, &slot.bg_agg3, &[]);
-            pass.dispatch_workgroups((tn + 15) / 16, (64 + 15) / 16, 1);
+            pass.dispatch_workgroups((tn + 15) / 16, wg_d(), 1);
 
             pass.set_pipeline(&self.gemm_pipeline);
             pass.set_bind_group(0, &slot.bg_gemm_s3, &[]);
-            pass.dispatch_workgroups((tn + 15) / 16, (64 + 15) / 16, 1);
+            pass.dispatch_workgroups((tn + 15) / 16, wg_d(), 1);
 
             pass.set_bind_group(0, &slot.bg_gemm_n3, &[]);
-            pass.dispatch_workgroups((tn + 15) / 16, (64 + 15) / 16, 1);
+            pass.dispatch_workgroups((tn + 15) / 16, wg_d(), 1);
 
             pass.set_pipeline(&self.combine_pipeline);
             pass.set_bind_group(0, &slot.bg_comb3, &[]);
-            pass.dispatch_workgroups((tn + 15) / 16, (64 + 15) / 16, 1);
+            pass.dispatch_workgroups((tn + 15) / 16, wg_d(), 1);
+
+            // Layer 4
+            pass.set_pipeline(&self.agg_pipeline);
+            pass.set_bind_group(0, &slot.bg_agg4, &[]);
+            pass.dispatch_workgroups((tn + 15) / 16, wg_d(), 1);
+
+            pass.set_pipeline(&self.gemm_pipeline);
+            pass.set_bind_group(0, &slot.bg_gemm_s4, &[]);
+            pass.dispatch_workgroups((tn + 15) / 16, wg_d(), 1);
+
+            pass.set_bind_group(0, &slot.bg_gemm_n4, &[]);
+            pass.dispatch_workgroups((tn + 15) / 16, wg_d(), 1);
+
+            pass.set_pipeline(&self.combine_pipeline);
+            pass.set_bind_group(0, &slot.bg_comb4, &[]);
+            pass.dispatch_workgroups((tn + 15) / 16, wg_d(), 1);
 
             // Gather & Pool
             pass.set_pipeline(&self.gather_pipeline);
@@ -827,10 +891,10 @@ impl GpuNNExecutor {
             // Head MLPs
             pass.set_pipeline(&self.gemm_pipeline);
             pass.set_bind_group(0, &slot.bg_act1, &[]);
-            pass.dispatch_workgroups((ta + 15) / 16, (64 + 15) / 16, 1);
+            pass.dispatch_workgroups((ta + 15) / 16, wg_d(), 1);
 
             pass.set_bind_group(0, &slot.bg_val1, &[]);
-            pass.dispatch_workgroups((b + 15) / 16, (64 + 15) / 16, 1);
+            pass.dispatch_workgroups((b + 15) / 16, wg_d(), 1);
 
             pass.set_bind_group(0, &slot.bg_act2, &[]);
             pass.dispatch_workgroups((ta + 15) / 16, 1, 1);

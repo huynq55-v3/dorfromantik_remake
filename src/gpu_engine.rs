@@ -29,6 +29,10 @@ impl GpuEngine {
 
         let info = adapter.get_info();
         let device_name = format!("{} ({:?})", info.name, info.backend);
+        // Model nâng cấp dùng Hidden Dim = 128, mỗi buffer sơ cấp có thể lên tới
+        // ~134 MB. Mặc định của wgpu giới hạn storage-buffer binding ở 128 MB, nên ta
+        // yêu cầu giới hạn tối đa adapter hỗ trợ để các buffer này dựng được.
+        let limits = adapter.limits();
 
         let (device, queue) = pollster::block_on(async {
             adapter
@@ -36,7 +40,7 @@ impl GpuEngine {
                     &wgpu::DeviceDescriptor {
                         label: Some("Dorfromantik GPU Device"),
                         required_features: wgpu::Features::empty(),
-                        required_limits: wgpu::Limits::default(),
+                        required_limits: limits,
                         memory_hints: wgpu::MemoryHints::Performance,
                     },
                     None,
