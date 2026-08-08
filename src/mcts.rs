@@ -15,7 +15,6 @@ pub struct MCTSNode {
     pub is_expanded: bool,
     pub is_terminal: bool,
     pub children: Vec<(Action, MCTSNode)>,
-    pub env: Option<DorfromantikEnv>,
 }
 
 impl MCTSNode {
@@ -28,7 +27,6 @@ impl MCTSNode {
             is_expanded: false,
             is_terminal: false,
             children: Vec::new(),
-            env: None,
         }
     }
 
@@ -570,7 +568,6 @@ impl MCTSSearch {
 
             let mut root = MCTSNode::new(1.0);
             root.is_expanded = true;
-            root.env = Some(all_envs[active_indices[i]].clone());
             root.children = obs.valid_actions
                 .iter()
                 .zip(priors.iter())
@@ -755,6 +752,7 @@ impl MCTSSearch {
             .map(|i| {
                 if let Some(ref root) = roots[i] {
                     let env_idx = active_indices[i];
+                    let mut sim_env = all_envs[env_idx].clone();
                     let mut node_path = Vec::new();
                     let mut rewards = Vec::new();
 
@@ -788,24 +786,20 @@ impl MCTSSearch {
                             }
                         }
 
-                        let (chosen_action, ref child_node) = curr.children[best_idx];
-                        node_path.push(best_idx);
+                        let (chosen_action, _) = curr.children[best_idx];
+                        let res = sim_env.step(chosen_action);
+                        let scaled_r = res.reward * 0.01;
 
-                        if child_node.env.is_some() {
-                            rewards.push(child_node.immediate_reward);
-                            curr = child_node;
-                        } else {
-                            let parent_env = curr.env.as_ref().unwrap_or(&all_envs[env_idx]);
-                            let mut sim_env = parent_env.clone();
-                            let res = sim_env.step(chosen_action);
-                            let scaled_r = res.reward * 0.01;
-                            rewards.push(scaled_r);
-                            return (Some(sim_env), node_path, rewards);
+                        node_path.push(best_idx);
+                        rewards.push(scaled_r);
+
+                        curr = &curr.children[best_idx].1;
+                        if res.done {
+                            break;
                         }
                     }
 
-                    let final_env = curr.env.clone().unwrap_or_else(|| all_envs[env_idx].clone());
-                    (Some(final_env), node_path, rewards)
+                    (Some(sim_env), node_path, rewards)
                 } else {
                     (None, Vec::new(), Vec::new())
                 }
@@ -866,7 +860,7 @@ impl MCTSSearch {
 
         for (rel_i, (sim_env_opt, node_path, rewards)) in sim_results.into_iter().enumerate() {
             let i = range.start + rel_i;
-            if let Some(sim_env) = sim_env_opt {
+            if sim_env_opt.is_some() {
                 if let Some(ref mut root) = roots[i] {
                     let mut curr = &mut *root;
                     for &idx in &node_path {
@@ -891,8 +885,6 @@ impl MCTSSearch {
                             .zip(l_probs.iter())
                             .map(|(&act, &p)| (act, MCTSNode::new(p)))
                             .collect();
-                        curr.env = Some(sim_env);
-                        curr.immediate_reward = *rewards.last().unwrap_or(&0.0);
 
                         *val
                     } else {

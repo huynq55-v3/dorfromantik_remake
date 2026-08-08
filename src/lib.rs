@@ -13,4 +13,7 @@ pub mod unity_random;
 pub mod gpu_engine;
 pub mod gpu_nn;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 

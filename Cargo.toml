@@ -15,6 +15,7 @@ crossbeam-channel = "0.5"
 wgpu = "24.0"
 pollster = "0.4"
 bytemuck = { version = "1.14", features = ["derive"] }
+mimalloc = "0.1"
 
 [[bin]]
 name = "simulator"
