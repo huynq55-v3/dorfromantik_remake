@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use rayon::prelude::*;
 use crate::nn::HexGNNModel;
 use crate::env::GraphObservation;
 
@@ -645,51 +646,84 @@ impl GpuNNExecutor {
             return None;
         }
 
-        let mut h0 = Vec::with_capacity(total_nodes * 40);
-        let mut csr_offsets = Vec::with_capacity(total_nodes + 1);
-        let mut csr_targets = Vec::with_capacity(total_nodes * 6);
-        let mut curr_csr_offset = 0u32;
+        // Build mảng GPU song song bằng Rayon (Tối ưu 3C): phần tính nặng (dựng feature,
+        // degree, tìm node index của action, ...) chạy song song trên từng obs độc lập,
+        // rồi ghép (splice) vào mảng bằng offset đã biết trước.
+        let mut h0: Vec<f32> = Vec::with_capacity(total_nodes * 40);
+        let mut csr_offsets: Vec<u32> = Vec::with_capacity(total_nodes + 1);
+        let mut csr_targets: Vec<u32> = Vec::with_capacity(total_nodes * 6);
+        let mut act_node_u: Vec<u32> = Vec::with_capacity(total_actions);
+        let mut act_feat_16: Vec<f32> = Vec::with_capacity(total_actions * 16);
         csr_offsets.push(0u32);
 
-        let mut act_node_u = Vec::with_capacity(total_actions);
-        let mut act_feat_16 = Vec::with_capacity(total_actions * 16);
+        let per_obs: Vec<(usize, Vec<f32>, Vec<u32>, Vec<u32>, Vec<u32>, Vec<f32>)> = observations
+            .par_iter()
+            .enumerate()
+            .map(|(i, obs)| {
+                let n = obs.node_features.len();
 
-        for (i, obs) in observations.iter().enumerate() {
+                // h0: node features flattened
+                let h0_seg: Vec<f32> = obs.node_features.iter().flatten().copied().collect();
+
+                // degrees theo local node index
+                let mut degrees = vec![0u32; n];
+                for &(u, v) in &obs.edge_index {
+                    if u < n && v < n {
+                        degrees[u] += 1;
+                    }
+                }
+
+                // csr row-pointers cục bộ (bắt đầu từ 0)
+                let mut csr_off_seg = Vec::with_capacity(n + 1);
+                let mut acc = 0u32;
+                csr_off_seg.push(0u32);
+                for d in &degrees {
+                    acc += d;
+                    csr_off_seg.push(acc);
+                }
+
+                // csr targets cục bộ (global node base được cộng sau khi splice)
+                let mut csr_targets_seg: Vec<u32> = Vec::new();
+                for &(u, v) in &obs.edge_index {
+                    if u < n && v < n {
+                        csr_targets_seg.push(v as u32);
+                    }
+                }
+
+                // action node index (local) + action features
+                let mut act_u_seg = Vec::with_capacity(obs.valid_actions.len());
+                let mut act_feat_seg = Vec::with_capacity(obs.valid_actions.len() * 16);
+                for (a_idx, act) in obs.valid_actions.iter().enumerate() {
+                    let pos = obs.node_positions.iter().position(|&p| p == (act.q, act.r)).unwrap_or(0);
+                    let u = pos.min(n.saturating_sub(1)) as u32;
+                    act_u_seg.push(u);
+                    if a_idx < obs.action_features.len() {
+                        act_feat_seg.extend_from_slice(&obs.action_features[a_idx]);
+                    } else {
+                        act_feat_seg.extend_from_slice(&[0.0f32; 16]);
+                    }
+                }
+
+                (i, h0_seg, csr_off_seg, csr_targets_seg, act_u_seg, act_feat_seg)
+            })
+            .collect();
+
+        // Ghép theo thứ tự (index i) vào các mảng phẳng
+        for (i, h0_seg, csr_off_seg, csr_targets_seg, act_u_seg, act_feat_seg) in per_obs {
+            h0.extend_from_slice(&h0_seg);
+
+            let base = *csr_offsets.last().unwrap();
+            for &o in &csr_off_seg[1..] {
+                csr_offsets.push(base + o);
+            }
+
             let off = node_offsets[i];
-            let n = obs.node_features.len();
-
-            for feat in &obs.node_features {
-                h0.extend_from_slice(feat);
+            for t in csr_targets_seg {
+                csr_targets.push(t + off);
             }
 
-            let mut degrees = vec![0u32; n];
-            for &(u, v) in &obs.edge_index {
-                if u < n && v < n {
-                    degrees[u] += 1;
-                }
-            }
-
-            for u in 0..n {
-                curr_csr_offset += degrees[u];
-                csr_offsets.push(curr_csr_offset);
-            }
-
-            for &(u, v) in &obs.edge_index {
-                if u < n && v < n {
-                    csr_targets.push((v as u32) + off);
-                }
-            }
-
-            for (a_idx, act) in obs.valid_actions.iter().enumerate() {
-                let pos = obs.node_positions.iter().position(|&p| p == (act.q, act.r)).unwrap_or(0);
-                let u = off + (pos.min(n.saturating_sub(1)) as u32);
-                act_node_u.push(u);
-                if a_idx < obs.action_features.len() {
-                    act_feat_16.extend_from_slice(&obs.action_features[a_idx]);
-                } else {
-                    act_feat_16.extend_from_slice(&[0.0f32; 16]);
-                }
-            }
+            act_node_u.extend_from_slice(&act_u_seg);
+            act_feat_16.extend_from_slice(&act_feat_seg);
         }
 
         // 1. Zero-Allocation Fast Memcpy to Persistent GPU Buffers

@@ -151,6 +151,7 @@ impl Board {
         vec
     }
 
+
     /// Kiểm tra quy tắc đặt tile có hợp lệ không (Placement Validation)
 
     /// - Water edge chỉ được nối với Water edge (hoặc ô trống)

@@ -129,6 +129,24 @@ impl DorfromantikEnv {
         valid
     }
 
+    /// Kiểm tra NHANH xem có ít nhất 1 placement hợp lệ hay không (chỉ để biết đã hết nước đi).
+    /// Dừng ngay khi tìm được nước đi hợp lệ đầu tiên -> cực kỳ nhanh với board thưa.
+    /// Cùng kết quả boolean với `!get_valid_actions().is_empty()`, nhưng không dựng toàn bộ Vec.
+    fn has_valid_action(&self) -> bool {
+        let Some(current_tile) = self.current_tile() else {
+            return false;
+        };
+        let candidates = self.board.get_candidate_placements();
+        for (q, r) in candidates {
+            for rotation in 0..6 {
+                if self.board.can_place_tile(q, r, current_tile, rotation) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Thực hiện 1 bước đi (Step Action)
     pub fn step(&mut self, action: Action) -> StepResult {
         let prev_score = self.score_manager.total_score;
@@ -192,11 +210,11 @@ impl DorfromantikEnv {
             crate::quest_manager::initialize_active_quest_tile(front_tile, &self.board, &mut self.quest_manager);
         }
 
-        // Kiểm tra điều kiện kết thúc
-        let valid_actions = self.get_valid_actions();
+        // Kiểm tra điều kiện kết thúc (dùng has_valid_action để tránh dựng toàn bộ valid-actions
+        // vốn chỉ được dùng để check rỗng -> giảm đáng kể chi phí step trong MCTS).
         let done = self.score_manager.remaining_tiles == 0
             || self.placed_count >= self.tile_limit
-            || valid_actions.is_empty();
+            || !self.has_valid_action();
 
         StepResult {
             reward,

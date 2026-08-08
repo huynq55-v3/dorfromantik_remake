@@ -578,7 +578,21 @@ impl MCTSSearch {
         }
 
         // 2. Chạy N lượt MCTS Simulations (Double-Buffering Pipelined nếu có GPU executor)
+        // Atomics đo chi phí clone vs step trong traversal (only nếu DORFO_PERF).
+        let clone_ns = std::sync::atomic::AtomicU64::new(0);
+        let step_ns = std::sync::atomic::AtomicU64::new(0);
+        let perf = std::env::var("DORFO_PERF").is_ok();
         if let Some(gpu) = gpu_exec {
+            if perf {
+                use std::io::Write;
+                let _ = writeln!(std::io::stdout(), "[PERF] mode=GPU batch={} rounds={}", b_count, self.config.n_simulations);
+                let _ = std::io::stdout().flush();
+            }
+            let mut t_trav_total = std::time::Duration::ZERO;
+            let mut t_gpu_total = std::time::Duration::ZERO;
+            let mut t_bp_total = std::time::Duration::ZERO;
+            let t_search0 = std::time::Instant::now();
+
             if b_count >= 4 {
                 let mid = b_count / 2;
                 let range_a = 0..mid;
@@ -586,46 +600,58 @@ impl MCTSSearch {
 
                 // Khởi động: CPU duyệt UCB Group A và gửi lệnh GPU Async vào Slot 0
                 let (mut sim_res_a, mut leaf_obs_a, mut leaf_idx_a) =
-                    self.run_sim_traversal_range(range_a.clone(), &roots, all_envs, active_indices, &q_mins, &q_maxs);
+                    self.run_sim_traversal_range(range_a.clone(), &roots, all_envs, active_indices, &q_mins, &q_maxs, &clone_ns, &step_ns);
                 let leaf_refs_a: Vec<&crate::env::GraphObservation> = leaf_obs_a.iter().collect();
                 let mut pending_a = gpu.forward_batch_gpu_async_slot(0, &leaf_refs_a);
 
                 for _ in 0..self.config.n_simulations {
                     // CPU chạy Rayon MCTS Traversal cho Group B trong lúc GPU đang tính Slot 0!
+                    let ts = std::time::Instant::now();
                     let (sim_res_b, leaf_obs_b, leaf_idx_b) =
-                        self.run_sim_traversal_range(range_b.clone(), &roots, all_envs, active_indices, &q_mins, &q_maxs);
+                        self.run_sim_traversal_range(range_b.clone(), &roots, all_envs, active_indices, &q_mins, &q_maxs, &clone_ns, &step_ns);
+                    t_trav_total += ts.elapsed();
 
                     // Nhận kết quả GPU Group A (Slot 0)
+                    let tg = std::time::Instant::now();
                     let results_a = if let Some(p_a) = pending_a {
                         p_a.wait(&gpu.device)
                     } else {
                         Vec::new()
                     };
+                    t_gpu_total += tg.elapsed();
 
                     // Gửi ngay lệnh GPU Async cho Group B vào Slot 1
                     let leaf_refs_b: Vec<&crate::env::GraphObservation> = leaf_obs_b.iter().collect();
                     let pending_b = gpu.forward_batch_gpu_async_slot(1, &leaf_refs_b);
 
                     // CPU Backprop cho Group A
+                    let tsb = std::time::Instant::now();
                     self.run_sim_backprop_range(range_a.clone(), sim_res_a, leaf_obs_a, leaf_idx_a, &results_a, &mut roots, &mut q_mins, &mut q_maxs);
+                    t_bp_total += tsb.elapsed();
 
                     // CPU chạy Rayon MCTS Traversal cho Group A (lượt kế tiếp) trong lúc GPU đang tính Slot 1!
+                    let ts = std::time::Instant::now();
                     let (next_sim_res_a, next_leaf_obs_a, next_leaf_idx_a) =
-                        self.run_sim_traversal_range(range_a.clone(), &roots, all_envs, active_indices, &q_mins, &q_maxs);
+                        self.run_sim_traversal_range(range_a.clone(), &roots, all_envs, active_indices, &q_mins, &q_maxs, &clone_ns, &step_ns);
+                    t_trav_total += ts.elapsed();
 
                     // Nhận kết quả GPU Group B (Slot 1)
+                    let tg = std::time::Instant::now();
                     let results_b = if let Some(p_b) = pending_b {
                         p_b.wait(&gpu.device)
                     } else {
                         Vec::new()
                     };
+                    t_gpu_total += tg.elapsed();
 
                     // Gửi ngay lệnh GPU Async cho Group A vào Slot 0 lượt kế tiếp
                     let next_leaf_refs_a: Vec<&crate::env::GraphObservation> = next_leaf_obs_a.iter().collect();
                     pending_a = gpu.forward_batch_gpu_async_slot(0, &next_leaf_refs_a);
 
                     // CPU Backprop cho Group B
+                    let tsb = std::time::Instant::now();
                     self.run_sim_backprop_range(range_b.clone(), sim_res_b, leaf_obs_b, leaf_idx_b, &results_b, &mut roots, &mut q_mins, &mut q_maxs);
+                    t_bp_total += tsb.elapsed();
 
                     sim_res_a = next_sim_res_a;
                     leaf_obs_a = next_leaf_obs_a;
@@ -634,27 +660,63 @@ impl MCTSSearch {
 
                 // Dọn dẹp pending Group A còn sót lại lượt cuối
                 if let Some(p_a) = pending_a {
+                    let tg = std::time::Instant::now();
                     let results_a = p_a.wait(&gpu.device);
+                    t_gpu_total += tg.elapsed();
+                    let tsb = std::time::Instant::now();
                     self.run_sim_backprop_range(range_a, sim_res_a, leaf_obs_a, leaf_idx_a, &results_a, &mut roots, &mut q_mins, &mut q_maxs);
+                    t_bp_total += tsb.elapsed();
                 }
             } else {
                 // Fallback đơn lẻ nếu b_count < 4
                 for _ in 0..self.config.n_simulations {
                     let (sim_res, leaf_obs, leaf_idx) =
-                        self.run_sim_traversal_range(0..b_count, &roots, all_envs, active_indices, &q_mins, &q_maxs);
+                        self.run_sim_traversal_range(0..b_count, &roots, all_envs, active_indices, &q_mins, &q_maxs, &clone_ns, &step_ns);
                     let leaf_refs: Vec<&crate::env::GraphObservation> = leaf_obs.iter().collect();
                     let results = gpu.forward_batch_gpu(&leaf_refs);
                     self.run_sim_backprop_range(0..b_count, sim_res, leaf_obs, leaf_idx, &results, &mut roots, &mut q_mins, &mut q_maxs);
                 }
             }
+            if perf {
+                use std::io::Write;
+                let wall = t_search0.elapsed().as_secs_f64();
+                let _ = writeln!(
+                    std::io::stdout(),
+                    "[PERF] search_batch_indexed mode=GPU rounds={} wall={:.3}s trav={:.3}s gpu_wait={:.3}s backprop={:.3}s clone={:.3}s step={:.3}s",
+                    self.config.n_simulations, wall,
+                    t_trav_total.as_secs_f64(),
+                    t_gpu_total.as_secs_f64(),
+                    t_bp_total.as_secs_f64(),
+                    clone_ns.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
+                    step_ns.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
+                );
+                let _ = std::io::stdout().flush();
+            }
         } else {
             // CPU fallback nếu không có GPU
+            let t_search0 = std::time::Instant::now();
+            let mut t_trav_total = std::time::Duration::ZERO;
+            let mut t_bp_total = std::time::Duration::ZERO;
             for _ in 0..self.config.n_simulations {
+                let ts = std::time::Instant::now();
                 let (sim_res, leaf_obs, leaf_idx) =
-                    self.run_sim_traversal_range(0..b_count, &roots, all_envs, active_indices, &q_mins, &q_maxs);
+                    self.run_sim_traversal_range(0..b_count, &roots, all_envs, active_indices, &q_mins, &q_maxs, &clone_ns, &step_ns);
+                t_trav_total += ts.elapsed();
                 let leaf_refs: Vec<&crate::env::GraphObservation> = leaf_obs.iter().collect();
                 let results = model.forward_batch(&leaf_refs);
+                let tsb = std::time::Instant::now();
                 self.run_sim_backprop_range(0..b_count, sim_res, leaf_obs, leaf_idx, &results, &mut roots, &mut q_mins, &mut q_maxs);
+                t_bp_total += tsb.elapsed();
+            }
+            if perf {
+                use std::io::Write;
+                let wall = t_search0.elapsed().as_secs_f64();
+                let _ = writeln!(
+                    std::io::stdout(),
+                    "[PERF] search_batch_indexed mode=CPU rounds={} wall={:.3}s trav={:.3}s nn+backprop={:.3}s",
+                    self.config.n_simulations, wall, t_trav_total.as_secs_f64(), t_bp_total.as_secs_f64(),
+                );
+                let _ = std::io::stdout().flush();
             }
         }
 
@@ -741,6 +803,8 @@ impl MCTSSearch {
         active_indices: &[usize],
         q_mins: &[f32],
         q_maxs: &[f32],
+        clone_ns: &std::sync::atomic::AtomicU64,
+        step_ns: &std::sync::atomic::AtomicU64,
     ) -> (
         Vec<(Option<DorfromantikEnv>, Vec<usize>, Vec<f32>)>,
         Vec<crate::env::GraphObservation>,
@@ -752,7 +816,9 @@ impl MCTSSearch {
             .map(|i| {
                 if let Some(ref root) = roots[i] {
                     let env_idx = active_indices[i];
+                    let t0 = std::time::Instant::now();
                     let mut sim_env = all_envs[env_idx].clone();
+                    clone_ns.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                     let mut node_path = Vec::new();
                     let mut rewards = Vec::new();
 
@@ -787,7 +853,9 @@ impl MCTSSearch {
                         }
 
                         let (chosen_action, _) = curr.children[best_idx];
+                        let ts = std::time::Instant::now();
                         let res = sim_env.step(chosen_action);
+                        step_ns.fetch_add(ts.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                         let scaled_r = res.reward * 0.01;
 
                         node_path.push(best_idx);
@@ -806,31 +874,45 @@ impl MCTSSearch {
             })
             .collect();
 
-        let mut eval_indices = Vec::new();
-        let mut eval_leaf_obs = Vec::new();
-
-        for (rel_i, (sim_env_opt, node_path, _)) in sim_results.iter().enumerate() {
-            let i = range.start + rel_i;
-            if let Some(ref sim_env) = sim_env_opt {
-                if let Some(ref root) = roots[i] {
-                    let mut curr = root;
-                    for &idx in node_path {
-                        if idx < curr.children.len() {
-                            curr = &curr.children[idx].1;
-                        } else {
-                            break;
+        // Song song hóa phần trích xuất GraphObservation cho các lá cần expand.
+        // (Cực kỳ nặng: quét candidate + group queries ~400k lần/turn, trước đây chạy TUẦN TỰ.)
+        // filter_map của Rayon giữ nguyên thứ tự -> eval_indices/eval_leaf_obs vẫn align với GPU.
+        let eval_pairs: Vec<(usize, crate::env::GraphObservation)> = range
+            .clone()
+            .into_par_iter()
+            .filter_map(|i| {
+                // `i` là chỉ số tuyệt đối (range có thể bắt đầu từ mid). sim_results là [range.len()].
+                let local = i - range.start;
+                match &sim_results[local].0 {
+                    Some(ref sim_env) => {
+                        if let Some(ref root) = roots[i] {
+                            let mut curr = root;
+                            for &idx in &sim_results[local].1 {
+                                if idx < curr.children.len() {
+                                    curr = &curr.children[idx].1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            if !curr.is_terminal && !curr.is_expanded {
+                                let leaf_obs = sim_env.extract_graph_observation();
+                                if !leaf_obs.valid_actions.is_empty() {
+                                    return Some((i, leaf_obs));
+                                }
+                            }
                         }
+                        None
                     }
-
-                    if !curr.is_terminal && !curr.is_expanded {
-                        let leaf_obs = sim_env.extract_graph_observation();
-                        if !leaf_obs.valid_actions.is_empty() {
-                            eval_indices.push(i);
-                            eval_leaf_obs.push(leaf_obs);
-                        }
-                    }
+                    None => None,
                 }
-            }
+            })
+            .collect();
+
+        let mut eval_indices = Vec::with_capacity(eval_pairs.len());
+        let mut eval_leaf_obs = Vec::with_capacity(eval_pairs.len());
+        for (i, leaf_obs) in eval_pairs {
+            eval_indices.push(i);
+            eval_leaf_obs.push(leaf_obs);
         }
 
         (sim_results, eval_leaf_obs, eval_indices)
@@ -858,10 +940,24 @@ impl MCTSSearch {
             }
         }
 
-        for (rel_i, (sim_env_opt, node_path, rewards)) in sim_results.into_iter().enumerate() {
-            let i = range.start + rel_i;
+        let range_s = range.clone();
+        let roots_slice = &mut roots[range_s.clone()];
+        let q_mins_slice = &mut q_mins[range_s.clone()];
+        let q_maxs_slice = &mut q_maxs[range_s.clone()];
+        let leaf_eval_results_slice = &mut leaf_eval_results[range_s.clone()];
+        let leaf_eval_obs_map_slice = &mut leaf_eval_obs_map[range_s];
+
+        sim_results
+            .into_par_iter()
+            .zip(roots_slice.par_iter_mut())
+            .zip(q_mins_slice.par_iter_mut())
+            .zip(q_maxs_slice.par_iter_mut())
+            .zip(leaf_eval_results_slice.par_iter_mut())
+            .zip(leaf_eval_obs_map_slice.par_iter_mut())
+            .for_each(
+                |((((((sim_env_opt, node_path, rewards), root_opt), q_min), q_max), leaf_eval_res), leaf_eval_obs)| {
             if sim_env_opt.is_some() {
-                if let Some(ref mut root) = roots[i] {
+                if let Some(ref mut root) = root_opt {
                     let mut curr = &mut *root;
                     for &idx in &node_path {
                         if idx < curr.children.len() {
@@ -873,7 +969,7 @@ impl MCTSSearch {
 
                     let leaf_value = if curr.is_terminal {
                         0.0
-                    } else if let (Some((leaf_logits, val)), Some(obs)) = (leaf_eval_results[i].as_ref(), leaf_eval_obs_map[i].as_ref()) {
+                    } else if let (Some((leaf_logits, val)), Some(obs)) = (leaf_eval_res.as_ref(), leaf_eval_obs.as_ref()) {
                         let l_max = leaf_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                         let l_exps: Vec<f32> = leaf_logits.iter().map(|l| (l - l_max).exp()).collect();
                         let l_sum: f32 = l_exps.iter().sum::<f32>().max(1e-8);
@@ -911,13 +1007,13 @@ impl MCTSSearch {
                             trav.total_value += returns[d];
 
                             let q = trav.q_value();
-                            if q < q_mins[i] { q_mins[i] = q; }
-                            if q > q_maxs[i] { q_maxs[i] = q; }
+                            if q < *q_min { *q_min = q; }
+                            if q > *q_max { *q_max = q; }
                         }
                     }
                 }
             }
-        }
+        });
     }
 }
 
