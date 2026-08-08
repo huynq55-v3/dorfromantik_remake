@@ -163,7 +163,7 @@ struct PoolDims { batch: u32, _p1: u32, _p2: u32, _p3: u32 }
 const MAX_NODES: usize = 262_144;
 const MAX_EDGES: usize = 1_572_864;
 const MAX_ACTIONS: usize = 262_144;
-const MAX_BATCH: usize = 1_024;
+const MAX_BATCH: usize = 4_096;
 
 /// Kế hoạch thực thi GPU chưa hoàn tất chờ Readback (Async Non-blocking Handle)
 pub struct PendingGpuResult {
@@ -662,19 +662,22 @@ impl GpuNNExecutor {
                 h0.extend_from_slice(feat);
             }
 
-            let mut adj = vec![Vec::new(); n];
+            let mut degrees = vec![0u32; n];
             for &(u, v) in &obs.edge_index {
                 if u < n && v < n {
-                    adj[u].push((v as u32) + off);
+                    degrees[u] += 1;
                 }
             }
 
             for u in 0..n {
-                for &v_target in &adj[u] {
-                    csr_targets.push(v_target);
-                    curr_csr_offset += 1;
-                }
+                curr_csr_offset += degrees[u];
                 csr_offsets.push(curr_csr_offset);
+            }
+
+            for &(u, v) in &obs.edge_index {
+                if u < n && v < n {
+                    csr_targets.push((v as u32) + off);
+                }
             }
 
             for (a_idx, act) in obs.valid_actions.iter().enumerate() {
