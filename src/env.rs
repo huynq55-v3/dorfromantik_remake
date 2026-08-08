@@ -299,30 +299,28 @@ impl DorfromantikEnv {
 
                 // 16..27: Quest features
                 if let GeneratedTile::Quest { quest_data, .. } = &pt.tile {
+                    // Quest đang cần xử lý hay không (1 = active, 0 = đã kết thúc / không còn là quest)
                     feature[16] = if pt.quest_finalized { 0.0 } else { 1.0 };
-                    let gt = quest_data.primary_group_type();
-                    let gt_idx = match gt {
-                        GroupType::Agriculture => 0,
-                        GroupType::Forest => 1,
-                        GroupType::Village => 2,
-                        GroupType::Water => 3,
-                        GroupType::TrainTracks => 4,
-                    };
-                    feature[17 + gt_idx] = 1.0;
+                    if !pt.quest_finalized {
+                        let gt = quest_data.primary_group_type();
+                        let gt_idx = match gt {
+                            GroupType::Agriculture => 0,
+                            GroupType::Forest => 1,
+                            GroupType::Village => 2,
+                            GroupType::Water => 3,
+                            GroupType::TrainTracks => 4,
+                        };
+                        feature[17 + gt_idx] = 1.0;
 
-                    match quest_data.equality {
-                        EqualityComparison::MoreThan => feature[22] = 1.0,
-                        EqualityComparison::Exactly => feature[23] = 1.0,
-                    }
+                        match quest_data.equality {
+                            EqualityComparison::MoreThan => feature[22] = 1.0,
+                            EqualityComparison::Exactly => feature[23] = 1.0,
+                        }
 
-                    let target_val = quest_data.target_count as f32;
-                    let current_ext = self.board.get_quest_external_count(pos, gt) as f32;
-
-                    feature[24] = ((1.0 + target_val).log2() / (101.0_f32).log2()).clamp(0.0, 1.0);
-                    feature[25] = if target_val > 0.0 { (current_ext / target_val).clamp(0.0, 2.0) } else { 0.0 };
-
-                    if quest_data.equality == EqualityComparison::Exactly && current_ext > target_val {
-                        feature[26] = 1.0; // Overfilled Exact Quest
+                        // Con số requirement hiện tại = số object cần thêm bên ngoài để hoàn thành quest
+                        // (đã trừ object sẵn có trên chính quest tile, khớp với badge hiển thị +5 / =7)
+                        let remaining_need = quest_data.remaining_display_value() as f32;
+                        feature[24] = (remaining_need / 100.0).clamp(0.0, 1.0);
                     }
                 }
             } else {
