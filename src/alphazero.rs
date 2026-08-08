@@ -260,6 +260,8 @@ pub struct AlphaZeroTrainerConfig {
     pub target_seed: i32,
     pub initial_stack: usize,
     pub tile_limit: usize,
+    /// Dung lượng Replay Buffer (số sample). None => tự động tính theo công thức mặc định.
+    pub replay_buffer_capacity: Option<usize>,
 }
 
 impl Default for AlphaZeroTrainerConfig {
@@ -282,6 +284,7 @@ impl Default for AlphaZeroTrainerConfig {
             target_seed: -2093096630,
             initial_stack: 10,
             tile_limit: 100,
+            replay_buffer_capacity: None,
         }
     }
 }
@@ -584,7 +587,9 @@ impl AlphaZeroPipeline {
     pub fn new(config: AlphaZeroTrainerConfig) -> Self {
         let model = HexGNNModel::new();
         // Tự động tính toán dung lượng Replay Buffer chứa 5 Iteration gần nhất (ví dụ: 1024 envs * 100 tiles * 5 = 512,000 samples)
-        let buf_capacity = (config.num_parallel_envs * config.tile_limit * 5).max(250_000);
+        let buf_capacity = config
+            .replay_buffer_capacity
+            .unwrap_or_else(|| (config.num_parallel_envs * config.tile_limit * 5).max(250_000));
         let replay_buffer = AlphaZeroReplayBuffer::new(buf_capacity);
         Self {
             config,

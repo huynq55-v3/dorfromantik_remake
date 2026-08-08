@@ -77,6 +77,7 @@ fn main() {
         target_seed,
         initial_stack,
         tile_limit,
+        replay_buffer_capacity: None,
     };
 
     let model_dir = "models";

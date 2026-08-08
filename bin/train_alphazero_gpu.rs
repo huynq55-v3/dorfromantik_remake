@@ -45,6 +45,30 @@ fn load_monthly_game_config() -> (i32, usize, usize) {
     (seed, initial_stack, tile_limit)
 }
 
+/// Quét thư mục models để tìm file checkpoint `alphazero_iter_<n>.bin` có số iteration lớn nhất.
+/// Trả về (iteration, đường dẫn file) nếu có, ngược lại None.
+fn find_latest_iter_model(model_dir: &str) -> Option<(usize, String)> {
+    let mut max_iter = 0usize;
+    let mut best_path: Option<String> = None;
+
+    let entries = fs::read_dir(model_dir).ok()?;
+    for entry in entries.flatten() {
+        let filename = entry.file_name().to_string_lossy().to_string();
+        if let Some(rest) = filename.strip_prefix("alphazero_iter_") {
+            if let Some(num_str) = rest.strip_suffix(".bin") {
+                if let Ok(n) = num_str.parse::<usize>() {
+                    if n > max_iter {
+                        max_iter = n;
+                        best_path = Some(entry.path().to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    best_path.map(|p| (max_iter, p))
+}
+
 fn main() {
     println!("============================================================");
     println!("=== DORFROMANTIK ALPHAZERO GPU TRAINER (Intel Iris Xe / Vulkan) ===");
@@ -69,6 +93,21 @@ fn main() {
         400
     };
 
+    // Đọc dung lượng replay buffer từ tham số dòng lệnh thứ 2 (optional).
+    // None => tự động tính theo công thức mặc định (envs * tile_limit * 5, tối thiểu 250k).
+    // Giá trị truyền vào phải > 0; nếu không hợp lệ sẽ tự fallback về None.
+    let replay_buffer_capacity = args
+        .get(2)
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&c| c > 0);
+
+    // Đọc iteration tối đa (iter_max) từ tham số dòng lệnh thứ 3 (optional).
+    // Mặc định usize::MAX => chạy gần như không giới hạn (không được truyền iter_max).
+    let iter_max = args
+        .get(3)
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(usize::MAX);
+
     let lr = 0.0003;
 
     let config = AlphaZeroTrainerConfig {
@@ -89,6 +128,7 @@ fn main() {
         target_seed,
         initial_stack,
         tile_limit,
+        replay_buffer_capacity,
     };
 
     let model_dir = "models";
@@ -104,10 +144,23 @@ fn main() {
     let mut best_eval_score = 0;
     let mut all_time_best_match_score = 0;
 
-    // 2. Nạp checkpoint model hiện tại nếu có (Tái sử dụng weights cũ, không train lại từ đầu!)
-    if Path::new(&latest_model_path).exists() {
-        println!("[Checkpoint] Đang nạp model cũ từ `{}`...", latest_model_path);
-        match HexGNNModel::load_from_file(&latest_model_path) {
+    // 2. Tìm checkpoint iteration lớn nhất hiện có (alphazero_iter_<n>.bin).
+    // Nếu có, nạp model đó và TIẾP TỤC từ iteration kế tiếp (n+1).
+    let mut checkpoint_path: Option<String> = None;
+    if let Some((iter, path)) = find_latest_iter_model(model_dir) {
+        start_iter = iter;
+        checkpoint_path = Some(path);
+        println!(
+            "[Checkpoint] Tìm thấy model iteration lớn nhất: `{}` (iteration = {})",
+            checkpoint_path.as_deref().unwrap_or(""),
+            iter
+        );
+    }
+
+    // Nạp checkpoint model hiện tại nếu có (Tái sử dụng weights cũ, không train lại từ đầu!)
+    if let Some(ref ckpt) = checkpoint_path {
+        println!("[Checkpoint] Đang nạp model từ `{}`...", ckpt);
+        match HexGNNModel::load_from_file(ckpt) {
             Ok(loaded_model) => {
                 println!(
                     "[Checkpoint] SUCCESS: Đã nạp thành công model HexGNN (Step count = {})!",
@@ -118,6 +171,15 @@ fn main() {
             Err(e) => {
                 println!("[Checkpoint] CẢNH BÁO: Lỗi đọc model cũ ({:?}), tạo model mới.", e);
             }
+        }
+    } else if Path::new(&latest_model_path).exists() {
+        println!("[Checkpoint] Đang nạp model cũ từ `{}`...", latest_model_path);
+        if let Ok(loaded_model) = HexGNNModel::load_from_file(&latest_model_path) {
+            println!(
+                "[Checkpoint] SUCCESS: Đã nạp thành công model (Step count = {})!",
+                loaded_model.step_count
+            );
+            pipeline.model = loaded_model;
         }
     } else if Path::new(&best_model_path).exists() {
         println!("[Checkpoint] Đang nạp best model từ `{}`...", best_model_path);
@@ -162,7 +224,9 @@ fn main() {
             for line in content.lines() {
                 if let Some((k, v)) = line.split_once('=') {
                     match k.trim() {
-                        "iteration" => start_iter = v.trim().parse::<usize>().unwrap_or(0),
+                        // Khi có file alphazero_iter_<n>.bin thì ưu tiên số đó (đã gán ở trên).
+                        // Meta chỉ giúp khi chưa dùng file iteration (fallback alphazero_latest/best).
+                        "iteration" if start_iter == 0 => start_iter = v.trim().parse::<usize>().unwrap_or(0),
                         "best_eval_score" => best_eval_score = v.trim().parse::<usize>().unwrap_or(0),
                         _ => {}
                     }
@@ -183,6 +247,10 @@ fn main() {
     println!(" - Số MCTS Simulations / Turn: {}", n_simulations);
     println!(" - Batch Size: {}", config.batch_size);
     println!(" - Learning Rate: {}", config.lr);
+    if iter_max != usize::MAX {
+        println!(" - Iteration Max: {}", iter_max);
+    }
+    println!(" - Bắt đầu từ Iteration #{} (tiếp tục từ checkpoint)", start_iter + 1);
     println!("============================================================\n");
 
     // 6. Tạo GPU NN Executor SAU KHI load checkpoint (dùng đúng weights đã train)
@@ -201,6 +269,13 @@ fn main() {
 
     loop {
         iteration += 1;
+        if iteration > iter_max {
+            println!(
+                "[Done] Đã huấn luyện xong tới iteration max ({}), kết thúc chương trình.",
+                iter_max
+            );
+            break;
+        }
         let iter_start = Instant::now();
         println!(
             "--- [Iteration #{}] (Buffer: {}/{} samples) ---",
@@ -261,6 +336,14 @@ fn main() {
         // D. Lưu checkpoint model & buffer định kỳ
         if let Err(e) = pipeline.model.save_to_file(&latest_model_path) {
             println!("[Save Error] Không thể lưu latest model: {:?}", e);
+        }
+
+        // Lưu model theo iteration: alphazero_iter_<n>.bin
+        let iter_model_path = format!("{}/alphazero_iter_{}.bin", model_dir, iteration);
+        if let Err(e) = pipeline.model.save_to_file(&iter_model_path) {
+            println!("[Save Error] Không thể lưu model iteration {}: {:?}", iteration, e);
+        } else {
+            println!("[Checkpoint] Đã lưu model iteration {} vào `{}`", iteration, iter_model_path);
         }
 
         if let Err(e) = pipeline.replay_buffer.save_to_file(&buffer_path) {
