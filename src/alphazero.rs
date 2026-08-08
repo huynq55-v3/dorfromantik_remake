@@ -1,6 +1,8 @@
 use rand::prelude::*;
 use rayon::prelude::*;
 use std::collections::VecDeque;
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 
 use crate::env::{DorfromantikEnv, GraphObservation};
 use crate::mcts::{MCTSConfig, MCTSSearch};
@@ -73,6 +75,26 @@ impl AlphaZeroReplayBuffer {
 
     pub fn is_empty(&self) -> bool {
         self.buffer.is_empty()
+    }
+
+    /// Lọc bỏ các sample trùng lặp về state (cùng chữ ký observation giữ nguyên target nhãn).
+    /// Giữ lại sample đầu tiên cho mỗi state duy nhất, bỏ các bản sao còn lại.
+    /// Được gọi ngay trước khi train để tránh model overfit vào những state lặp lại.
+    pub fn deduplicate(&mut self) -> usize {
+        let mut seen: HashSet<u64> = HashSet::with_capacity(self.buffer.len());
+        let mut unique: VecDeque<AlphaZeroSample> = VecDeque::with_capacity(self.buffer.len());
+        let mut removed = 0usize;
+
+        for sample in self.buffer.drain(..) {
+            let sig = observation_hash(&sample.obs);
+            if seen.insert(sig) {
+                unique.push_back(sample);
+            } else {
+                removed += 1;
+            }
+        }
+        self.buffer = unique;
+        removed
     }
 
     pub fn save_to_file(&self, path: &str) -> std::io::Result<()> {
@@ -809,6 +831,11 @@ impl AlphaZeroPipeline {
 
     /// Huấn luyện mạng GNN trên mini-batches từ Replay Buffer bằng Adam Optimizer (Zero-Copy Sampling)
     pub fn train_step(&mut self) -> (f32, f32, f32) {
+        // Lọc bỏ các state trùng lặp trước khi train để tránh overfit
+        let removed = self.replay_buffer.deduplicate();
+        if removed > 0 {
+            println!("[Train] Đã lọc {} sample trùng lặp khỏi replay buffer (còn {}).", removed, self.replay_buffer.len());
+        }
         let buf_len = self.replay_buffer.len();
         if buf_len < self.config.batch_size {
             return (0.0, 0.0, 0.0);
@@ -958,4 +985,36 @@ impl AlphaZeroPipeline {
         }
         Ok(())
     }
+}
+
+/// Tính chữ ký hash (u64) cho toàn bộ observation — dùng để nhận diện các ván state trùng lặp.
+/// Hash ngay chính input mà model nhìn thấy (node_positions, node_features, edge_index,
+/// valid_actions, action_features) nên trạng thái giống y hệt sẽ có cùng chữ ký.
+fn observation_hash(obs: &GraphObservation) -> u64 {
+    use std::hash::DefaultHasher;
+    let mut h = DefaultHasher::new();
+    for &(q, r) in &obs.node_positions {
+        q.hash(&mut h);
+        r.hash(&mut h);
+    }
+    for feat in &obs.node_features {
+        for &v in feat {
+            v.to_bits().hash(&mut h);
+        }
+    }
+    for &(u, v) in &obs.edge_index {
+        u.hash(&mut h);
+        v.hash(&mut h);
+    }
+    for act in &obs.valid_actions {
+        act.q.hash(&mut h);
+        act.r.hash(&mut h);
+        act.rotation.hash(&mut h);
+    }
+    for feat in &obs.action_features {
+        for &v in feat {
+            v.to_bits().hash(&mut h);
+        }
+    }
+    h.finish()
 }

@@ -108,6 +108,14 @@ fn main() {
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(usize::MAX);
 
+    // Đọc số train epochs mỗi iteration từ tham số dòng lệnh thứ 4 (optional).
+    // Mặc định 4. Giá trị phải > 0; nếu không hợp lệ sẽ fallback về 4.
+    let train_epochs = args
+        .get(4)
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&e| e > 0)
+        .unwrap_or(4);
+
     let lr = 0.0003;
 
     let config = AlphaZeroTrainerConfig {
@@ -115,7 +123,7 @@ fn main() {
         gamma: 0.99,
         value_loss_coeff: 0.5,
         batch_size: 512,
-        train_epochs_per_iter: 4,
+        train_epochs_per_iter: train_epochs,
         mcts_config: MCTSConfig {
             c_puct: 1.5,
             gamma: 0.99,
@@ -246,6 +254,7 @@ fn main() {
     println!(" - Số Môi Trường Song Song (Envs): {}", parallel_envs);
     println!(" - Số MCTS Simulations / Turn: {}", n_simulations);
     println!(" - Batch Size: {}", config.batch_size);
+    println!(" - Train Epochs / Iter: {}", config.train_epochs_per_iter);
     println!(" - Learning Rate: {}", config.lr);
     if iter_max != usize::MAX {
         println!(" - Iteration Max: {}", iter_max);
