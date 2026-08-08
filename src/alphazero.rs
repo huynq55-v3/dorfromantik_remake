@@ -42,6 +42,17 @@ impl AlphaZeroReplayBuffer {
         }
     }
 
+    pub fn sample_batch_indices(&self, batch_size: usize) -> Vec<usize> {
+        let mut rng = rand::thread_rng();
+        let len = self.buffer.len();
+        if len == 0 {
+            return Vec::new();
+        }
+        (0..batch_size)
+            .map(|_| rng.gen_range(0..len))
+            .collect()
+    }
+
     pub fn sample_batch(&self, batch_size: usize) -> Vec<AlphaZeroSample> {
         let mut rng = rand::thread_rng();
         let len = self.buffer.len();
@@ -572,7 +583,9 @@ pub struct AlphaZeroPipeline {
 impl AlphaZeroPipeline {
     pub fn new(config: AlphaZeroTrainerConfig) -> Self {
         let model = HexGNNModel::new();
-        let replay_buffer = AlphaZeroReplayBuffer::new(50_000);
+        // Tự động tính toán dung lượng Replay Buffer chứa 5 Iteration gần nhất (ví dụ: 1024 envs * 100 tiles * 5 = 512,000 samples)
+        let buf_capacity = (config.num_parallel_envs * config.tile_limit * 5).max(500_000);
+        let replay_buffer = AlphaZeroReplayBuffer::new(buf_capacity);
         Self {
             config,
             model,
@@ -641,6 +654,7 @@ impl AlphaZeroPipeline {
         let mut move_counts = vec![0usize; n_envs];
         let mut active = vec![true; n_envs];
         let mut turn_counter = 0usize;
+        let mut total_moves = 0usize;
         use std::io::Write;
 
         print!("[Self-Play Progress] ");
@@ -648,27 +662,18 @@ impl AlphaZeroPipeline {
 
         while active.iter().any(|&a| a) {
             let active_indices: Vec<usize> = (0..n_envs).filter(|&i| active[i]).collect();
-            let active_envs: Vec<DorfromantikEnv> = active_indices.iter().map(|&i| envs[i].clone()).collect();
-
             if active_indices.is_empty() {
                 break;
             }
 
             turn_counter += 1;
-            print!(".");
-            if turn_counter % 25 == 0 {
-                print!(" [Turn {} | Active: {}/{}]\n[Self-Play Progress] ", turn_counter, active_indices.len(), n_envs);
-            }
-            let _ = std::io::stdout().flush();
-
             let add_dirichlet = move_counts[active_indices[0]] < temp_thresh;
             let temp = if move_counts[active_indices[0]] < temp_thresh { 1.0f32 } else { 0.2f32 };
 
-            let batch_results = mcts.search_batch(&active_envs, &self.model, gpu_exec, add_dirichlet, temp);
+            let batch_results = mcts.search_batch_indexed(&envs, &active_indices, &self.model, gpu_exec, add_dirichlet, temp);
 
             for (k, &idx) in active_indices.iter().enumerate() {
-                let (pi_probs, _, chosen_action, _) = &batch_results[k];
-                let obs = envs[idx].extract_graph_observation();
+                let (pi_probs, _, chosen_action, _, obs) = &batch_results[k];
 
                 if obs.valid_actions.is_empty() {
                     active[idx] = false;
@@ -692,8 +697,9 @@ impl AlphaZeroPipeline {
                     remaining_tiles: envs[idx].score_manager.remaining_tiles,
                 });
 
-                raw_steps[idx].push((obs, pi_probs.clone(), scaled_r));
+                raw_steps[idx].push((obs.clone(), pi_probs.clone(), scaled_r));
                 move_counts[idx] += 1;
+                total_moves += 1;
 
                 if res.done || envs[idx].is_game_over() {
                     active[idx] = false;
@@ -701,8 +707,15 @@ impl AlphaZeroPipeline {
                     let _ = std::io::stdout().flush();
                 }
             }
+
+            // In đúng 1 dấu chấm nhịp nhàng sau mỗi lượt đi hoàn thành (giống Wisdom engine)
+            print!(".");
+            if turn_counter % 25 == 0 {
+                print!(" [Turn {} | Active: {}/{} | {} moves]\n[Self-Play Progress] ", turn_counter, active_indices.len(), n_envs, total_moves);
+            }
+            let _ = std::io::stdout().flush();
         }
-        println!();
+        println!("\n[Self-Play Done] Hoàn thành {} turns, tổng cộng {} nước đi.", turn_counter, total_moves);
 
         let mut total_score = 0;
         let mut max_score = 0;
@@ -789,7 +802,7 @@ impl AlphaZeroPipeline {
         (avg_score, max_score, avg_placed, best_record)
     }
 
-    /// Huấn luyện mạng GNN trên mini-batches từ Replay Buffer bằng Adam Optimizer
+    /// Huấn luyện mạng GNN trên mini-batches từ Replay Buffer bằng Adam Optimizer (Zero-Copy Sampling)
     pub fn train_step(&mut self) -> (f32, f32, f32) {
         let buf_len = self.replay_buffer.len();
         if buf_len < self.config.batch_size {
@@ -803,17 +816,19 @@ impl AlphaZeroPipeline {
 
         for _ in 0..self.config.train_epochs_per_iter {
             for _ in 0..num_batches {
-                let batch = self.replay_buffer.sample_batch(self.config.batch_size);
-                if batch.is_empty() {
+                let indices = self.replay_buffer.sample_batch_indices(self.config.batch_size);
+                if indices.is_empty() {
                     continue;
                 }
 
                 let model_ref = &self.model;
                 let val_coeff = self.config.value_loss_coeff;
+                let buffer_ref = &self.replay_buffer.buffer;
 
-                let (mb_grads, (mb_pi_loss, mb_val_loss)) = batch
+                let (mb_grads, (mb_pi_loss, mb_val_loss)) = indices
                     .into_par_iter()
-                    .map(|sample| {
+                    .map(|idx| {
+                        let sample = &buffer_ref[idx];
                         let obs = &sample.obs;
                         let (action_logits, pred_val) = model_ref.forward(
                             &obs.node_positions,

@@ -3,9 +3,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 use dorfromantik_remake::alphazero::{
-    evaluate_alphazero_agent_gpu, AlphaZeroPipeline, AlphaZeroTrainerConfig, GameMatchRecord,
+    evaluate_alphazero_agent, AlphaZeroPipeline, AlphaZeroTrainerConfig, GameMatchRecord,
 };
-use dorfromantik_remake::gpu_engine::{GpuEngine, GpuEvalQueue};
+use dorfromantik_remake::gpu_engine::GpuEngine;
 use dorfromantik_remake::gpu_nn::GpuNNExecutor;
 use dorfromantik_remake::mcts::MCTSConfig;
 use dorfromantik_remake::nn::HexGNNModel;
@@ -59,7 +59,7 @@ fn main() {
     }
 
     let (target_seed, initial_stack, tile_limit) = load_monthly_game_config();
-    let parallel_envs = 16;
+    let parallel_envs = 1024;
 
     // Đọc số simulations từ tham số dòng lệnh nếu có (mặc định 400)
     let args: Vec<String> = std::env::args().collect();
@@ -75,7 +75,7 @@ fn main() {
         lr,
         gamma: 0.99,
         value_loss_coeff: 0.5,
-        batch_size: 128,
+        batch_size: 1024,
         train_epochs_per_iter: 4,
         mcts_config: MCTSConfig {
             c_puct: 1.5,
@@ -267,19 +267,15 @@ fn main() {
             println!("[Save Error] Không thể lưu replay buffer: {:?}", e);
         }
 
-        // E. Đánh giá (Evaluation GPU) mỗi 5 iterations
+        // E. Đánh giá (Evaluation) mỗi 5 iterations
         if iteration % 5 == 0 {
             let eval_start = Instant::now();
-            println!("[Eval GPU] Đang chạy đánh giá Greedy Agent trên target seed {}...", target_seed);
-            // Tạo eval_queue tạm thời chỉ cho lần eval này
-            let eval_queue = dorfromantik_remake::gpu_engine::GpuEvalQueue::new(
-                pipeline.model.clone(), parallel_envs * 4, 100,
-            );
-            let (eval_score, eval_placed, eval_record) = evaluate_alphazero_agent_gpu(
+            println!("[Eval] Đang chạy đánh giá Greedy Agent trên target seed {}...", target_seed);
+            let (eval_score, eval_placed, eval_record) = evaluate_alphazero_agent(
                 target_seed,
                 initial_stack,
                 tile_limit,
-                &eval_queue.tx,
+                &pipeline.model,
                 &config.mcts_config,
             );
             let eval_dur = eval_start.elapsed();

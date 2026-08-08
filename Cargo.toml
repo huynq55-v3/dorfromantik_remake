@@ -44,3 +44,9 @@ path = "bin/train_alphazero_gpu.rs"
 name = "debug_seed"
 path = "bin/debug_seed.rs"
 
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+

@@ -3,9 +3,9 @@ use std::sync::Arc;
 use crate::nn::HexGNNModel;
 use crate::env::GraphObservation;
 
-/// WGSL GEMM Shader tối ưu: Y[row, col] = X[row, :] · W[col, :]^T + B[col], optional ReLU
+/// WGSL GEMM Shader: Y[row, col] = X[row, :] · W[col, :]^T + B[col], optional ReLU
 const GEMM_SHADER: &str = r#"
-struct Dims { M: u32, K: u32, N: u32, relu: u32 };
+struct Dims { m: u32, k: u32, n: u32, relu: u32 };
 
 @group(0) @binding(0) var<uniform>            dims: Dims;
 @group(0) @binding(1) var<storage, read>      x:    array<f32>;
@@ -17,53 +17,106 @@ struct Dims { M: u32, K: u32, N: u32, relu: u32 };
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let row = gid.x;
     let col = gid.y;
-    if (row >= dims.M || col >= dims.N) { return; }
+    if (row >= dims.m || col >= dims.n) { return; }
     var acc: f32 = b[col];
-    for (var k: u32 = 0u; k < dims.K; k = k + 1u) {
-        acc = acc + x[row * dims.K + k] * w[col * dims.K + k];
+    for (var k: u32 = 0u; k < dims.k; k = k + 1u) {
+        acc = acc + x[row * dims.k + k] * w[col * dims.k + k];
     }
     if (dims.relu == 1u && acc < 0.0) { acc = 0.0; }
-    y[row * dims.N + col] = acc;
+    y[row * dims.n + col] = acc;
+}
+"#;
+
+/// WGSL CSR Aggregation Shader: h_out[u, d] = mean_{v in N(u)} h_in[v, d] - O(Deg(u)) siêu tốc!
+const AGG_CSR_SHADER: &str = r#"
+struct AggCsrDims { n_nodes: u32, dim: u32 };
+
+@group(0) @binding(0) var<uniform>          dims:    AggCsrDims;
+@group(0) @binding(1) var<storage, read>    h_in:    array<f32>;
+@group(0) @binding(2) var<storage, read>    offsets: array<u32>;
+@group(0) @binding(3) var<storage, read>    targets: array<u32>;
+@group(0) @binding(4) var<storage, read_write> h_out:  array<f32>;
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let node = gid.x;
+    let feat = gid.y;
+    if (node >= dims.n_nodes || feat >= dims.dim) { return; }
+
+    let start = offsets[node];
+    let end   = offsets[node + 1u];
+    let count = end - start;
+
+    var sum: f32 = 0.0;
+    for (var i: u32 = start; i < end; i = i + 1u) {
+        let v = targets[i];
+        sum = sum + h_in[v * dims.dim + feat];
+    }
+
+    let inv = select(1.0 / f32(count), 0.0, count == 0u);
+    h_out[node * dims.dim + feat] = sum * inv;
+}
+"#;
+
+/// WGSL Combine Shader: h_out = relu(ys + yn) [+ h_prev if residual]
+const COMBINE_SHADER: &str = r#"
+struct CombineDims { n_nodes: u32, dim: u32, residual: u32, _p1: u32 };
+
+@group(0) @binding(0) var<uniform>          dims:   CombineDims;
+@group(0) @binding(1) var<storage, read>    ys:     array<f32>;
+@group(0) @binding(2) var<storage, read>    yn:     array<f32>;
+@group(0) @binding(3) var<storage, read>    h_prev: array<f32>;
+@group(0) @binding(4) var<storage, read_write> h_out: array<f32>;
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let node = gid.x;
+    let feat = gid.y;
+    if (node >= dims.n_nodes || feat >= dims.dim) { return; }
+
+    let i = node * dims.dim + feat;
+    let sum = ys[i] + yn[i];
+    let relu = max(sum, 0.0);
+    if (dims.residual == 1u) {
+        h_out[i] = relu + h_prev[i];
+    } else {
+        h_out[i] = relu;
+    }
 }
 "#;
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct GemmDims { M: u32, K: u32, N: u32, relu: u32 }
+struct GemmDims { m: u32, k: u32, n: u32, relu: u32 }
 
-/// GPU Neural Network Executor với Persistent Weight Buffers
-///
-/// Các weight được upload lên GPU VRAM MỘT LẦN DUY NHẤT khi khởi tạo.
-/// Khi inference, chỉ cần upload input data (nhỏ) và readback output.
-/// Sau mỗi training step, gọi sync_weights() để cập nhật weights.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct AggCsrDims { n_nodes: u32, dim: u32 }
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct CombineDims { n_nodes: u32, dim: u32, residual: u32, _p1: u32 }
+
+/// GPU Neural Network Executor V1 Supercharged (3 Layers GNN, Hidden Dim = 64, O(Deg) CSR Aggregation)
 pub struct GpuNNExecutor {
     pub device: Arc<wgpu::Device>,
     pub queue:  Arc<wgpu::Queue>,
-    pipeline: wgpu::ComputePipeline,
-    layout:   wgpu::BindGroupLayout,
-    // ===== Persistent Weight Buffers (STORAGE | COPY_DST) =====
-    // GNN Layer 1: 40 -> 128
+    gemm_pipeline:    wgpu::ComputePipeline,
+    gemm_layout:      wgpu::BindGroupLayout,
+    agg_pipeline:     wgpu::ComputePipeline,
+    agg_layout:       wgpu::BindGroupLayout,
+    combine_pipeline: wgpu::ComputePipeline,
+    combine_layout:   wgpu::BindGroupLayout,
+
+    // Persistent Weights (VRAM)
     w_self1: wgpu::Buffer, b_self1: wgpu::Buffer,
     w_neigh1: wgpu::Buffer, b_neigh1: wgpu::Buffer,
-    // GNN Layer 2: 128 -> 128
     w_self2: wgpu::Buffer, b_self2: wgpu::Buffer,
     w_neigh2: wgpu::Buffer, b_neigh2: wgpu::Buffer,
-    // GNN Layer 3: 128 -> 128
     w_self3: wgpu::Buffer, b_self3: wgpu::Buffer,
     w_neigh3: wgpu::Buffer, b_neigh3: wgpu::Buffer,
-    // GNN Layer 4: 128 -> 128
-    w_self4: wgpu::Buffer, b_self4: wgpu::Buffer,
-    w_neigh4: wgpu::Buffer, b_neigh4: wgpu::Buffer,
-    // GNN Layer 5: 128 -> 128
-    w_self5: wgpu::Buffer, b_self5: wgpu::Buffer,
-    w_neigh5: wgpu::Buffer, b_neigh5: wgpu::Buffer,
-    // GNN Layer 6: 128 -> 128
-    w_self6: wgpu::Buffer, b_self6: wgpu::Buffer,
-    w_neigh6: wgpu::Buffer, b_neigh6: wgpu::Buffer,
-    // Action Head: 144 -> 128 -> 1
     w_act1: wgpu::Buffer, b_act1: wgpu::Buffer,
     w_act2: wgpu::Buffer, b_act2: wgpu::Buffer,
-    // Value Head: 128 -> 128 -> 1
     w_val1: wgpu::Buffer, b_val1: wgpu::Buffer,
     w_val2: wgpu::Buffer, b_val2: wgpu::Buffer,
 }
@@ -97,7 +150,6 @@ impl GpuNNExecutor {
         }
     }
 
-    /// Tạo persistent weight buffer: STORAGE (shader read) + COPY_DST (cập nhật qua write_buffer)
     fn make_weight_buf(device: &wgpu::Device, data: &[f32]) -> wgpu::Buffer {
         device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
@@ -106,62 +158,93 @@ impl GpuNNExecutor {
         })
     }
 
-    /// Khởi tạo GpuNNExecutor - compile shader + upload TẤT CẢ weights lên GPU VRAM (1 lần duy nhất)
     pub fn new(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>, model: &HexGNNModel) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("HexGNN GEMM Shader"),
-            source: wgpu::ShaderSource::Wgsl(GEMM_SHADER.into()),
+        // 1. GEMM Pipeline
+        let gemm_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("GEMM"), source: wgpu::ShaderSource::Wgsl(GEMM_SHADER.into()),
         });
-
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        let gemm_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("GEMM BGL"),
             entries: &[
-                Self::bgl_uniform(0),
-                Self::bgl_storage_ro(1),
-                Self::bgl_storage_ro(2),
-                Self::bgl_storage_ro(3),
+                Self::bgl_uniform(0), Self::bgl_storage_ro(1),
+                Self::bgl_storage_ro(2), Self::bgl_storage_ro(3),
                 Self::bgl_storage_rw(4),
             ],
         });
-
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None, bind_group_layouts: &[&layout], push_constant_ranges: &[],
+        let gemm_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None, bind_group_layouts: &[&gemm_layout], push_constant_ranges: &[],
+        });
+        let gemm_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("GEMM Pipeline"), layout: Some(&gemm_pl),
+            module: &gemm_shader, entry_point: Some("main"), compilation_options: Default::default(), cache: None,
         });
 
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("GEMM Pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
+        // 2. CSR Aggregation Pipeline
+        let agg_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Agg CSR"), source: wgpu::ShaderSource::Wgsl(AGG_CSR_SHADER.into()),
+        });
+        let agg_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Agg CSR BGL"),
+            entries: &[
+                Self::bgl_uniform(0), Self::bgl_storage_ro(1),
+                Self::bgl_storage_ro(2), Self::bgl_storage_ro(3),
+                Self::bgl_storage_rw(4),
+            ],
+        });
+        let agg_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None, bind_group_layouts: &[&agg_layout], push_constant_ranges: &[],
+        });
+        let agg_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Agg CSR Pipeline"), layout: Some(&agg_pl),
+            module: &agg_shader, entry_point: Some("main"), compilation_options: Default::default(), cache: None,
         });
 
-        macro_rules! wb { ($data:expr) => { Self::make_weight_buf(&device, $data) } }
+        // 3. Combine Pipeline
+        let combine_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Combine"), source: wgpu::ShaderSource::Wgsl(COMBINE_SHADER.into()),
+        });
+        let combine_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Combine BGL"),
+            entries: &[
+                Self::bgl_uniform(0), Self::bgl_storage_ro(1),
+                Self::bgl_storage_ro(2), Self::bgl_storage_ro(3),
+                Self::bgl_storage_rw(4),
+            ],
+        });
+        let combine_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None, bind_group_layouts: &[&combine_layout], push_constant_ranges: &[],
+        });
+        let combine_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Combine Pipeline"), layout: Some(&combine_pl),
+            module: &combine_shader, entry_point: Some("main"), compilation_options: Default::default(), cache: None,
+        });
+
+        macro_rules! wb { ($slice:expr) => { Self::make_weight_buf(&device, $slice) } }
+        let w_self1  = wb!(&model.w_self1.weight);  let b_self1  = wb!(&model.w_self1.bias);
+        let w_neigh1 = wb!(&model.w_neigh1.weight); let b_neigh1 = wb!(&model.w_neigh1.bias);
+        let w_self2  = wb!(&model.w_self2.weight);  let b_self2  = wb!(&model.w_self2.bias);
+        let w_neigh2 = wb!(&model.w_neigh2.weight); let b_neigh2 = wb!(&model.w_neigh2.bias);
+        let w_self3  = wb!(&model.w_self3.weight);  let b_self3  = wb!(&model.w_self3.bias);
+        let w_neigh3 = wb!(&model.w_neigh3.weight); let b_neigh3 = wb!(&model.w_neigh3.bias);
+        let w_act1   = wb!(&model.w_act1.weight);   let b_act1   = wb!(&model.w_act1.bias);
+        let w_act2   = wb!(&model.w_act2.weight);   let b_act2   = wb!(&model.w_act2.bias);
+        let w_val1   = wb!(&model.w_val1.weight);   let b_val1   = wb!(&model.w_val1.bias);
+        let w_val2   = wb!(&model.w_val2.weight);   let b_val2   = wb!(&model.w_val2.bias);
 
         Self {
-            w_self1:  wb!(&model.w_self1.weight),  b_self1:  wb!(&model.w_self1.bias),
-            w_neigh1: wb!(&model.w_neigh1.weight), b_neigh1: wb!(&model.w_neigh1.bias),
-            w_self2:  wb!(&model.w_self2.weight),  b_self2:  wb!(&model.w_self2.bias),
-            w_neigh2: wb!(&model.w_neigh2.weight), b_neigh2: wb!(&model.w_neigh2.bias),
-            w_self3:  wb!(&model.w_self3.weight),  b_self3:  wb!(&model.w_self3.bias),
-            w_neigh3: wb!(&model.w_neigh3.weight), b_neigh3: wb!(&model.w_neigh3.bias),
-            w_self4:  wb!(&model.w_self4.weight),  b_self4:  wb!(&model.w_self4.bias),
-            w_neigh4: wb!(&model.w_neigh4.weight), b_neigh4: wb!(&model.w_neigh4.bias),
-            w_self5:  wb!(&model.w_self5.weight),  b_self5:  wb!(&model.w_self5.bias),
-            w_neigh5: wb!(&model.w_neigh5.weight), b_neigh5: wb!(&model.w_neigh5.bias),
-            w_self6:  wb!(&model.w_self6.weight),  b_self6:  wb!(&model.w_self6.bias),
-            w_neigh6: wb!(&model.w_neigh6.weight), b_neigh6: wb!(&model.w_neigh6.bias),
-            w_act1:   wb!(&model.w_act1.weight),   b_act1:   wb!(&model.w_act1.bias),
-            w_act2:   wb!(&model.w_act2.weight),   b_act2:   wb!(&model.w_act2.bias),
-            w_val1:   wb!(&model.w_val1.weight),   b_val1:   wb!(&model.w_val1.bias),
-            w_val2:   wb!(&model.w_val2.weight),   b_val2:   wb!(&model.w_val2.bias),
-            pipeline, layout, device, queue,
+            device, queue,
+            gemm_pipeline, gemm_layout,
+            agg_pipeline, agg_layout,
+            combine_pipeline, combine_layout,
+            w_self1, b_self1, w_neigh1, b_neigh1,
+            w_self2, b_self2, w_neigh2, b_neigh2,
+            w_self3, b_self3, w_neigh3, b_neigh3,
+            w_act1, b_act1, w_act2, b_act2,
+            w_val1, b_val1, w_val2, b_val2,
         }
     }
 
-    /// Cập nhật weights sau mỗi training step (dùng queue.write_buffer - zero-copy trên Intel iGPU)
-    pub fn sync_weights(&self, model: &HexGNNModel) {
+    pub fn update_weights_from_model(&self, model: &HexGNNModel) {
         macro_rules! ww {
             ($buf:expr, $data:expr) => {
                 self.queue.write_buffer(&$buf, 0, bytemuck::cast_slice($data));
@@ -173,31 +256,18 @@ impl GpuNNExecutor {
         ww!(self.w_neigh2, &model.w_neigh2.weight); ww!(self.b_neigh2, &model.w_neigh2.bias);
         ww!(self.w_self3,  &model.w_self3.weight);  ww!(self.b_self3,  &model.w_self3.bias);
         ww!(self.w_neigh3, &model.w_neigh3.weight); ww!(self.b_neigh3, &model.w_neigh3.bias);
-        ww!(self.w_self4,  &model.w_self4.weight);  ww!(self.b_self4,  &model.w_self4.bias);
-        ww!(self.w_neigh4, &model.w_neigh4.weight); ww!(self.b_neigh4, &model.w_neigh4.bias);
-        ww!(self.w_self5,  &model.w_self5.weight);  ww!(self.b_self5,  &model.w_self5.bias);
-        ww!(self.w_neigh5, &model.w_neigh5.weight); ww!(self.b_neigh5, &model.w_neigh5.bias);
-        ww!(self.w_self6,  &model.w_self6.weight);  ww!(self.b_self6,  &model.w_self6.bias);
-        ww!(self.w_neigh6, &model.w_neigh6.weight); ww!(self.b_neigh6, &model.w_neigh6.bias);
         ww!(self.w_act1,   &model.w_act1.weight);   ww!(self.b_act1,   &model.w_act1.bias);
         ww!(self.w_act2,   &model.w_act2.weight);   ww!(self.b_act2,   &model.w_act2.bias);
         ww!(self.w_val1,   &model.w_val1.weight);   ww!(self.b_val1,   &model.w_val1.bias);
         ww!(self.w_val2,   &model.w_val2.weight);   ww!(self.b_val2,   &model.w_val2.bias);
-        // Flush all pending writes
         self.queue.submit([]);
     }
 
-    // ===== Helper: tạo input buffer từ CPU data =====
-    fn input_buf(&self, data: &[f32]) -> wgpu::Buffer {
-        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: bytemuck::cast_slice(data),
-            usage: wgpu::BufferUsages::STORAGE,
-        })
+    pub fn sync_weights(&self, model: &HexGNNModel) {
+        self.update_weights_from_model(model);
     }
 
-    // ===== Helper: tạo output buffer trên GPU =====
-    fn output_buf(&self, n_f32: usize) -> wgpu::Buffer {
+    fn storage_buf(&self, n_f32: usize) -> wgpu::Buffer {
         self.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: (n_f32 * 4) as u64,
@@ -206,25 +276,50 @@ impl GpuNNExecutor {
         })
     }
 
-    // ===== Dispatch 1 GEMM vào encoder (không submit) =====
-    fn dispatch_gemm(
-        &self,
-        enc: &mut wgpu::CommandEncoder,
-        x: &wgpu::Buffer,
-        w: &wgpu::Buffer,
-        b: &wgpu::Buffer,
-        y: &wgpu::Buffer,
-        m: usize, k: usize, n: usize,
-        relu: bool,
-    ) {
-        let dims = GemmDims { M: m as u32, K: k as u32, N: n as u32, relu: relu as u32 };
-        let dims_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    fn init_storage_buf<T: bytemuck::Pod>(&self, data: &[T]) -> wgpu::Buffer {
+        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: bytemuck::bytes_of(&dims),
-            usage: wgpu::BufferUsages::UNIFORM,
+            contents: bytemuck::cast_slice(data),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        })
+    }
+
+    fn dispatch_agg_csr(
+        &self, enc: &mut wgpu::CommandEncoder,
+        h_in: &wgpu::Buffer, offsets: &wgpu::Buffer, targets: &wgpu::Buffer, h_out: &wgpu::Buffer,
+        n_nodes: usize, dim: usize,
+    ) {
+        let dims = AggCsrDims { n_nodes: n_nodes as u32, dim: dim as u32 };
+        let dims_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None, contents: bytemuck::bytes_of(&dims), usage: wgpu::BufferUsages::UNIFORM,
         });
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None, layout: &self.layout,
+            label: None, layout: &self.agg_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: dims_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: h_in.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: offsets.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: targets.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: h_out.as_entire_binding() },
+            ],
+        });
+        let mut pass = enc.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&self.agg_pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups((n_nodes as u32 + 15) / 16, (dim as u32 + 15) / 16, 1);
+    }
+
+    fn dispatch_gemm(
+        &self, enc: &mut wgpu::CommandEncoder,
+        x: &wgpu::Buffer, w: &wgpu::Buffer, b: &wgpu::Buffer, y: &wgpu::Buffer,
+        m: usize, k: usize, n: usize, relu: bool,
+    ) {
+        let dims = GemmDims { m: m as u32, k: k as u32, n: n as u32, relu: relu as u32 };
+        let dims_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None, contents: bytemuck::bytes_of(&dims), usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &self.gemm_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: dims_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: x.as_entire_binding() },
@@ -233,38 +328,45 @@ impl GpuNNExecutor {
                 wgpu::BindGroupEntry { binding: 4, resource: y.as_entire_binding() },
             ],
         });
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
-        pass.set_pipeline(&self.pipeline);
+        let mut pass = enc.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&self.gemm_pipeline);
         pass.set_bind_group(0, &bg, &[]);
         pass.dispatch_workgroups((m as u32 + 15) / 16, (n as u32 + 15) / 16, 1);
     }
 
-    // ===== Submit 2 GEMMs + readback combined (1 encoder submit, 1 poll, 1 staging) =====
-    fn two_gemm_readback(
-        &self,
-        x1: &wgpu::Buffer, w1: &wgpu::Buffer, b1: &wgpu::Buffer, m1: usize, k1: usize, n1: usize,
-        x2: &wgpu::Buffer, w2: &wgpu::Buffer, b2: &wgpu::Buffer, m2: usize, k2: usize, n2: usize,
-        relu1: bool, relu2: bool,
-    ) -> (Vec<f32>, Vec<f32>) {
-        let y1 = self.output_buf(m1 * n1);
-        let y2 = self.output_buf(m2 * n2);
+    fn dispatch_combine(
+        &self, enc: &mut wgpu::CommandEncoder,
+        ys: &wgpu::Buffer, yn: &wgpu::Buffer, h_prev: &wgpu::Buffer, h_out: &wgpu::Buffer,
+        n_nodes: usize, dim: usize, residual: bool,
+    ) {
+        let dims = CombineDims { n_nodes: n_nodes as u32, dim: dim as u32, residual: residual as u32, _p1: 0 };
+        let dims_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None, contents: bytemuck::bytes_of(&dims), usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &self.combine_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: dims_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: ys.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: yn.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: h_prev.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: h_out.as_entire_binding() },
+            ],
+        });
+        let mut pass = enc.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&self.combine_pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups((n_nodes as u32 + 15) / 16, (dim as u32 + 15) / 16, 1);
+    }
 
-        let mut enc = self.device.create_command_encoder(&Default::default());
-        self.dispatch_gemm(&mut enc, x1, w1, b1, &y1, m1, k1, n1, relu1);
-        self.dispatch_gemm(&mut enc, x2, w2, b2, &y2, m2, k2, n2, relu2);
-
-        // Combined staging buffer (both outputs)
-        let size1 = m1 * n1 * 4;
-        let size2 = m2 * n2 * 4;
-        let combined_size = size1 + size2;
+    fn readback(&self, src: &wgpu::Buffer, n_f32: usize) -> Vec<f32> {
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: combined_size as u64,
+            label: None, size: (n_f32 * 4) as u64,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        enc.copy_buffer_to_buffer(&y1, 0, &staging, 0, size1 as u64);
-        enc.copy_buffer_to_buffer(&y2, 0, &staging, size1 as u64, size2 as u64);
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        enc.copy_buffer_to_buffer(src, 0, &staging, 0, (n_f32 * 4) as u64);
         self.queue.submit(Some(enc.finish()));
 
         let slice = staging.slice(..);
@@ -272,78 +374,15 @@ impl GpuNNExecutor {
         slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
         self.device.poll(wgpu::Maintain::Wait);
         let _ = rx.recv();
-
         let data = slice.get_mapped_range();
-        let all: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
-        drop(data);
-
-        let out1 = all[0..m1 * n1].to_vec();
-        let out2 = all[m1 * n1..m1 * n1 + m2 * n2].to_vec();
-        (out1, out2)
+        bytemuck::cast_slice(&data).to_vec()
     }
 
-    // ===== CPU Neighbor Aggregation (Mean Pooling) =====
-    fn cpu_aggregate(h: &[f32], dim: usize, n_nodes: usize, edges: &[(usize, usize)]) -> Vec<f32> {
-        let mut sum = vec![0.0f32; n_nodes * dim];
-        let mut cnt = vec![0u32; n_nodes];
-        for &(u, v) in edges {
-            if u < n_nodes && v < n_nodes {
-                for d in 0..dim {
-                    sum[u * dim + d] += h[v * dim + d];
-                }
-                cnt[u] += 1;
-            }
-        }
-        let mut out = vec![0.0f32; n_nodes * dim];
-        for u in 0..n_nodes {
-            let c = cnt[u].max(1) as f32;
-            for d in 0..dim { out[u * dim + d] = sum[u * dim + d] / c; }
-        }
-        out
-    }
-
-    // ===== Một GNN Layer: submit 2 GEMMs (self+neigh) song song trên GPU, CPU add+relu+residual =====
-    fn gnn_layer_gpu(
-        &self,
-        h: &[f32],
-        agg: &[f32],
-        n_nodes: usize,
-        in_dim: usize,
-        out_dim: usize,
-        w_self: &wgpu::Buffer, b_self: &wgpu::Buffer,
-        w_neigh: &wgpu::Buffer, b_neigh: &wgpu::Buffer,
-        residual: bool,  // true cho layers 2-6, false cho layer 1
-    ) -> Vec<f32> {
-        let x_buf = self.input_buf(h);
-        let n_buf = self.input_buf(agg);
-
-        let (ys, yn) = self.two_gemm_readback(
-            &x_buf, w_self, b_self, n_nodes, in_dim, out_dim,
-            &n_buf, w_neigh, b_neigh, n_nodes, in_dim, out_dim,
-            false, false,
-        );
-
-        let mut h_new = vec![0.0f32; n_nodes * out_dim];
-        for i in 0..n_nodes * out_dim {
-            let sum = ys[i] + yn[i];
-            let relu = sum.max(0.0);
-            // Residual connection chỉ khi in_dim == out_dim (layers 2-6)
-            h_new[i] = if residual { relu + h[i] } else { relu };
-        }
-        h_new
-    }
-
-    /// Forward Batch toàn bộ trên GPU Intel Iris Xe - Persistent Weights, tối thiểu GPU roundtrips
-    ///
-    /// Thay vì cấp phát weight buffer mỗi lần, weights đã được upload sẵn trong GPU VRAM.
-    /// Mỗi GNN layer: 1 GPU submit (2 GEMMs song song) + 1 readback.
-    /// Heads: 2 submits (act+val song song) + 2 readbacks.
-    /// Tổng: ~8 GPU submits/call thay vì 32+ như trước.
+    /// Forward Pass CSR Supercharged trên GPU (O(Deg) Aggregation)
     pub fn forward_batch_gpu(&self, observations: &[&GraphObservation]) -> Vec<(Vec<f32>, f32)> {
         let batch = observations.len();
         if batch == 0 { return Vec::new(); }
 
-        // ===== 1. Build batched disjoint graph =====
         let mut total_nodes = 0usize;
         let mut total_actions = 0usize;
         let mut node_offsets = Vec::with_capacity(batch);
@@ -360,153 +399,131 @@ impl GpuNNExecutor {
             return observations.iter().map(|o| (vec![0.0f32; o.valid_actions.len()], 0.0f32)).collect();
         }
 
-        // ===== 2. Flatten node features [total_nodes, 40] =====
         let mut h0 = Vec::with_capacity(total_nodes * 40);
-        let mut edges: Vec<(usize, usize)> = Vec::new();
+
+        // --- Build Compressed Sparse Row (CSR) Format cho Graph Aggregation ---
+        let mut csr_offsets = Vec::with_capacity(total_nodes + 1);
+        let mut csr_targets = Vec::new();
+        let mut curr_csr_offset = 0u32;
+        csr_offsets.push(0u32);
 
         for (i, obs) in observations.iter().enumerate() {
-            let off = node_offsets[i];
+            let off = node_offsets[i] as u32;
+            let n = obs.node_features.len();
+
             for feat in &obs.node_features {
                 h0.extend_from_slice(feat);
             }
+
+            let mut adj = vec![Vec::new(); n];
             for &(u, v) in &obs.edge_index {
-                edges.push((u + off, v + off));
+                if u < n && v < n {
+                    adj[u].push((v as u32) + off);
+                }
+            }
+
+            for u in 0..n {
+                for &v_target in &adj[u] {
+                    csr_targets.push(v_target);
+                    curr_csr_offset += 1;
+                }
+                csr_offsets.push(curr_csr_offset);
             }
         }
 
-        // ===== 3. 6 GNN Layers trên GPU (Weights persistent trong VRAM) =====
-        // Layer 1: 40 -> 128
-        let agg0 = Self::cpu_aggregate(&h0, 40, total_nodes, &edges);
-        let h1 = self.gnn_layer_gpu(&h0, &agg0, total_nodes, 40, 128,
-            &self.w_self1, &self.b_self1, &self.w_neigh1, &self.b_neigh1, false);
+        let h0_buf = self.init_storage_buf(&h0);
+        let offsets_buf = self.init_storage_buf(&csr_offsets);
+        let targets_buf = self.init_storage_buf(&csr_targets);
 
-        // Layer 2: 128 -> 128 (residual)
-        let agg1 = Self::cpu_aggregate(&h1, 128, total_nodes, &edges);
-        let h2 = self.gnn_layer_gpu(&h1, &agg1, total_nodes, 128, 128,
-            &self.w_self2, &self.b_self2, &self.w_neigh2, &self.b_neigh2, true);
+        let h1_buf = self.storage_buf(total_nodes * 64);
+        let h2_buf = self.storage_buf(total_nodes * 64);
+        let h3_buf = self.storage_buf(total_nodes * 64);
 
-        // Layer 3
-        let agg2 = Self::cpu_aggregate(&h2, 128, total_nodes, &edges);
-        let h3 = self.gnn_layer_gpu(&h2, &agg2, total_nodes, 128, 128,
-            &self.w_self3, &self.b_self3, &self.w_neigh3, &self.b_neigh3, true);
+        let agg0_buf = self.storage_buf(total_nodes * 40);
+        let agg1_buf = self.storage_buf(total_nodes * 64);
+        let agg2_buf = self.storage_buf(total_nodes * 64);
 
-        // Layer 4
-        let agg3 = Self::cpu_aggregate(&h3, 128, total_nodes, &edges);
-        let h4 = self.gnn_layer_gpu(&h3, &agg3, total_nodes, 128, 128,
-            &self.w_self4, &self.b_self4, &self.w_neigh4, &self.b_neigh4, true);
+        let ys_buf = self.storage_buf(total_nodes * 64);
+        let yn_buf = self.storage_buf(total_nodes * 64);
 
-        // Layer 5
-        let agg4 = Self::cpu_aggregate(&h4, 128, total_nodes, &edges);
-        let h5 = self.gnn_layer_gpu(&h4, &agg4, total_nodes, 128, 128,
-            &self.w_self5, &self.b_self5, &self.w_neigh5, &self.b_neigh5, true);
+        // ===== 3 LAYERS GNN VỚI CSR AGGREGATION $O(\text{Deg}(u))$ TRÊN GPU =====
+        let mut enc = self.device.create_command_encoder(&Default::default());
 
-        // Layer 6
-        let agg5 = Self::cpu_aggregate(&h5, 128, total_nodes, &edges);
-        let h6 = self.gnn_layer_gpu(&h5, &agg5, total_nodes, 128, 128,
-            &self.w_self6, &self.b_self6, &self.w_neigh6, &self.b_neigh6, true);
+        macro_rules! pipeline_layer {
+            ($h_in:expr, $agg:expr, $h_out:expr, $dim_in:expr, $w_s:expr, $b_s:expr, $w_n:expr, $b_n:expr, $res:expr) => {
+                self.dispatch_agg_csr(&mut enc, $h_in, &offsets_buf, &targets_buf, $agg, total_nodes, $dim_in);
+                self.dispatch_gemm(&mut enc, $h_in, $w_s, $b_s, &ys_buf, total_nodes, $dim_in, 64, false);
+                self.dispatch_gemm(&mut enc, $agg,  $w_n, $b_n, &yn_buf, total_nodes, $dim_in, 64, false);
+                self.dispatch_combine(&mut enc, &ys_buf, &yn_buf, $h_in, $h_out, total_nodes, 64, $res);
+            };
+        }
 
-        // ===== 4. Gather Action Inputs [total_actions, 144] =====
-        let mut act_in = vec![0.0f32; total_actions * 144];
+        pipeline_layer!(&h0_buf, &agg0_buf, &h1_buf, 40, &self.w_self1, &self.b_self1, &self.w_neigh1, &self.b_neigh1, false);
+        pipeline_layer!(&h1_buf, &agg1_buf, &h2_buf, 64, &self.w_self2, &self.b_self2, &self.w_neigh2, &self.b_neigh2, true);
+        pipeline_layer!(&h2_buf, &agg2_buf, &h3_buf, 64, &self.w_self3, &self.b_self3, &self.w_neigh3, &self.b_neigh3, true);
+
+        // Single submit & readback cho 3 GNN layers
+        self.queue.submit(Some(enc.finish()));
+        let h3 = self.readback(&h3_buf, total_nodes * 64);
+
+        // ===== Build Action Head & Value Head Inputs trên CPU =====
+        let mut act_in = vec![0.0f32; total_actions * 80];
         let mut g_act = 0usize;
         for (i, obs) in observations.iter().enumerate() {
             let off = node_offsets[i];
             let n = obs.node_features.len();
             for (a_idx, act) in obs.valid_actions.iter().enumerate() {
-                // Tìm node embedding tương ứng với action position
                 let pos = obs.node_positions.iter().position(|&p| p == (act.q, act.r)).unwrap_or(0);
                 let u = off + pos.min(n.saturating_sub(1));
-                act_in[g_act * 144..g_act * 144 + 128].copy_from_slice(&h6[u * 128..(u + 1) * 128]);
+                act_in[g_act * 80..g_act * 80 + 64].copy_from_slice(&h3[u * 64..(u + 1) * 64]);
                 if a_idx < obs.action_features.len() {
-                    act_in[g_act * 144 + 128..(g_act + 1) * 144].copy_from_slice(&obs.action_features[a_idx]);
+                    act_in[g_act * 80 + 64..(g_act + 1) * 80].copy_from_slice(&obs.action_features[a_idx]);
                 }
                 g_act += 1;
             }
         }
 
-        // ===== 5. Value Head Input: Mean Pool h6 per graph [batch, 128] =====
-        let mut val_in = vec![0.0f32; batch * 128];
+        let mut val_in = vec![0.0f32; batch * 64];
         for (i, obs) in observations.iter().enumerate() {
             let off = node_offsets[i];
             let n = obs.node_features.len();
             if n > 0 {
                 let inv = 1.0 / n as f32;
                 for u in 0..n {
-                    for d in 0..128 {
-                        val_in[i * 128 + d] += h6[(off + u) * 128 + d] * inv;
+                    for d in 0..64 {
+                        val_in[i * 64 + d] += h3[(off + u) * 64 + d] * inv;
                     }
                 }
             }
         }
 
-        // ===== 6. Action Head + Value Head Layer 1 (song song trên GPU) =====
-        let act_in_buf = self.input_buf(&act_in);
-        let val_in_buf = self.input_buf(&val_in);
-        let (act_h, val_h) = self.two_gemm_readback(
-            &act_in_buf, &self.w_act1, &self.b_act1, total_actions, 144, 128,
-            &val_in_buf, &self.w_val1, &self.b_val1, batch,         128, 128,
-            true, true,
-        );
+        // ===== GEMM cho Action Head & Value Head =====
+        let act_in_buf = self.init_storage_buf(&act_in);
+        let val_in_buf = self.init_storage_buf(&val_in);
+        let act_h_buf  = self.storage_buf(total_actions * 64);
+        let val_h_buf  = self.storage_buf(batch * 64);
+        let act_o_buf  = self.storage_buf(total_actions);
+        let val_o_buf  = self.storage_buf(batch);
 
-        // ===== 7. Action Head + Value Head Layer 2 (song song trên GPU) =====
-        let act_h_buf = self.input_buf(&act_h);
-        let val_h_buf = self.input_buf(&val_h);
-        let (act_logits, val_raw) = self.two_gemm_readback(
-            &act_h_buf, &self.w_act2, &self.b_act2, total_actions, 128, 1,
-            &val_h_buf, &self.w_val2, &self.b_val2, batch,         128, 1,
-            false, false,
-        );
+        let mut enc_heads = self.device.create_command_encoder(&Default::default());
+        self.dispatch_gemm(&mut enc_heads, &act_in_buf, &self.w_act1, &self.b_act1, &act_h_buf, total_actions, 80, 64, true);
+        self.dispatch_gemm(&mut enc_heads, &val_in_buf, &self.w_val1, &self.b_val1, &val_h_buf, batch,         64, 64, true);
+        self.dispatch_gemm(&mut enc_heads, &act_h_buf,  &self.w_act2, &self.b_act2, &act_o_buf, total_actions, 64, 1,  false);
+        self.dispatch_gemm(&mut enc_heads, &val_h_buf,  &self.w_val2, &self.b_val2, &val_o_buf, batch,         64, 1,  false);
+        self.queue.submit(Some(enc_heads.finish()));
 
-        // ===== 8. Tách kết quả theo từng graph =====
+        let all_logits = self.readback(&act_o_buf, total_actions);
+        let all_vals   = self.readback(&val_o_buf, batch);
+
         let mut results = Vec::with_capacity(batch);
         for (i, obs) in observations.iter().enumerate() {
             let a_start = action_offsets[i];
             let a_count = obs.valid_actions.len();
-            let logits = act_logits[a_start..a_start + a_count].to_vec();
-            let value = val_raw[i];
+            let logits = all_logits[a_start..a_start + a_count].to_vec();
+            let value = all_vals[i];
             results.push((logits, value));
         }
+
         results
-    }
-
-    /// Legacy: forward đơn lẻ (tương thích ngược)
-    pub fn gpu_linear_forward(
-        &self,
-        input: &[f32],
-        batch_size: usize,
-        in_features: usize,
-        out_features: usize,
-        weight: &[f32],
-        bias: &[f32],
-        add_relu: bool,
-    ) -> Vec<f32> {
-        let x_buf = self.input_buf(input);
-        let w_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None, contents: bytemuck::cast_slice(weight),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let b_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None, contents: bytemuck::cast_slice(bias),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let out_n = batch_size * out_features;
-        let y_buf = self.output_buf(out_n);
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: None, size: (out_n * 4) as u64,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let mut enc = self.device.create_command_encoder(&Default::default());
-        self.dispatch_gemm(&mut enc, &x_buf, &w_buf, &b_buf, &y_buf, batch_size, in_features, out_features, add_relu);
-        enc.copy_buffer_to_buffer(&y_buf, 0, &staging, 0, (out_n * 4) as u64);
-        self.queue.submit(Some(enc.finish()));
-
-        let slice = staging.slice(..);
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-        self.device.poll(wgpu::Maintain::Wait);
-        let _ = rx.recv();
-        let data = slice.get_mapped_range();
-        bytemuck::cast_slice(&data).to_vec()
     }
 }

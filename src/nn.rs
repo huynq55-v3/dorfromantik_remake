@@ -1,8 +1,10 @@
 use rand::Rng;
-use rayon::prelude::*;
+use std::fs::File;
+use std::io::{Read, Write};
+use serde::{Serialize, Deserialize};
 
 /// Trọng số Ma trận Linear Layer trong Rust cùng với Adam Optimizer Moments (m, v)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Linear {
     pub in_features: usize,
     pub out_features: usize,
@@ -53,40 +55,22 @@ impl Linear {
         }
     }
 
-    /// Linear Forward: Y = X * W^T + b (Đa luồng song song cực nhanh qua Rayon SIMD)
+    /// Linear Forward: Y = X * W^T + b
     pub fn forward(&self, input: &[f32], input_len: usize) -> Vec<f32> {
         let batch_size = input_len / self.in_features;
         let mut output = vec![0.0f32; batch_size * self.out_features];
 
-        if batch_size >= 4 {
-            output.par_chunks_mut(self.out_features)
-                .enumerate()
-                .for_each(|(b, out_slice)| {
-                    let in_offset = b * self.in_features;
-                    let in_slice = &input[in_offset..in_offset + self.in_features];
-                    for o in 0..self.out_features {
-                        let mut sum = self.bias[o];
-                        let w_offset = o * self.in_features;
-                        let w_slice = &self.weight[w_offset..w_offset + self.in_features];
-                        for i in 0..self.in_features {
-                            sum += in_slice[i] * w_slice[i];
-                        }
-                        out_slice[o] = sum;
-                    }
-                });
-        } else {
-            for b in 0..batch_size {
-                let in_offset = b * self.in_features;
-                let out_offset = b * self.out_features;
+        for b in 0..batch_size {
+            let in_offset = b * self.in_features;
+            let out_offset = b * self.out_features;
 
-                for o in 0..self.out_features {
-                    let mut sum = self.bias[o];
-                    let w_offset = o * self.in_features;
-                    for i in 0..self.in_features {
-                        sum += input[in_offset + i] * self.weight[w_offset + i];
-                    }
-                    output[out_offset + o] = sum;
+            for o in 0..self.out_features {
+                let mut sum = self.bias[o];
+                let w_offset = o * self.in_features;
+                for i in 0..self.in_features {
+                    sum += input[in_offset + i] * self.weight[w_offset + i];
                 }
+                output[out_offset + o] = sum;
             }
         }
         output
@@ -169,30 +153,24 @@ impl Linear {
     }
 }
 
-/// Mạng 6-Hop Residual Graph Neural Network V2 (Hidden Dim = 128) kết hợp Action & Value Head
-#[derive(Debug, Clone)]
+/// Mạng 3-Hop Residual Graph Neural Network V1 (Hidden Dim = 64) kết hợp Action & Value Head
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HexGNNModel {
-    // 6 GNN Layers (Backbone)
-    pub w_self1: Linear,     // 40 -> 128
-    pub w_neigh1: Linear,    // 40 -> 128
-    pub w_self2: Linear,     // 128 -> 128
-    pub w_neigh2: Linear,    // 128 -> 128
-    pub w_self3: Linear,     // 128 -> 128
-    pub w_neigh3: Linear,    // 128 -> 128
-    pub w_self4: Linear,     // 128 -> 128
-    pub w_neigh4: Linear,    // 128 -> 128
-    pub w_self5: Linear,     // 128 -> 128
-    pub w_neigh5: Linear,    // 128 -> 128
-    pub w_self6: Linear,     // 128 -> 128
-    pub w_neigh6: Linear,    // 128 -> 128
+    // 3 GNN Layers (Backbone, Hidden Dim = 64)
+    pub w_self1: Linear,     // 40 -> 64
+    pub w_neigh1: Linear,    // 40 -> 64
+    pub w_self2: Linear,     // 64 -> 64
+    pub w_neigh2: Linear,    // 64 -> 64
+    pub w_self3: Linear,     // 64 -> 64
+    pub w_neigh3: Linear,    // 64 -> 64
 
-    // Action Scoring MLP Head: [h(u) (128) + action_feature (16)] = 144 -> 128 -> 1
-    pub w_act1: Linear,      // 144 -> 128
-    pub w_act2: Linear,      // 128 -> 1
+    // Action Scoring MLP Head: [h(u) (64) + action_feature (16)] = 80 -> 64 -> 1
+    pub w_act1: Linear,      // 80 -> 64
+    pub w_act2: Linear,      // 64 -> 1
 
-    // Value Head: mean_h (128) -> 128 -> 1
-    pub w_val1: Linear,      // 128 -> 128
-    pub w_val2: Linear,      // 128 -> 1
+    // Value Head: mean_h (64) -> 64 -> 1
+    pub w_val1: Linear,      // 64 -> 64
+    pub w_val2: Linear,      // 64 -> 1
 
     pub step_count: usize,
 }
@@ -200,44 +178,32 @@ pub struct HexGNNModel {
 impl HexGNNModel {
     pub fn new() -> Self {
         Self {
-            w_self1: Linear::new(40, 128),
-            w_neigh1: Linear::new(40, 128),
-            w_self2: Linear::new(128, 128),
-            w_neigh2: Linear::new(128, 128),
-            w_self3: Linear::new(128, 128),
-            w_neigh3: Linear::new(128, 128),
-            w_self4: Linear::new(128, 128),
-            w_neigh4: Linear::new(128, 128),
-            w_self5: Linear::new(128, 128),
-            w_neigh5: Linear::new(128, 128),
-            w_self6: Linear::new(128, 128),
-            w_neigh6: Linear::new(128, 128),
-            w_act1: Linear::new(144, 128),
-            w_act2: Linear::new(128, 1),
-            w_val1: Linear::new(128, 128),
-            w_val2: Linear::new(128, 1),
+            w_self1: Linear::new(40, 64),
+            w_neigh1: Linear::new(40, 64),
+            w_self2: Linear::new(64, 64),
+            w_neigh2: Linear::new(64, 64),
+            w_self3: Linear::new(64, 64),
+            w_neigh3: Linear::new(64, 64),
+            w_act1: Linear::new(80, 64),
+            w_act2: Linear::new(64, 1),
+            w_val1: Linear::new(64, 64),
+            w_val2: Linear::new(64, 1),
             step_count: 0,
         }
     }
 
     pub fn new_zero() -> Self {
         Self {
-            w_self1: Linear::new_zero(40, 128),
-            w_neigh1: Linear::new_zero(40, 128),
-            w_self2: Linear::new_zero(128, 128),
-            w_neigh2: Linear::new_zero(128, 128),
-            w_self3: Linear::new_zero(128, 128),
-            w_neigh3: Linear::new_zero(128, 128),
-            w_self4: Linear::new_zero(128, 128),
-            w_neigh4: Linear::new_zero(128, 128),
-            w_self5: Linear::new_zero(128, 128),
-            w_neigh5: Linear::new_zero(128, 128),
-            w_self6: Linear::new_zero(128, 128),
-            w_neigh6: Linear::new_zero(128, 128),
-            w_act1: Linear::new_zero(144, 128),
-            w_act2: Linear::new_zero(128, 1),
-            w_val1: Linear::new_zero(128, 128),
-            w_val2: Linear::new_zero(128, 1),
+            w_self1: Linear::new_zero(40, 64),
+            w_neigh1: Linear::new_zero(40, 64),
+            w_self2: Linear::new_zero(64, 64),
+            w_neigh2: Linear::new_zero(64, 64),
+            w_self3: Linear::new_zero(64, 64),
+            w_neigh3: Linear::new_zero(64, 64),
+            w_act1: Linear::new_zero(80, 64),
+            w_act2: Linear::new_zero(64, 1),
+            w_val1: Linear::new_zero(64, 64),
+            w_val2: Linear::new_zero(64, 1),
             step_count: 0,
         }
     }
@@ -254,12 +220,6 @@ impl HexGNNModel {
         scale(&mut self.w_neigh2.weight); scale(&mut self.w_neigh2.bias);
         scale(&mut self.w_self3.weight); scale(&mut self.w_self3.bias);
         scale(&mut self.w_neigh3.weight); scale(&mut self.w_neigh3.bias);
-        scale(&mut self.w_self4.weight); scale(&mut self.w_self4.bias);
-        scale(&mut self.w_neigh4.weight); scale(&mut self.w_neigh4.bias);
-        scale(&mut self.w_self5.weight); scale(&mut self.w_self5.bias);
-        scale(&mut self.w_neigh5.weight); scale(&mut self.w_neigh5.bias);
-        scale(&mut self.w_self6.weight); scale(&mut self.w_self6.bias);
-        scale(&mut self.w_neigh6.weight); scale(&mut self.w_neigh6.bias);
         scale(&mut self.w_act1.weight); scale(&mut self.w_act1.bias);
         scale(&mut self.w_act2.weight); scale(&mut self.w_act2.bias);
         scale(&mut self.w_val1.weight); scale(&mut self.w_val1.bias);
@@ -275,12 +235,6 @@ impl HexGNNModel {
         total_sq += sum_sq(&self.w_neigh2.weight) + sum_sq(&self.w_neigh2.bias);
         total_sq += sum_sq(&self.w_self3.weight) + sum_sq(&self.w_self3.bias);
         total_sq += sum_sq(&self.w_neigh3.weight) + sum_sq(&self.w_neigh3.bias);
-        total_sq += sum_sq(&self.w_self4.weight) + sum_sq(&self.w_self4.bias);
-        total_sq += sum_sq(&self.w_neigh4.weight) + sum_sq(&self.w_neigh4.bias);
-        total_sq += sum_sq(&self.w_self5.weight) + sum_sq(&self.w_self5.bias);
-        total_sq += sum_sq(&self.w_neigh5.weight) + sum_sq(&self.w_neigh5.bias);
-        total_sq += sum_sq(&self.w_self6.weight) + sum_sq(&self.w_self6.bias);
-        total_sq += sum_sq(&self.w_neigh6.weight) + sum_sq(&self.w_neigh6.bias);
         total_sq += sum_sq(&self.w_act1.weight) + sum_sq(&self.w_act1.bias);
         total_sq += sum_sq(&self.w_act2.weight) + sum_sq(&self.w_act2.bias);
         total_sq += sum_sq(&self.w_val1.weight) + sum_sq(&self.w_val1.bias);
@@ -305,12 +259,6 @@ impl HexGNNModel {
         add(&mut self.w_neigh2.weight, &other.w_neigh2.weight); add(&mut self.w_neigh2.bias, &other.w_neigh2.bias);
         add(&mut self.w_self3.weight, &other.w_self3.weight); add(&mut self.w_self3.bias, &other.w_self3.bias);
         add(&mut self.w_neigh3.weight, &other.w_neigh3.weight); add(&mut self.w_neigh3.bias, &other.w_neigh3.bias);
-        add(&mut self.w_self4.weight, &other.w_self4.weight); add(&mut self.w_self4.bias, &other.w_self4.bias);
-        add(&mut self.w_neigh4.weight, &other.w_neigh4.weight); add(&mut self.w_neigh4.bias, &other.w_neigh4.bias);
-        add(&mut self.w_self5.weight, &other.w_self5.weight); add(&mut self.w_self5.bias, &other.w_self5.bias);
-        add(&mut self.w_neigh5.weight, &other.w_neigh5.weight); add(&mut self.w_neigh5.bias, &other.w_neigh5.bias);
-        add(&mut self.w_self6.weight, &other.w_self6.weight); add(&mut self.w_self6.bias, &other.w_self6.bias);
-        add(&mut self.w_neigh6.weight, &other.w_neigh6.weight); add(&mut self.w_neigh6.bias, &other.w_neigh6.bias);
         add(&mut self.w_act1.weight, &other.w_act1.weight); add(&mut self.w_act1.bias, &other.w_act1.bias);
         add(&mut self.w_act2.weight, &other.w_act2.weight); add(&mut self.w_act2.bias, &other.w_act2.bias);
         add(&mut self.w_val1.weight, &other.w_val1.weight); add(&mut self.w_val1.bias, &other.w_val1.bias);
@@ -341,7 +289,7 @@ impl HexGNNModel {
         mean
     }
 
-    /// Forward pass trên Graph Observation (6 GNN Layers, 128 Dims)
+    /// Forward pass trên Graph Observation (3 GNN Layers, Hidden Dim = 64)
     pub fn forward(
         &self,
         node_positions: &[(i32, i32)],
@@ -356,7 +304,7 @@ impl HexGNNModel {
             return (vec![0.0; num_actions], 0.0);
         }
 
-        // Layer 1: 40 -> 128
+        // --- GNN LAYER 1: 40 -> 64 ---
         let mut x_flat = vec![0.0f32; n_nodes * 40];
         for u in 0..n_nodes {
             x_flat[u * 40..(u + 1) * 40].copy_from_slice(&node_features[u]);
@@ -364,109 +312,79 @@ impl HexGNNModel {
         let neigh1 = Self::aggregate_neighbors(&x_flat, 40, n_nodes, edge_index);
         let out_self1 = self.w_self1.forward(&x_flat, n_nodes * 40);
         let out_neigh1 = self.w_neigh1.forward(&neigh1, n_nodes * 40);
-        let mut h1 = vec![0.0f32; n_nodes * 128];
-        for i in 0..n_nodes * 128 {
+
+        let mut h1 = vec![0.0f32; n_nodes * 64];
+        for i in 0..n_nodes * 64 {
             let sum = out_self1[i] + out_neigh1[i];
             h1[i] = if sum > 0.0 { sum } else { 0.0 };
         }
 
-        // Layer 2: 128 -> 128
-        let neigh2 = Self::aggregate_neighbors(&h1, 128, n_nodes, edge_index);
-        let out_self2 = self.w_self2.forward(&h1, n_nodes * 128);
-        let out_neigh2 = self.w_neigh2.forward(&neigh2, n_nodes * 128);
-        let mut h2 = vec![0.0f32; n_nodes * 128];
-        for i in 0..n_nodes * 128 {
+        // --- GNN LAYER 2: 64 -> 64 (Residual) ---
+        let neigh2 = Self::aggregate_neighbors(&h1, 64, n_nodes, edge_index);
+        let out_self2 = self.w_self2.forward(&h1, n_nodes * 64);
+        let out_neigh2 = self.w_neigh2.forward(&neigh2, n_nodes * 64);
+
+        let mut h2 = vec![0.0f32; n_nodes * 64];
+        for i in 0..n_nodes * 64 {
             let sum = out_self2[i] + out_neigh2[i];
             let relu = if sum > 0.0 { sum } else { 0.0 };
             h2[i] = relu + h1[i];
         }
 
-        // Layer 3: 128 -> 128
-        let neigh3 = Self::aggregate_neighbors(&h2, 128, n_nodes, edge_index);
-        let out_self3 = self.w_self3.forward(&h2, n_nodes * 128);
-        let out_neigh3 = self.w_neigh3.forward(&neigh3, n_nodes * 128);
-        let mut h3 = vec![0.0f32; n_nodes * 128];
-        for i in 0..n_nodes * 128 {
+        // --- GNN LAYER 3: 64 -> 64 (Residual) ---
+        let neigh3 = Self::aggregate_neighbors(&h2, 64, n_nodes, edge_index);
+        let out_self3 = self.w_self3.forward(&h2, n_nodes * 64);
+        let out_neigh3 = self.w_neigh3.forward(&neigh3, n_nodes * 64);
+
+        let mut h3 = vec![0.0f32; n_nodes * 64];
+        for i in 0..n_nodes * 64 {
             let sum = out_self3[i] + out_neigh3[i];
             let relu = if sum > 0.0 { sum } else { 0.0 };
             h3[i] = relu + h2[i];
         }
 
-        // Layer 4: 128 -> 128
-        let neigh4 = Self::aggregate_neighbors(&h3, 128, n_nodes, edge_index);
-        let out_self4 = self.w_self4.forward(&h3, n_nodes * 128);
-        let out_neigh4 = self.w_neigh4.forward(&neigh4, n_nodes * 128);
-        let mut h4 = vec![0.0f32; n_nodes * 128];
-        for i in 0..n_nodes * 128 {
-            let sum = out_self4[i] + out_neigh4[i];
-            let relu = if sum > 0.0 { sum } else { 0.0 };
-            h4[i] = relu + h3[i];
-        }
-
-        // Layer 5: 128 -> 128
-        let neigh5 = Self::aggregate_neighbors(&h4, 128, n_nodes, edge_index);
-        let out_self5 = self.w_self5.forward(&h4, n_nodes * 128);
-        let out_neigh5 = self.w_neigh5.forward(&neigh5, n_nodes * 128);
-        let mut h5 = vec![0.0f32; n_nodes * 128];
-        for i in 0..n_nodes * 128 {
-            let sum = out_self5[i] + out_neigh5[i];
-            let relu = if sum > 0.0 { sum } else { 0.0 };
-            h5[i] = relu + h4[i];
-        }
-
-        // Layer 6: 128 -> 128
-        let neigh6 = Self::aggregate_neighbors(&h5, 128, n_nodes, edge_index);
-        let out_self6 = self.w_self6.forward(&h5, n_nodes * 128);
-        let out_neigh6 = self.w_neigh6.forward(&neigh6, n_nodes * 128);
-        let mut h6 = vec![0.0f32; n_nodes * 128];
-        for i in 0..n_nodes * 128 {
-            let sum = out_self6[i] + out_neigh6[i];
-            let relu = if sum > 0.0 { sum } else { 0.0 };
-            h6[i] = relu + h5[i];
-        }
-
-        // Action MLP Head: [h6(u) (128) + act_feat (16)] = 144 -> 128 -> 1
-        let mut act_in = vec![0.0f32; num_actions * 144];
+        // --- ACTION SCORING MLP HEAD: [h3(u) (64) + act_feat (16)] = 80 -> 64 -> 1 ---
+        let mut act_in = vec![0.0f32; num_actions * 80];
         for (a_idx, act) in valid_actions.iter().enumerate() {
             let pos_idx = node_positions.iter().position(|&p| p == (act.q, act.r)).unwrap_or(0);
             let u = pos_idx.min(n_nodes - 1);
-            act_in[a_idx * 144..a_idx * 144 + 128].copy_from_slice(&h6[u * 128..(u + 1) * 128]);
+            act_in[a_idx * 80..a_idx * 80 + 64].copy_from_slice(&h3[u * 64..(u + 1) * 64]);
             if a_idx < action_features.len() {
-                act_in[a_idx * 144 + 128..(a_idx + 1) * 144].copy_from_slice(&action_features[a_idx]);
+                act_in[a_idx * 80 + 64..(a_idx + 1) * 80].copy_from_slice(&action_features[a_idx]);
             }
         }
 
-        let act_hidden = self.w_act1.forward(&act_in, num_actions * 144);
-        let mut act_relu = vec![0.0f32; num_actions * 128];
-        for i in 0..num_actions * 128 {
+        let act_hidden = self.w_act1.forward(&act_in, num_actions * 80);
+        let mut act_relu = vec![0.0f32; num_actions * 64];
+        for i in 0..num_actions * 64 {
             act_relu[i] = if act_hidden[i] > 0.0 { act_hidden[i] } else { 0.0 };
         }
-        let action_logits = self.w_act2.forward(&act_relu, num_actions * 128);
+        let action_logits = self.w_act2.forward(&act_relu, num_actions * 64);
 
-        // Value Head: mean_h6 (128) -> 128 -> 1
-        let mut mean_h6 = vec![0.0f32; 128];
+        // --- VALUE HEAD: mean_h3 (64) -> 64 -> 1 ---
+        let mut mean_h3 = vec![0.0f32; 64];
         for u in 0..n_nodes {
-            for i in 0..128 {
-                mean_h6[i] += h6[u * 128 + i];
+            for i in 0..64 {
+                mean_h3[i] += h3[u * 64 + i];
             }
         }
         let inv_n = 1.0 / n_nodes as f32;
-        for i in 0..128 {
-            mean_h6[i] *= inv_n;
+        for i in 0..64 {
+            mean_h3[i] *= inv_n;
         }
 
-        let val_hidden = self.w_val1.forward(&mean_h6, 128);
-        let mut val_relu = vec![0.0f32; 128];
-        for i in 0..128 {
+        let val_hidden = self.w_val1.forward(&mean_h3, 64);
+        let mut val_relu = vec![0.0f32; 64];
+        for i in 0..64 {
             val_relu[i] = if val_hidden[i] > 0.0 { val_hidden[i] } else { 0.0 };
         }
-        let val_out = self.w_val2.forward(&val_relu, 128);
+        let val_out = self.w_val2.forward(&val_relu, 64);
         let state_value = val_out[0];
 
         (action_logits, state_value)
     }
 
-    /// Forward Batch trên danh sách các GraphObservation (Disjoint Graph Batching V2)
+    /// Forward Batch trên danh sách các GraphObservation (Disjoint Graph Batching V1)
     pub fn forward_batch(
         &self,
         observations: &[&crate::env::GraphObservation],
@@ -517,130 +435,94 @@ impl HexGNNModel {
             }
         }
 
-        // Layer 1: 40 -> 128
+        // Layer 1: 40 -> 64
         let neigh1 = Self::aggregate_neighbors(&x_flat, 40, total_nodes, &combined_edges);
         let out_self1 = self.w_self1.forward(&x_flat, total_nodes * 40);
         let out_neigh1 = self.w_neigh1.forward(&neigh1, total_nodes * 40);
-        let mut h1 = vec![0.0f32; total_nodes * 128];
-        for i in 0..total_nodes * 128 {
+        let mut h1 = vec![0.0f32; total_nodes * 64];
+        for i in 0..total_nodes * 64 {
             let sum = out_self1[i] + out_neigh1[i];
             h1[i] = if sum > 0.0 { sum } else { 0.0 };
         }
 
-        // Layer 2: 128 -> 128
-        let neigh2 = Self::aggregate_neighbors(&h1, 128, total_nodes, &combined_edges);
-        let out_self2 = self.w_self2.forward(&h1, total_nodes * 128);
-        let out_neigh2 = self.w_neigh2.forward(&neigh2, total_nodes * 128);
-        let mut h2 = vec![0.0f32; total_nodes * 128];
-        for i in 0..total_nodes * 128 {
+        // Layer 2: 64 -> 64 (Residual)
+        let neigh2 = Self::aggregate_neighbors(&h1, 64, total_nodes, &combined_edges);
+        let out_self2 = self.w_self2.forward(&h1, total_nodes * 64);
+        let out_neigh2 = self.w_neigh2.forward(&neigh2, total_nodes * 64);
+        let mut h2 = vec![0.0f32; total_nodes * 64];
+        for i in 0..total_nodes * 64 {
             let sum = out_self2[i] + out_neigh2[i];
             let relu = if sum > 0.0 { sum } else { 0.0 };
             h2[i] = relu + h1[i];
         }
 
-        // Layer 3: 128 -> 128
-        let neigh3 = Self::aggregate_neighbors(&h2, 128, total_nodes, &combined_edges);
-        let out_self3 = self.w_self3.forward(&h2, total_nodes * 128);
-        let out_neigh3 = self.w_neigh3.forward(&neigh3, total_nodes * 128);
-        let mut h3 = vec![0.0f32; total_nodes * 128];
-        for i in 0..total_nodes * 128 {
+        // Layer 3: 64 -> 64 (Residual)
+        let neigh3 = Self::aggregate_neighbors(&h2, 64, total_nodes, &combined_edges);
+        let out_self3 = self.w_self3.forward(&h2, total_nodes * 64);
+        let out_neigh3 = self.w_neigh3.forward(&neigh3, total_nodes * 64);
+        let mut h3 = vec![0.0f32; total_nodes * 64];
+        for i in 0..total_nodes * 64 {
             let sum = out_self3[i] + out_neigh3[i];
             let relu = if sum > 0.0 { sum } else { 0.0 };
             h3[i] = relu + h2[i];
         }
 
-        // Layer 4: 128 -> 128
-        let neigh4 = Self::aggregate_neighbors(&h3, 128, total_nodes, &combined_edges);
-        let out_self4 = self.w_self4.forward(&h3, total_nodes * 128);
-        let out_neigh4 = self.w_neigh4.forward(&neigh4, total_nodes * 128);
-        let mut h4 = vec![0.0f32; total_nodes * 128];
-        for i in 0..total_nodes * 128 {
-            let sum = out_self4[i] + out_neigh4[i];
-            let relu = if sum > 0.0 { sum } else { 0.0 };
-            h4[i] = relu + h3[i];
-        }
-
-        // Layer 5: 128 -> 128
-        let neigh5 = Self::aggregate_neighbors(&h4, 128, total_nodes, &combined_edges);
-        let out_self5 = self.w_self5.forward(&h4, total_nodes * 128);
-        let out_neigh5 = self.w_neigh5.forward(&neigh5, total_nodes * 128);
-        let mut h5 = vec![0.0f32; total_nodes * 128];
-        for i in 0..total_nodes * 128 {
-            let sum = out_self5[i] + out_neigh5[i];
-            let relu = if sum > 0.0 { sum } else { 0.0 };
-            h5[i] = relu + h4[i];
-        }
-
-        // Layer 6: 128 -> 128
-        let neigh6 = Self::aggregate_neighbors(&h5, 128, total_nodes, &combined_edges);
-        let out_self6 = self.w_self6.forward(&h5, total_nodes * 128);
-        let out_neigh6 = self.w_neigh6.forward(&neigh6, total_nodes * 128);
-        let mut h6 = vec![0.0f32; total_nodes * 128];
-        for i in 0..total_nodes * 128 {
-            let sum = out_self6[i] + out_neigh6[i];
-            let relu = if sum > 0.0 { sum } else { 0.0 };
-            h6[i] = relu + h5[i];
-        }
-
-        // Action MLP Head: 144 -> 128 -> 1
-        let mut act_in = vec![0.0f32; total_actions * 144];
+        // Flatten Action Features & Node Embeddings: [h3(u) (64) + act_feat (16)] = 80
+        let mut act_in = vec![0.0f32; total_actions * 80];
         let mut global_act_idx = 0usize;
 
         for (i, obs) in observations.iter().enumerate() {
             let offset = node_offsets[i];
             let n_nodes = obs.node_features.len();
+
             for (a_idx, act) in obs.valid_actions.iter().enumerate() {
                 let pos_idx = obs.node_positions.iter().position(|&p| p == (act.q, act.r)).unwrap_or(0);
                 let u = offset + pos_idx.min(n_nodes.saturating_sub(1));
 
-                act_in[global_act_idx * 144..global_act_idx * 144 + 128].copy_from_slice(&h6[u * 128..(u + 1) * 128]);
+                act_in[global_act_idx * 80..global_act_idx * 80 + 64].copy_from_slice(&h3[u * 64..(u + 1) * 64]);
                 if a_idx < obs.action_features.len() {
-                    act_in[global_act_idx * 144 + 128..(global_act_idx + 1) * 144].copy_from_slice(&obs.action_features[a_idx]);
+                    act_in[global_act_idx * 80 + 64..(global_act_idx + 1) * 80].copy_from_slice(&obs.action_features[a_idx]);
                 }
                 global_act_idx += 1;
             }
         }
 
-        let act_hidden = self.w_act1.forward(&act_in, total_actions * 144);
-        let mut act_relu = vec![0.0f32; total_actions * 128];
-        for i in 0..total_actions * 128 {
+        let act_hidden = self.w_act1.forward(&act_in, total_actions * 80);
+        let mut act_relu = vec![0.0f32; total_actions * 64];
+        for i in 0..total_actions * 64 {
             act_relu[i] = if act_hidden[i] > 0.0 { act_hidden[i] } else { 0.0 };
         }
-        let all_action_logits = self.w_act2.forward(&act_relu, total_actions * 128);
+        let all_action_logits = self.w_act2.forward(&act_relu, total_actions * 64);
 
-        // Value Head
-        let mut mean_h6_batch = vec![0.0f32; b_count * 128];
+        // Value Head for each Graph
+        let mut mean_h3_batch = vec![0.0f32; b_count * 64];
         for (i, obs) in observations.iter().enumerate() {
             let offset = node_offsets[i];
             let n_nodes = obs.node_features.len();
             if n_nodes > 0 {
-                let mut sum_h = [0.0f32; 128];
-                for u in 0..n_nodes {
-                    for d in 0..128 {
-                        sum_h[d] += h6[(offset + u) * 128 + d];
-                    }
-                }
                 let inv_n = 1.0 / n_nodes as f32;
-                for d in 0..128 {
-                    mean_h6_batch[i * 128 + d] = sum_h[d] * inv_n;
+                for u in 0..n_nodes {
+                    for d in 0..64 {
+                        mean_h3_batch[i * 64 + d] += h3[(offset + u) * 64 + d] * inv_n;
+                    }
                 }
             }
         }
 
-        let val_hidden = self.w_val1.forward(&mean_h6_batch, b_count * 128);
-        let mut val_relu = vec![0.0f32; b_count * 128];
-        for i in 0..b_count * 128 {
+        let val_hidden = self.w_val1.forward(&mean_h3_batch, b_count * 64);
+        let mut val_relu = vec![0.0f32; b_count * 64];
+        for i in 0..b_count * 64 {
             val_relu[i] = if val_hidden[i] > 0.0 { val_hidden[i] } else { 0.0 };
         }
-        let all_values = self.w_val2.forward(&val_relu, b_count * 128);
+        let all_values = self.w_val2.forward(&val_relu, b_count * 64);
 
         let mut results = Vec::with_capacity(b_count);
         for (i, obs) in observations.iter().enumerate() {
-            let act_start = action_offsets[i];
-            let act_count = obs.valid_actions.len();
-            let logits = all_action_logits[act_start..act_start + act_count].to_vec();
-            let val = all_values[i];
-            results.push((logits, val));
+            let a_start = action_offsets[i];
+            let a_count = obs.valid_actions.len();
+            let logits = all_action_logits[a_start..a_start + a_count].to_vec();
+            let value = all_values[i];
+            results.push((logits, value));
         }
 
         results
@@ -681,7 +563,7 @@ impl HexGNNModel {
         (log_prob, state_value, entropy)
     }
 
-    /// Backpropagation: Tính đạo hàm giải tích chính xác qua toàn bộ 6 Layers GNN + Action Scoring MLP Head (PPO)
+    /// Backpropagation: Tính đạo hàm giải tích chính xác qua toàn bộ 3 Layers GNN (PPO)
     pub fn backward_accumulate(
         &self,
         node_positions: &[(i32, i32)],
@@ -761,7 +643,7 @@ impl HexGNNModel {
         );
     }
 
-    /// Backpropagation cốt lõi nhận vector d_logits và value_grad (6 Layers, 128 Dims)
+    /// Backpropagation cốt lõi nhận vector d_logits và value_grad (3 Layers GNN)
     pub fn backward_accumulate_with_d_logits(
         &self,
         node_positions: &[(i32, i32)],
@@ -779,7 +661,8 @@ impl HexGNNModel {
             return;
         }
 
-        // Forward Pass Tracing cho 6 Layers 128 Dims
+        // ================= FORWARD PASS TRACING =================
+        // GNN 1
         let mut x_flat = vec![0.0f32; n_nodes * 40];
         for u in 0..n_nodes {
             x_flat[u * 40..(u + 1) * 40].copy_from_slice(&node_features[u]);
@@ -787,333 +670,219 @@ impl HexGNNModel {
         let neigh1 = Self::aggregate_neighbors(&x_flat, 40, n_nodes, edge_index);
         let out_self1 = self.w_self1.forward(&x_flat, n_nodes * 40);
         let out_neigh1 = self.w_neigh1.forward(&neigh1, n_nodes * 40);
-        let mut h1_pre = vec![0.0f32; n_nodes * 128];
-        let mut h1 = vec![0.0f32; n_nodes * 128];
-        for i in 0..n_nodes * 128 {
+        let mut h1_pre = vec![0.0f32; n_nodes * 64];
+        let mut h1 = vec![0.0f32; n_nodes * 64];
+        for i in 0..n_nodes * 64 {
             let sum = out_self1[i] + out_neigh1[i];
             h1_pre[i] = sum;
             h1[i] = if sum > 0.0 { sum } else { 0.0 };
         }
 
-        let neigh2 = Self::aggregate_neighbors(&h1, 128, n_nodes, edge_index);
-        let out_self2 = self.w_self2.forward(&h1, n_nodes * 128);
-        let out_neigh2 = self.w_neigh2.forward(&neigh2, n_nodes * 128);
-        let mut h2_pre = vec![0.0f32; n_nodes * 128];
-        let mut h2 = vec![0.0f32; n_nodes * 128];
-        for i in 0..n_nodes * 128 {
+        // GNN 2
+        let neigh2 = Self::aggregate_neighbors(&h1, 64, n_nodes, edge_index);
+        let out_self2 = self.w_self2.forward(&h1, n_nodes * 64);
+        let out_neigh2 = self.w_neigh2.forward(&neigh2, n_nodes * 64);
+        let mut h2_pre = vec![0.0f32; n_nodes * 64];
+        let mut h2 = vec![0.0f32; n_nodes * 64];
+        for i in 0..n_nodes * 64 {
             let sum = out_self2[i] + out_neigh2[i];
             h2_pre[i] = sum;
             let relu = if sum > 0.0 { sum } else { 0.0 };
             h2[i] = relu + h1[i];
         }
 
-        let neigh3 = Self::aggregate_neighbors(&h2, 128, n_nodes, edge_index);
-        let out_self3 = self.w_self3.forward(&h2, n_nodes * 128);
-        let out_neigh3 = self.w_neigh3.forward(&neigh3, n_nodes * 128);
-        let mut h3_pre = vec![0.0f32; n_nodes * 128];
-        let mut h3 = vec![0.0f32; n_nodes * 128];
-        for i in 0..n_nodes * 128 {
+        // GNN 3
+        let neigh3 = Self::aggregate_neighbors(&h2, 64, n_nodes, edge_index);
+        let out_self3 = self.w_self3.forward(&h2, n_nodes * 64);
+        let out_neigh3 = self.w_neigh3.forward(&neigh3, n_nodes * 64);
+        let mut h3_pre = vec![0.0f32; n_nodes * 64];
+        let mut h3 = vec![0.0f32; n_nodes * 64];
+        for i in 0..n_nodes * 64 {
             let sum = out_self3[i] + out_neigh3[i];
             h3_pre[i] = sum;
             let relu = if sum > 0.0 { sum } else { 0.0 };
             h3[i] = relu + h2[i];
         }
 
-        let neigh4 = Self::aggregate_neighbors(&h3, 128, n_nodes, edge_index);
-        let out_self4 = self.w_self4.forward(&h3, n_nodes * 128);
-        let out_neigh4 = self.w_neigh4.forward(&neigh4, n_nodes * 128);
-        let mut h4_pre = vec![0.0f32; n_nodes * 128];
-        let mut h4 = vec![0.0f32; n_nodes * 128];
-        for i in 0..n_nodes * 128 {
-            let sum = out_self4[i] + out_neigh4[i];
-            h4_pre[i] = sum;
-            let relu = if sum > 0.0 { sum } else { 0.0 };
-            h4[i] = relu + h3[i];
-        }
-
-        let neigh5 = Self::aggregate_neighbors(&h4, 128, n_nodes, edge_index);
-        let out_self5 = self.w_self5.forward(&h4, n_nodes * 128);
-        let out_neigh5 = self.w_neigh5.forward(&neigh5, n_nodes * 128);
-        let mut h5_pre = vec![0.0f32; n_nodes * 128];
-        let mut h5 = vec![0.0f32; n_nodes * 128];
-        for i in 0..n_nodes * 128 {
-            let sum = out_self5[i] + out_neigh5[i];
-            h5_pre[i] = sum;
-            let relu = if sum > 0.0 { sum } else { 0.0 };
-            h5[i] = relu + h4[i];
-        }
-
-        let neigh6 = Self::aggregate_neighbors(&h5, 128, n_nodes, edge_index);
-        let out_self6 = self.w_self6.forward(&h5, n_nodes * 128);
-        let out_neigh6 = self.w_neigh6.forward(&neigh6, n_nodes * 128);
-        let mut h6_pre = vec![0.0f32; n_nodes * 128];
-        let mut h6 = vec![0.0f32; n_nodes * 128];
-        for i in 0..n_nodes * 128 {
-            let sum = out_self6[i] + out_neigh6[i];
-            h6_pre[i] = sum;
-            let relu = if sum > 0.0 { sum } else { 0.0 };
-            h6[i] = relu + h5[i];
-        }
-
-        // Action Head
-        let mut act_in = vec![0.0f32; num_actions * 144];
+        // Action MLP Forward
+        let mut act_in = vec![0.0f32; num_actions * 80];
         let mut act_node_idx = Vec::with_capacity(num_actions);
         for (a_idx, act) in valid_actions.iter().enumerate() {
             let pos_idx = node_positions.iter().position(|&p| p == (act.q, act.r)).unwrap_or(0);
             let u = pos_idx.min(n_nodes - 1);
             act_node_idx.push(u);
 
-            act_in[a_idx * 144..a_idx * 144 + 128].copy_from_slice(&h6[u * 128..(u + 1) * 128]);
+            act_in[a_idx * 80..a_idx * 80 + 64].copy_from_slice(&h3[u * 64..(u + 1) * 64]);
             if a_idx < action_features.len() {
-                act_in[a_idx * 144 + 128..(a_idx + 1) * 144].copy_from_slice(&action_features[a_idx]);
+                act_in[a_idx * 80 + 64..(a_idx + 1) * 80].copy_from_slice(&action_features[a_idx]);
             }
         }
-        let act_hidden = self.w_act1.forward(&act_in, num_actions * 144);
-        let mut act_relu = vec![0.0f32; num_actions * 128];
-        for i in 0..num_actions * 128 {
+        let act_hidden = self.w_act1.forward(&act_in, num_actions * 80);
+        let mut act_relu = vec![0.0f32; num_actions * 64];
+        for i in 0..num_actions * 64 {
             act_relu[i] = if act_hidden[i] > 0.0 { act_hidden[i] } else { 0.0 };
         }
+        let _action_logits = self.w_act2.forward(&act_relu, num_actions * 64);
 
-        // Value Head
-        let mut mean_h6 = vec![0.0f32; 128];
+        // Value Forward
+        let mut mean_h3 = vec![0.0f32; 64];
         for u in 0..n_nodes {
-            for i in 0..128 {
-                mean_h6[i] += h6[u * 128 + i];
+            for i in 0..64 {
+                mean_h3[i] += h3[u * 64 + i];
             }
         }
-        for i in 0..128 {
-            mean_h6[i] /= n_nodes as f32;
+        for i in 0..64 {
+            mean_h3[i] /= n_nodes as f32;
         }
-        let val_hidden = self.w_val1.forward(&mean_h6, 128);
-        let mut val_relu = vec![0.0f32; 128];
-        for i in 0..128 {
+        let val_hidden = self.w_val1.forward(&mean_h3, 64);
+        let mut val_relu = vec![0.0f32; 64];
+        for i in 0..64 {
             val_relu[i] = if val_hidden[i] > 0.0 { val_hidden[i] } else { 0.0 };
         }
 
-        // Backprop Action Head
-        let mut d_act_relu = vec![0.0f32; num_actions * 128];
+        // ================= BACKPROPAGATION =================
+        // 1. Action Head Gradient
+        let mut d_act_relu = vec![0.0f32; num_actions * 64];
         for a in 0..num_actions {
             let d_z = d_logits[a];
             grads.w_act2.bias[0] += d_z;
-            for j in 0..128 {
-                grads.w_act2.weight[j] += d_z * act_relu[a * 128 + j];
-                d_act_relu[a * 128 + j] = d_z * self.w_act2.weight[j];
+            for j in 0..64 {
+                grads.w_act2.weight[j] += d_z * act_relu[a * 64 + j];
+                d_act_relu[a * 64 + j] = d_z * self.w_act2.weight[j];
             }
         }
 
-        let mut d_act_in = vec![0.0f32; num_actions * 144];
+        let mut d_act_in = vec![0.0f32; num_actions * 80];
         for a in 0..num_actions {
-            for j in 0..128 {
-                let d_h = if act_hidden[a * 128 + j] > 0.0 { d_act_relu[a * 128 + j] } else { 0.0 };
+            for j in 0..64 {
+                let d_h = if act_hidden[a * 64 + j] > 0.0 { d_act_relu[a * 64 + j] } else { 0.0 };
                 grads.w_act1.bias[j] += d_h;
-                let w_off = j * 144;
-                for i in 0..144 {
-                    grads.w_act1.weight[w_off + i] += d_h * act_in[a * 144 + i];
-                    d_act_in[a * 144 + i] += d_h * self.w_act1.weight[w_off + i];
+                let w_off = j * 80;
+                for i in 0..80 {
+                    grads.w_act1.weight[w_off + i] += d_h * act_in[a * 80 + i];
+                    d_act_in[a * 80 + i] += d_h * self.w_act1.weight[w_off + i];
                 }
             }
         }
 
-        let mut d_h6 = vec![0.0f32; n_nodes * 128];
+        let mut d_h3 = vec![0.0f32; n_nodes * 64];
         for a in 0..num_actions {
             let u = act_node_idx[a];
-            for i in 0..128 {
-                d_h6[u * 128 + i] += d_act_in[a * 144 + i];
+            for i in 0..64 {
+                d_h3[u * 64 + i] += d_act_in[a * 80 + i];
             }
         }
 
-        // Backprop Value Head
+        // 2. Value Head Gradient
         grads.w_val2.bias[0] += value_grad;
-        let mut d_val_relu = vec![0.0f32; 128];
-        for i in 0..128 {
+        let mut d_val_relu = vec![0.0f32; 64];
+        for i in 0..64 {
             grads.w_val2.weight[i] += value_grad * val_relu[i];
             d_val_relu[i] = value_grad * self.w_val2.weight[i];
         }
 
-        let mut d_mean_h6 = vec![0.0f32; 128];
-        for i in 0..128 {
+        let mut d_mean_h3 = vec![0.0f32; 64];
+        for i in 0..64 {
             let d_h = if val_hidden[i] > 0.0 { d_val_relu[i] } else { 0.0 };
             grads.w_val1.bias[i] += d_h;
-            let w_off = i * 128;
-            for j in 0..128 {
-                grads.w_val1.weight[w_off + j] += d_h * mean_h6[j];
-                d_mean_h6[j] += d_h * self.w_val1.weight[w_off + j];
+            let w_off = i * 64;
+            for j in 0..64 {
+                grads.w_val1.weight[w_off + j] += d_h * mean_h3[j];
+                d_mean_h3[j] += d_h * self.w_val1.weight[w_off + j];
             }
         }
 
         for u in 0..n_nodes {
-            for i in 0..128 {
-                d_h6[u * 128 + i] += d_mean_h6[i] / n_nodes as f32;
+            for i in 0..64 {
+                d_h3[u * 64 + i] += d_mean_h3[i] / n_nodes as f32;
             }
         }
 
-        // Helper backprop per layer
+        // 3. Backprop through GNN LAYER 3
+        let mut d_h2 = vec![0.0f32; n_nodes * 64];
+        let mut d_relu3 = vec![0.0f32; n_nodes * 64];
+        for i in 0..n_nodes * 64 {
+            d_h2[i] += d_h3[i]; // Residual gradient
+            d_relu3[i] = if h3_pre[i] > 0.0 { d_h3[i] } else { 0.0 };
+        }
+
+        let mut d_neigh3 = vec![0.0f32; n_nodes * 64];
+        for u in 0..n_nodes {
+            for o in 0..64 {
+                let g = d_relu3[u * 64 + o];
+                grads.w_self3.bias[o] += g;
+                grads.w_neigh3.bias[o] += g;
+                let w_off = o * 64;
+                for i in 0..64 {
+                    grads.w_self3.weight[w_off + i] += g * h2[u * 64 + i];
+                    d_h2[u * 64 + i] += g * self.w_self3.weight[w_off + i];
+
+                    grads.w_neigh3.weight[w_off + i] += g * neigh3[u * 64 + i];
+                    d_neigh3[u * 64 + i] += g * self.w_neigh3.weight[w_off + i];
+                }
+            }
+        }
+
         let mut neighbor_count = vec![0usize; n_nodes];
         for &(u, _) in edge_index {
             if u < n_nodes {
                 neighbor_count[u] += 1;
             }
         }
-
-        // GNN 6 -> GNN 5
-        let mut d_h5 = vec![0.0f32; n_nodes * 128];
-        let mut d_relu6 = vec![0.0f32; n_nodes * 128];
-        for i in 0..n_nodes * 128 {
-            d_h5[i] += d_h6[i];
-            d_relu6[i] = if h6_pre[i] > 0.0 { d_h6[i] } else { 0.0 };
-        }
-        let mut d_neigh6 = vec![0.0f32; n_nodes * 128];
-        for u in 0..n_nodes {
-            for o in 0..128 {
-                let g = d_relu6[u * 128 + o];
-                grads.w_self6.bias[o] += g; grads.w_neigh6.bias[o] += g;
-                let w_off = o * 128;
-                for i in 0..128 {
-                    grads.w_self6.weight[w_off + i] += g * h5[u * 128 + i];
-                    d_h5[u * 128 + i] += g * self.w_self6.weight[w_off + i];
-                    grads.w_neigh6.weight[w_off + i] += g * neigh6[u * 128 + i];
-                    d_neigh6[u * 128 + i] += g * self.w_neigh6.weight[w_off + i];
-                }
-            }
-        }
         for &(u, v) in edge_index {
             if u < n_nodes && v < n_nodes {
                 let count_u = neighbor_count[u].max(1) as f32;
-                for i in 0..128 {
-                    d_h5[v * 128 + i] += d_neigh6[u * 128 + i] / count_u;
+                for i in 0..64 {
+                    d_h2[v * 64 + i] += d_neigh3[u * 64 + i] / count_u;
                 }
             }
         }
 
-        // GNN 5 -> GNN 4
-        let mut d_h4 = vec![0.0f32; n_nodes * 128];
-        let mut d_relu5 = vec![0.0f32; n_nodes * 128];
-        for i in 0..n_nodes * 128 {
-            d_h4[i] += d_h5[i];
-            d_relu5[i] = if h5_pre[i] > 0.0 { d_h5[i] } else { 0.0 };
-        }
-        let mut d_neigh5 = vec![0.0f32; n_nodes * 128];
-        for u in 0..n_nodes {
-            for o in 0..128 {
-                let g = d_relu5[u * 128 + o];
-                grads.w_self5.bias[o] += g; grads.w_neigh5.bias[o] += g;
-                let w_off = o * 128;
-                for i in 0..128 {
-                    grads.w_self5.weight[w_off + i] += g * h4[u * 128 + i];
-                    d_h4[u * 128 + i] += g * self.w_self5.weight[w_off + i];
-                    grads.w_neigh5.weight[w_off + i] += g * neigh5[u * 128 + i];
-                    d_neigh5[u * 128 + i] += g * self.w_neigh5.weight[w_off + i];
-                }
-            }
-        }
-        for &(u, v) in edge_index {
-            if u < n_nodes && v < n_nodes {
-                let count_u = neighbor_count[u].max(1) as f32;
-                for i in 0..128 {
-                    d_h4[v * 128 + i] += d_neigh5[u * 128 + i] / count_u;
-                }
-            }
-        }
-
-        // GNN 4 -> GNN 3
-        let mut d_h3 = vec![0.0f32; n_nodes * 128];
-        let mut d_relu4 = vec![0.0f32; n_nodes * 128];
-        for i in 0..n_nodes * 128 {
-            d_h3[i] += d_h4[i];
-            d_relu4[i] = if h4_pre[i] > 0.0 { d_h4[i] } else { 0.0 };
-        }
-        let mut d_neigh4 = vec![0.0f32; n_nodes * 128];
-        for u in 0..n_nodes {
-            for o in 0..128 {
-                let g = d_relu4[u * 128 + o];
-                grads.w_self4.bias[o] += g; grads.w_neigh4.bias[o] += g;
-                let w_off = o * 128;
-                for i in 0..128 {
-                    grads.w_self4.weight[w_off + i] += g * h3[u * 128 + i];
-                    d_h3[u * 128 + i] += g * self.w_self4.weight[w_off + i];
-                    grads.w_neigh4.weight[w_off + i] += g * neigh4[u * 128 + i];
-                    d_neigh4[u * 128 + i] += g * self.w_neigh4.weight[w_off + i];
-                }
-            }
-        }
-        for &(u, v) in edge_index {
-            if u < n_nodes && v < n_nodes {
-                let count_u = neighbor_count[u].max(1) as f32;
-                for i in 0..128 {
-                    d_h3[v * 128 + i] += d_neigh4[u * 128 + i] / count_u;
-                }
-            }
-        }
-
-        // GNN 3 -> GNN 2
-        let mut d_h2 = vec![0.0f32; n_nodes * 128];
-        let mut d_relu3 = vec![0.0f32; n_nodes * 128];
-        for i in 0..n_nodes * 128 {
-            d_h2[i] += d_h3[i];
-            d_relu3[i] = if h3_pre[i] > 0.0 { d_h3[i] } else { 0.0 };
-        }
-        let mut d_neigh3 = vec![0.0f32; n_nodes * 128];
-        for u in 0..n_nodes {
-            for o in 0..128 {
-                let g = d_relu3[u * 128 + o];
-                grads.w_self3.bias[o] += g; grads.w_neigh3.bias[o] += g;
-                let w_off = o * 128;
-                for i in 0..128 {
-                    grads.w_self3.weight[w_off + i] += g * h2[u * 128 + i];
-                    d_h2[u * 128 + i] += g * self.w_self3.weight[w_off + i];
-                    grads.w_neigh3.weight[w_off + i] += g * neigh3[u * 128 + i];
-                    d_neigh3[u * 128 + i] += g * self.w_neigh3.weight[w_off + i];
-                }
-            }
-        }
-        for &(u, v) in edge_index {
-            if u < n_nodes && v < n_nodes {
-                let count_u = neighbor_count[u].max(1) as f32;
-                for i in 0..128 {
-                    d_h2[v * 128 + i] += d_neigh3[u * 128 + i] / count_u;
-                }
-            }
-        }
-
-        // GNN 2 -> GNN 1
-        let mut d_h1 = vec![0.0f32; n_nodes * 128];
-        let mut d_relu2 = vec![0.0f32; n_nodes * 128];
-        for i in 0..n_nodes * 128 {
-            d_h1[i] += d_h2[i];
+        // 4. Backprop through GNN LAYER 2
+        let mut d_h1 = vec![0.0f32; n_nodes * 64];
+        let mut d_relu2 = vec![0.0f32; n_nodes * 64];
+        for i in 0..n_nodes * 64 {
+            d_h1[i] += d_h2[i]; // Residual gradient
             d_relu2[i] = if h2_pre[i] > 0.0 { d_h2[i] } else { 0.0 };
         }
-        let mut d_neigh2 = vec![0.0f32; n_nodes * 128];
+
+        let mut d_neigh2 = vec![0.0f32; n_nodes * 64];
         for u in 0..n_nodes {
-            for o in 0..128 {
-                let g = d_relu2[u * 128 + o];
-                grads.w_self2.bias[o] += g; grads.w_neigh2.bias[o] += g;
-                let w_off = o * 128;
-                for i in 0..128 {
-                    grads.w_self2.weight[w_off + i] += g * h1[u * 128 + i];
-                    d_h1[u * 128 + i] += g * self.w_self2.weight[w_off + i];
-                    grads.w_neigh2.weight[w_off + i] += g * neigh2[u * 128 + i];
-                    d_neigh2[u * 128 + i] += g * self.w_neigh2.weight[w_off + i];
-                }
-            }
-        }
-        for &(u, v) in edge_index {
-            if u < n_nodes && v < n_nodes {
-                let count_u = neighbor_count[u].max(1) as f32;
-                for i in 0..128 {
-                    d_h1[v * 128 + i] += d_neigh2[u * 128 + i] / count_u;
+            for o in 0..64 {
+                let g = d_relu2[u * 64 + o];
+                grads.w_self2.bias[o] += g;
+                grads.w_neigh2.bias[o] += g;
+                let w_off = o * 64;
+                for i in 0..64 {
+                    grads.w_self2.weight[w_off + i] += g * h1[u * 64 + i];
+                    d_h1[u * 64 + i] += g * self.w_self2.weight[w_off + i];
+
+                    grads.w_neigh2.weight[w_off + i] += g * neigh2[u * 64 + i];
+                    d_neigh2[u * 64 + i] += g * self.w_neigh2.weight[w_off + i];
                 }
             }
         }
 
-        // GNN 1 Input
-        let mut d_relu1 = vec![0.0f32; n_nodes * 128];
-        for i in 0..n_nodes * 128 {
+        for &(u, v) in edge_index {
+            if u < n_nodes && v < n_nodes {
+                let count_u = neighbor_count[u].max(1) as f32;
+                for i in 0..64 {
+                    d_h1[v * 64 + i] += d_neigh2[u * 64 + i] / count_u;
+                }
+            }
+        }
+
+        // 5. Backprop through GNN LAYER 1
+        let mut d_relu1 = vec![0.0f32; n_nodes * 64];
+        for i in 0..n_nodes * 64 {
             d_relu1[i] = if h1_pre[i] > 0.0 { d_h1[i] } else { 0.0 };
         }
+
         for u in 0..n_nodes {
-            for o in 0..128 {
-                let g = d_relu1[u * 128 + o];
-                grads.w_self1.bias[o] += g; grads.w_neigh1.bias[o] += g;
+            for o in 0..64 {
+                let g = d_relu1[u * 64 + o];
+                grads.w_self1.bias[o] += g;
+                grads.w_neigh1.bias[o] += g;
                 let w_off = o * 40;
                 for i in 0..40 {
                     grads.w_self1.weight[w_off + i] += g * x_flat[u * 40 + i];
@@ -1136,12 +905,6 @@ impl HexGNNModel {
         self.w_neigh2.adam_update(&grads.w_neigh2.weight, &grads.w_neigh2.bias, lr, beta1, beta2, eps, t);
         self.w_self3.adam_update(&grads.w_self3.weight, &grads.w_self3.bias, lr, beta1, beta2, eps, t);
         self.w_neigh3.adam_update(&grads.w_neigh3.weight, &grads.w_neigh3.bias, lr, beta1, beta2, eps, t);
-        self.w_self4.adam_update(&grads.w_self4.weight, &grads.w_self4.bias, lr, beta1, beta2, eps, t);
-        self.w_neigh4.adam_update(&grads.w_neigh4.weight, &grads.w_neigh4.bias, lr, beta1, beta2, eps, t);
-        self.w_self5.adam_update(&grads.w_self5.weight, &grads.w_self5.bias, lr, beta1, beta2, eps, t);
-        self.w_neigh5.adam_update(&grads.w_neigh5.weight, &grads.w_neigh5.bias, lr, beta1, beta2, eps, t);
-        self.w_self6.adam_update(&grads.w_self6.weight, &grads.w_self6.bias, lr, beta1, beta2, eps, t);
-        self.w_neigh6.adam_update(&grads.w_neigh6.weight, &grads.w_neigh6.bias, lr, beta1, beta2, eps, t);
         self.w_act1.adam_update(&grads.w_act1.weight, &grads.w_act1.bias, lr, beta1, beta2, eps, t);
         self.w_act2.adam_update(&grads.w_act2.weight, &grads.w_act2.bias, lr, beta1, beta2, eps, t);
         self.w_val1.adam_update(&grads.w_val1.weight, &grads.w_val1.bias, lr, beta1, beta2, eps, t);
@@ -1152,11 +915,10 @@ impl HexGNNModel {
         if let Some(parent) = std::path::Path::new(path).parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = std::fs::File::create(path)?;
+        let file = File::create(path)?;
         let mut writer = std::io::BufWriter::new(file);
 
-        use std::io::Write;
-        writer.write_all(b"DORF_GNN_V2")?;
+        writer.write_all(b"DORF_GNN_V1")?;
         writer.write_all(&(self.step_count as u64).to_le_bytes())?;
 
         self.w_self1.save_to_writer(&mut writer)?;
@@ -1165,12 +927,6 @@ impl HexGNNModel {
         self.w_neigh2.save_to_writer(&mut writer)?;
         self.w_self3.save_to_writer(&mut writer)?;
         self.w_neigh3.save_to_writer(&mut writer)?;
-        self.w_self4.save_to_writer(&mut writer)?;
-        self.w_neigh4.save_to_writer(&mut writer)?;
-        self.w_self5.save_to_writer(&mut writer)?;
-        self.w_neigh5.save_to_writer(&mut writer)?;
-        self.w_self6.save_to_writer(&mut writer)?;
-        self.w_neigh6.save_to_writer(&mut writer)?;
         self.w_act1.save_to_writer(&mut writer)?;
         self.w_act2.save_to_writer(&mut writer)?;
         self.w_val1.save_to_writer(&mut writer)?;
@@ -1181,93 +937,37 @@ impl HexGNNModel {
     }
 
     pub fn load_from_file(path: &str) -> std::io::Result<Self> {
-        use std::io::Read;
-        let file = std::fs::File::open(path)?;
+        let file = File::open(path)?;
         let mut reader = std::io::BufReader::new(file);
 
         let mut magic = [0u8; 11];
         reader.read_exact(&mut magic)?;
-
-        if &magic == b"DORF_GNN_V2" {
-            let mut buf8 = [0u8; 8];
-            reader.read_exact(&mut buf8)?;
-            let step_count = u64::from_le_bytes(buf8) as usize;
-
-            let w_self1 = Linear::load_from_reader(&mut reader)?;
-            let w_neigh1 = Linear::load_from_reader(&mut reader)?;
-            let w_self2 = Linear::load_from_reader(&mut reader)?;
-            let w_neigh2 = Linear::load_from_reader(&mut reader)?;
-            let w_self3 = Linear::load_from_reader(&mut reader)?;
-            let w_neigh3 = Linear::load_from_reader(&mut reader)?;
-            let w_self4 = Linear::load_from_reader(&mut reader)?;
-            let w_neigh4 = Linear::load_from_reader(&mut reader)?;
-            let w_self5 = Linear::load_from_reader(&mut reader)?;
-            let w_neigh5 = Linear::load_from_reader(&mut reader)?;
-            let w_self6 = Linear::load_from_reader(&mut reader)?;
-            let w_neigh6 = Linear::load_from_reader(&mut reader)?;
-            let w_act1 = Linear::load_from_reader(&mut reader)?;
-            let w_act2 = Linear::load_from_reader(&mut reader)?;
-            let w_val1 = Linear::load_from_reader(&mut reader)?;
-            let w_val2 = Linear::load_from_reader(&mut reader)?;
-
-            Ok(Self {
-                w_self1, w_neigh1,
-                w_self2, w_neigh2,
-                w_self3, w_neigh3,
-                w_self4, w_neigh4,
-                w_self5, w_neigh5,
-                w_self6, w_neigh6,
-                w_act1, w_act2,
-                w_val1, w_val2,
-                step_count,
-            })
-        } else if &magic == b"DORF_GNN_V1" {
-            println!("[HexGNN V2] Phát hiện model V1 cũ, tự động chuyển đổi sang V2 (6 Layers, 128 Dims)...");
-            let mut buf8 = [0u8; 8];
-            reader.read_exact(&mut buf8)?;
-            let step_count = u64::from_le_bytes(buf8) as usize;
-
-            let v1_self1 = Linear::load_from_reader(&mut reader)?;
-            let v1_neigh1 = Linear::load_from_reader(&mut reader)?;
-            let v1_self2 = Linear::load_from_reader(&mut reader)?;
-            let v1_neigh2 = Linear::load_from_reader(&mut reader)?;
-            let v1_self3 = Linear::load_from_reader(&mut reader)?;
-            let v1_neigh3 = Linear::load_from_reader(&mut reader)?;
-            let v1_act1 = Linear::load_from_reader(&mut reader)?;
-            let v1_act2 = Linear::load_from_reader(&mut reader)?;
-            let v1_val1 = Linear::load_from_reader(&mut reader)?;
-            let v1_val2 = Linear::load_from_reader(&mut reader)?;
-
-            let mut model_v2 = Self::new();
-            model_v2.step_count = step_count;
-
-            // Copy V1 weights (64-dim) into V2 weights (128-dim)
-            let copy_linear_rows = |dst: &mut Linear, src: &Linear| {
-                let out_sub = src.out_features.min(dst.out_features);
-                let in_sub = src.in_features.min(dst.in_features);
-                for o in 0..out_sub {
-                    dst.bias[o] = src.bias[o];
-                    for i in 0..in_sub {
-                        dst.weight[o * dst.in_features + i] = src.weight[o * src.in_features + i];
-                    }
-                }
-            };
-
-            copy_linear_rows(&mut model_v2.w_self1, &v1_self1);
-            copy_linear_rows(&mut model_v2.w_neigh1, &v1_neigh1);
-            copy_linear_rows(&mut model_v2.w_self2, &v1_self2);
-            copy_linear_rows(&mut model_v2.w_neigh2, &v1_neigh2);
-            copy_linear_rows(&mut model_v2.w_self3, &v1_self3);
-            copy_linear_rows(&mut model_v2.w_neigh3, &v1_neigh3);
-            copy_linear_rows(&mut model_v2.w_act1, &v1_act1);
-            copy_linear_rows(&mut model_v2.w_act2, &v1_act2);
-            copy_linear_rows(&mut model_v2.w_val1, &v1_val1);
-            copy_linear_rows(&mut model_v2.w_val2, &v1_val2);
-
-            println!("[HexGNN V2] Tự động nâng cấp hoàn tất!");
-            Ok(model_v2)
-        } else {
-            Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid model format"))
+        if &magic != b"DORF_GNN_V1" && &magic != b"DORF_GNN_V2" {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid model format"));
         }
+
+        let mut buf8 = [0u8; 8];
+        reader.read_exact(&mut buf8)?;
+        let step_count = u64::from_le_bytes(buf8) as usize;
+
+        let w_self1 = Linear::load_from_reader(&mut reader)?;
+        let w_neigh1 = Linear::load_from_reader(&mut reader)?;
+        let w_self2 = Linear::load_from_reader(&mut reader)?;
+        let w_neigh2 = Linear::load_from_reader(&mut reader)?;
+        let w_self3 = Linear::load_from_reader(&mut reader)?;
+        let w_neigh3 = Linear::load_from_reader(&mut reader)?;
+        let w_act1 = Linear::load_from_reader(&mut reader)?;
+        let w_act2 = Linear::load_from_reader(&mut reader)?;
+        let w_val1 = Linear::load_from_reader(&mut reader)?;
+        let w_val2 = Linear::load_from_reader(&mut reader)?;
+
+        Ok(Self {
+            w_self1, w_neigh1,
+            w_self2, w_neigh2,
+            w_self3, w_neigh3,
+            w_act1, w_act2,
+            w_val1, w_val2,
+            step_count,
+        })
     }
 }

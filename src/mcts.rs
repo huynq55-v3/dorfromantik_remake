@@ -509,22 +509,26 @@ impl MCTSSearch {
         (pi_probs, chosen_idx, chosen_action, root_val)
     }
 
-    /// Vectorized Batch MCTS Search cho danh sách B environments đồng thời.
-    /// Khi có gpu_exec, dùng GPU để evaluate neural network (nhanh hơn CPU).
-    pub fn search_batch(
+    /// Vectorized Batch MCTS Search cho danh sách các active envs theo index (Zero Env-Clone & Zero HashMap overhead)
+    /// Trả về: Vec<(pi_probs, chosen_idx, chosen_action, root_val, root_obs)>
+    pub fn search_batch_indexed(
         &self,
-        envs: &[DorfromantikEnv],
+        all_envs: &[DorfromantikEnv],
+        active_indices: &[usize],
         model: &HexGNNModel,
         gpu_exec: Option<&GpuNNExecutor>,
         add_dirichlet: bool,
         temperature: f32,
-    ) -> Vec<(Vec<f32>, usize, Action, f32)> {
-        let b_count = envs.len();
+    ) -> Vec<(Vec<f32>, usize, Action, f32, crate::env::GraphObservation)> {
+        let b_count = active_indices.len();
         if b_count == 0 {
             return Vec::new();
         }
 
-        let obs_batch: Vec<crate::env::GraphObservation> = envs.iter().map(|e| e.extract_graph_observation()).collect();
+        let obs_batch: Vec<crate::env::GraphObservation> = active_indices
+            .iter()
+            .map(|&idx| all_envs[idx].extract_graph_observation())
+            .collect();
         let obs_refs: Vec<&crate::env::GraphObservation> = obs_batch.iter().collect();
 
         let root_evals = if let Some(gpu) = gpu_exec {
@@ -573,12 +577,14 @@ impl MCTSSearch {
             roots.push(Some(root));
         }
 
+        // 2. Chạy N lượt MCTS Simulations (mỗi lượt chạy đồng thời trên B environments)
         for _ in 0..self.config.n_simulations {
             let sim_results: Vec<(Option<DorfromantikEnv>, Vec<usize>, Vec<f32>)> = (0..b_count)
                 .into_par_iter()
                 .map(|i| {
                     if let Some(ref root) = roots[i] {
-                        let mut sim_env = envs[i].clone();
+                        let env_idx = active_indices[i];
+                        let mut sim_env = all_envs[env_idx].clone();
                         let mut node_path = Vec::new();
                         let mut rewards = Vec::new();
 
@@ -632,25 +638,14 @@ impl MCTSSearch {
                 })
                 .collect();
 
-            let mut sim_envs = Vec::with_capacity(b_count);
-            let mut node_paths = Vec::with_capacity(b_count);
-            let mut step_rewards = Vec::with_capacity(b_count);
-
-            for (sim_env, node_path, rewards) in sim_results {
-                sim_envs.push(sim_env);
-                node_paths.push(node_path);
-                step_rewards.push(rewards);
-            }
-
             let mut eval_indices = Vec::new();
             let mut eval_leaf_obs = Vec::new();
 
-            for (i, sim_env_opt) in sim_envs.iter().enumerate() {
+            for (i, (sim_env_opt, node_path, _)) in sim_results.iter().enumerate() {
                 if let Some(ref sim_env) = sim_env_opt {
                     if let Some(ref mut root) = roots[i] {
-                        let path = &node_paths[i];
-                        let mut curr = root;
-                        for &idx in path {
+                        let mut curr = &mut *root;
+                        for &idx in node_path {
                             curr = &mut curr.children[idx].1;
                         }
 
@@ -667,39 +662,36 @@ impl MCTSSearch {
                 }
             }
 
-            let mut leaf_eval_results = Vec::new();
+            let mut leaf_eval_results: Vec<Option<(Vec<f32>, f32)>> = vec![None; b_count];
+            let mut leaf_eval_obs_map: Vec<Option<crate::env::GraphObservation>> = (0..b_count).map(|_| None).collect();
+
             if !eval_leaf_obs.is_empty() {
                 let leaf_refs: Vec<&crate::env::GraphObservation> = eval_leaf_obs.iter().collect();
-                leaf_eval_results = if let Some(gpu) = gpu_exec {
+                let results = if let Some(gpu) = gpu_exec {
                     gpu.forward_batch_gpu(&leaf_refs)
                 } else {
                     model.forward_batch(&leaf_refs)
                 };
+
+                for (pos, &idx) in eval_indices.iter().enumerate() {
+                    leaf_eval_results[idx] = Some(results[pos].clone());
+                }
+                for (pos, idx) in eval_indices.into_iter().enumerate() {
+                    leaf_eval_obs_map[idx] = Some(eval_leaf_obs[pos].clone());
+                }
             }
 
-            let mut eval_result_map = std::collections::HashMap::new();
-            for (idx, res) in eval_indices.iter().zip(leaf_eval_results) {
-                eval_result_map.insert(*idx, res);
-            }
-
-            for (i, sim_env_opt) in sim_envs.iter().enumerate() {
-                if let Some(_) = sim_env_opt {
+            for (i, (sim_env_opt, node_path, rewards)) in sim_results.into_iter().enumerate() {
+                if sim_env_opt.is_some() {
                     if let Some(ref mut root) = roots[i] {
-                        let node_path = &node_paths[i];
-                        let rewards = &step_rewards[i];
-
-                        let eval_res = eval_result_map.get(&i).cloned();
-                        let obs_opt = eval_indices.iter().position(|&x| x == i).map(|pos| &eval_leaf_obs[pos]);
-
-                        // 1. Expand leaf node if evaluated
                         let mut curr = &mut *root;
-                        for &idx in node_path {
+                        for &idx in &node_path {
                             curr = &mut curr.children[idx].1;
                         }
 
                         let leaf_value = if curr.is_terminal {
                             0.0
-                        } else if let (Some((ref leaf_logits, val)), Some(obs)) = (eval_res, obs_opt) {
+                        } else if let (Some((leaf_logits, val)), Some(obs)) = (leaf_eval_results[i].as_ref(), leaf_eval_obs_map[i].as_ref()) {
                             let l_max = leaf_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                             let l_exps: Vec<f32> = leaf_logits.iter().map(|l| (l - l_max).exp()).collect();
                             let l_sum: f32 = l_exps.iter().sum::<f32>().max(1e-8);
@@ -712,12 +704,11 @@ impl MCTSSearch {
                                 .map(|(&act, &p)| (act, MCTSNode::new(p)))
                                 .collect();
 
-                            val
+                            *val
                         } else {
                             curr.q_value()
                         };
 
-                        // 2. Backup values up the path
                         let mut g = leaf_value;
                         let depth = node_path.len();
                         let mut returns = vec![0.0f32; depth];
@@ -746,13 +737,12 @@ impl MCTSSearch {
         }
 
         let mut results = Vec::with_capacity(b_count);
-        for i in 0..b_count {
-            let obs = &obs_batch[i];
+        for (i, obs) in obs_batch.into_iter().enumerate() {
             let num_actions = obs.valid_actions.len();
 
             if num_actions == 0 || roots[i].is_none() {
                 let default_act = Action { q: 0, r: 0, rotation: 0 };
-                results.push((Vec::new(), 0, default_act, 0.0));
+                results.push((Vec::new(), 0, default_act, 0.0, obs));
                 continue;
             }
 
@@ -801,11 +791,26 @@ impl MCTSSearch {
             };
 
             let chosen_action = root.children[chosen_idx].0;
-            results.push((pi_probs, chosen_idx, chosen_action, root_val));
+            results.push((pi_probs, chosen_idx, chosen_action, root_val, obs));
         }
 
         results
     }
+
+    /// Vectorized Batch MCTS Search wrapper cho danh sách B environments.
+    pub fn search_batch(
+        &self,
+        envs: &[DorfromantikEnv],
+        model: &HexGNNModel,
+        gpu_exec: Option<&GpuNNExecutor>,
+        add_dirichlet: bool,
+        temperature: f32,
+    ) -> Vec<(Vec<f32>, usize, Action, f32)> {
+        let active_indices: Vec<usize> = (0..envs.len()).collect();
+        let indexed_results = self.search_batch_indexed(envs, &active_indices, model, gpu_exec, add_dirichlet, temperature);
+        indexed_results.into_iter().map(|(pi, idx, act, val, _)| (pi, idx, act, val)).collect()
+    }
 }
+
 
 
