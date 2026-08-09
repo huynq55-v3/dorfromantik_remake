@@ -55,6 +55,25 @@ impl AlphaZeroReplayBuffer {
             .collect()
     }
 
+    /// Lấy `count` indices ngẫu nhiên KHÔNG TRÙNG từ buffer và trộn ngẫu nhiên (subset để train).
+    /// Dùng Fisher-Yates partial để tránh allocate / shuffle toàn bộ buffer mỗi lần.
+    pub fn sample_unique_indices(&self, count: usize) -> Vec<usize> {
+        let len = self.buffer.len();
+        let count = count.min(len);
+        if count == 0 {
+            return Vec::new();
+        }
+        let mut rng = rand::thread_rng();
+        // Khởi tạo danh sách index 0..len và thực hiện Fisher-Yates partial (chỉ count phần đầu)
+        let mut indices: Vec<usize> = (0..len).collect();
+        for i in 0..count {
+            let j = i + rng.gen_range(0..(len - i));
+            indices.swap(i, j);
+        }
+        indices.truncate(count);
+        indices
+    }
+
     pub fn sample_batch(&self, batch_size: usize) -> Vec<AlphaZeroSample> {
         let mut rng = rand::thread_rng();
         let len = self.buffer.len();
@@ -276,6 +295,8 @@ pub struct AlphaZeroTrainerConfig {
     pub value_loss_coeff: f32,
     pub batch_size: usize,
     pub train_epochs_per_iter: usize,
+    /// Tỉ lệ (%) replay buffer được lấy ra để train mỗi lần (0.2 = 20%), trước khi train sẽ trộn subset này.
+    pub train_buffer_fraction: f32,
     pub mcts_config: MCTSConfig,
     pub temp_threshold_moves: usize,
     pub num_parallel_envs: usize,
@@ -294,12 +315,13 @@ impl Default for AlphaZeroTrainerConfig {
             value_loss_coeff: 0.5,
             batch_size: 128,
             train_epochs_per_iter: 4,
+            train_buffer_fraction: 0.2,
             mcts_config: MCTSConfig {
                 c_puct: 1.5,
                 gamma: 0.99,
                 n_simulations: 200,
-                dirichlet_alpha: 0.3,
-                dirichlet_eps: 0.25,
+                dirichlet_alpha: 0.5,
+                dirichlet_eps: 0.4,
             },
             temp_threshold_moves: 12,
             num_parallel_envs: 16,
@@ -841,23 +863,36 @@ impl AlphaZeroPipeline {
             return (0.0, 0.0, 0.0);
         }
 
-        let num_batches = (buf_len / self.config.batch_size).clamp(4, 32);
+        // Lấy một subset (mặc định 20%) của buffer để train mỗi lần, rồi trộn trước khi chia mini-batch
+        let fraction = self.config.train_buffer_fraction.clamp(0.01, 1.0);
+        let subset_size = ((buf_len as f32) * fraction).round() as usize;
+        let subset_size = subset_size.max(self.config.batch_size);
+        let num_batches = (subset_size / self.config.batch_size).clamp(1, 32);
         let total_epochs = self.config.train_epochs_per_iter;
         let train_start = std::time::Instant::now();
         println!(
-            "[Train] Bắt đầu: {} epochs × {} batches (batch_size={}) trên CPU...",
-            total_epochs, num_batches, self.config.batch_size
+            "[Train] Bắt đầu: {} epochs × {} batches (batch_size={}) | subset {:.0}% ({} samples) trên CPU...",
+            total_epochs, num_batches, self.config.batch_size, fraction * 100.0, subset_size
         );
         let mut total_policy_loss = 0.0f32;
         let mut total_value_loss = 0.0f32;
         let mut step_count = 0;
 
         for epoch in 0..total_epochs {
+            // Trộn subset indices ngẫu nhiên không trùng cho epoch này
+            let epoch_indices = self.replay_buffer.sample_unique_indices(subset_size);
+            let epoch_batches = if epoch_indices.is_empty() {
+                0
+            } else {
+                (epoch_indices.len() / self.config.batch_size).min(num_batches).max(1)
+            };
             use std::io::Write;
             print!("[Train Epoch {}/{}] ", epoch + 1, total_epochs);
             let _ = std::io::stdout().flush();
-            for batch in 0..num_batches {
-                let indices = self.replay_buffer.sample_batch_indices(self.config.batch_size);
+            for batch in 0..epoch_batches {
+                let start = batch * self.config.batch_size;
+                let end = ((batch + 1) * self.config.batch_size).min(epoch_indices.len());
+                let indices = epoch_indices[start..end].to_vec();
                 if indices.is_empty() {
                     continue;
                 }
@@ -935,8 +970,8 @@ impl AlphaZeroPipeline {
                 // Cập nhật trọng số mạng bằng Adam Optimizer
                 self.model.update_weights_adam(&scaled_grads, self.config.lr);
 
-                if (batch + 1) % 4 == 0 || batch + 1 == num_batches {
-                    print!("{}/{} ", batch + 1, num_batches);
+                if (batch + 1) % 4 == 0 || batch + 1 == epoch_batches {
+                    print!("{}/{} ", batch + 1, epoch_batches);
                     let _ = std::io::stdout().flush();
                 }
 

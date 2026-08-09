@@ -116,6 +116,22 @@ fn main() {
         .filter(|&e| e > 0)
         .unwrap_or(4);
 
+    // Đọc số moves giữ exploration (temp=1 + Dirichlet) từ tham số dòng lệnh thứ 5 (optional).
+    // Mặc định 12. Giá trị phải > 0; nếu không hợp lệ sẽ fallback về 12.
+    let temp_threshold_moves = args
+        .get(5)
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&t| t > 0)
+        .unwrap_or(12);
+
+    // Đọc tỉ lệ replay buffer được lấy ra để train mỗi lần (thứ 6, optional).
+    // Mặc định 0.2 (20%). Giá trị phải trong (0, 1]; nếu không hợp lệ fallback về 0.2.
+    let train_buffer_fraction = args
+        .get(6)
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|&f| f > 0.0 && f <= 1.0)
+        .unwrap_or(0.2);
+
     let lr = 0.0003;
 
     let config = AlphaZeroTrainerConfig {
@@ -124,14 +140,15 @@ fn main() {
         value_loss_coeff: 0.5,
         batch_size: 512,
         train_epochs_per_iter: train_epochs,
+        train_buffer_fraction,
         mcts_config: MCTSConfig {
             c_puct: 1.5,
             gamma: 0.99,
             n_simulations,
-            dirichlet_alpha: 0.3,
-            dirichlet_eps: 0.25,
+            dirichlet_alpha: 0.5,
+            dirichlet_eps: 0.4,
         },
-        temp_threshold_moves: 12,
+        temp_threshold_moves,
         num_parallel_envs: parallel_envs,
         target_seed,
         initial_stack,
@@ -255,6 +272,9 @@ fn main() {
     println!(" - Số MCTS Simulations / Turn: {}", n_simulations);
     println!(" - Batch Size: {}", config.batch_size);
     println!(" - Train Epochs / Iter: {}", config.train_epochs_per_iter);
+    println!(" - Train Buffer Fraction: {:.0}%", config.train_buffer_fraction * 100.0);
+    println!(" - Temp Threshold (exploration moves): {}", config.temp_threshold_moves);
+    println!(" - Dirichlet Alpha: {} | Dirichlet Eps: {}", config.mcts_config.dirichlet_alpha, config.mcts_config.dirichlet_eps);
     println!(" - Learning Rate: {}", config.lr);
     if iter_max != usize::MAX {
         println!(" - Iteration Max: {}", iter_max);
