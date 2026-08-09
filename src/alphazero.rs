@@ -38,10 +38,26 @@ impl AlphaZeroReplayBuffer {
         self.buffer.push_back(sample);
     }
 
-    pub fn push_batch(&mut self, samples: Vec<AlphaZeroSample>) {
-        for s in samples {
-            self.push(s);
+    /// Thêm một batch sample vào buffer, lọc trùng (không thêm sample có cùng state đã tồn tại).
+    /// Trả về số sample MỚI thực sự được giữ lại trong batch này (trừ các sample bị trùng).
+    /// Số này là lượng train cho iteration tương ứng.
+    pub fn push_batch(&mut self, samples: Vec<AlphaZeroSample>) -> usize {
+        // Tập chữ ký của các sample hiện có trong buffer (để loại trùng khi thêm mới)
+        let mut seen: HashSet<u64> = HashSet::with_capacity(self.buffer.len() + samples.len());
+        for s in &self.buffer {
+            seen.insert(observation_hash(&s.obs));
         }
+
+        let mut retained = 0usize;
+        for s in samples {
+            let sig = observation_hash(&s.obs);
+            if seen.insert(sig) {
+                self.push(s);
+                retained += 1;
+            }
+            // Nếu trùng chữ ký => bỏ qua, không thêm
+        }
+        retained
     }
 
     pub fn sample_batch_indices(&self, batch_size: usize) -> Vec<usize> {
@@ -295,8 +311,6 @@ pub struct AlphaZeroTrainerConfig {
     pub value_loss_coeff: f32,
     pub batch_size: usize,
     pub train_epochs_per_iter: usize,
-    /// Tỉ lệ (%) replay buffer được lấy ra để train mỗi lần (0.2 = 20%), trước khi train sẽ trộn subset này.
-    pub train_buffer_fraction: f32,
     pub mcts_config: MCTSConfig,
     pub temp_threshold_moves: usize,
     pub num_parallel_envs: usize,
@@ -315,7 +329,6 @@ impl Default for AlphaZeroTrainerConfig {
             value_loss_coeff: 0.5,
             batch_size: 128,
             train_epochs_per_iter: 4,
-            train_buffer_fraction: 0.2,
             mcts_config: MCTSConfig {
                 c_puct: 1.5,
                 gamma: 0.99,
@@ -625,20 +638,21 @@ pub struct AlphaZeroPipeline {
     pub config: AlphaZeroTrainerConfig,
     pub model: HexGNNModel,
     pub replay_buffer: AlphaZeroReplayBuffer,
+    /// Số sample MỚI thực sự được giữ lại trong lần self-play vừa rồi (dùng để quyết định lượng train).
+    pub last_new_samples: usize,
 }
 
 impl AlphaZeroPipeline {
     pub fn new(config: AlphaZeroTrainerConfig) -> Self {
         let model = HexGNNModel::new();
-        // Tự động tính toán dung lượng Replay Buffer chứa 5 Iteration gần nhất (ví dụ: 1024 envs * 100 tiles * 5 = 512,000 samples)
-        let buf_capacity = config
-            .replay_buffer_capacity
-            .unwrap_or_else(|| (config.num_parallel_envs * config.tile_limit * 5).max(250_000));
+        // Dung lượng Replay Buffer mặc định 100k sample (nếu không được cấu hình)
+        let buf_capacity = config.replay_buffer_capacity.unwrap_or(100_000);
         let replay_buffer = AlphaZeroReplayBuffer::new(buf_capacity);
         Self {
             config,
             model,
             replay_buffer,
+            last_new_samples: 0,
         }
     }
 
@@ -686,6 +700,7 @@ impl AlphaZeroPipeline {
     /// Thu thập dữ liệu tự chơi bằng Vectorized Batch MCTS (Không channel, không lock-step stall)
     /// Khi có gpu_exec: dùng GPU inference cho neural network evaluation.
     pub fn collect_self_play_data_batch(&mut self, gpu_exec: Option<&GpuNNExecutor>) -> (f32, usize, usize, Option<GameMatchRecord>) {
+        self.last_new_samples = 0;
         let n_envs = self.config.num_parallel_envs;
         let base_seed = self.config.target_seed;
         let initial_stack = self.config.initial_stack;
@@ -801,7 +816,7 @@ impl AlphaZeroPipeline {
                 });
             }
             samples.reverse();
-            self.replay_buffer.push_batch(samples);
+            self.last_new_samples += self.replay_buffer.push_batch(samples);
         }
 
         let avg_score = total_score as f32 / n_envs as f32;
@@ -863,24 +878,35 @@ impl AlphaZeroPipeline {
             return (0.0, 0.0, 0.0);
         }
 
-        // Lấy một subset (mặc định 20%) của buffer để train mỗi lần, rồi trộn trước khi chia mini-batch
-        let fraction = self.config.train_buffer_fraction.clamp(0.01, 1.0);
-        let subset_size = ((buf_len as f32) * fraction).round() as usize;
-        let subset_size = subset_size.max(self.config.batch_size);
-        let num_batches = (subset_size / self.config.batch_size).clamp(1, 32);
+        // Warm-up: chỉ bắt đầu train khi buffer đã nạp đủ 20% dung lượng, tránh overfit vào data khởi đầu ít ỏi
+        let warmup_threshold = (self.replay_buffer.capacity as f32 * 0.20) as usize;
+        if buf_len < warmup_threshold {
+            println!(
+                "[Train] Warm-up: buffer {}/{} sample (cần ≥ {}) — chưa train, tiếp tục self-play tích lũy.",
+                buf_len, self.replay_buffer.capacity, warmup_threshold
+            );
+            return (0.0, 0.0, 0.0);
+        }
+
+        // Train đúng bằng số sample MỚI thực sự giữ lại trong iteration này (số push, lọc trùng)
+        let mut m = self.last_new_samples;
+        if m < self.config.batch_size {
+            m = self.config.batch_size.min(buf_len);
+        }
+        let num_batches = (m / self.config.batch_size).max(1);
         let total_epochs = self.config.train_epochs_per_iter;
         let train_start = std::time::Instant::now();
         println!(
-            "[Train] Bắt đầu: {} epochs × {} batches (batch_size={}) | subset {:.0}% ({} samples) trên CPU...",
-            total_epochs, num_batches, self.config.batch_size, fraction * 100.0, subset_size
+            "[Train] Bắt đầu: {} epochs × {} batches (batch_size={}) | train trên {} sample mới (buffer {}/{}) CPU...",
+            total_epochs, num_batches, self.config.batch_size, m, buf_len, self.replay_buffer.capacity
         );
         let mut total_policy_loss = 0.0f32;
         let mut total_value_loss = 0.0f32;
         let mut step_count = 0;
 
         for epoch in 0..total_epochs {
-            // Trộn subset indices ngẫu nhiên không trùng cho epoch này
-            let epoch_indices = self.replay_buffer.sample_unique_indices(subset_size);
+            // Bốc ngẫu nhiên M indices (trộn) từ buffer để train cho epoch này
+            let epoch_indices = self.replay_buffer.sample_unique_indices(m);
             let epoch_batches = if epoch_indices.is_empty() {
                 0
             } else {

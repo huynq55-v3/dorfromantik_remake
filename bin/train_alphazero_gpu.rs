@@ -83,7 +83,7 @@ fn main() {
     }
 
     let (target_seed, initial_stack, tile_limit) = load_monthly_game_config();
-    let parallel_envs = 512;
+    let parallel_envs = 256;
 
     // Đọc số simulations từ tham số dòng lệnh nếu có (mặc định 400)
     let args: Vec<String> = std::env::args().collect();
@@ -124,14 +124,6 @@ fn main() {
         .filter(|&t| t > 0)
         .unwrap_or(12);
 
-    // Đọc tỉ lệ replay buffer được lấy ra để train mỗi lần (thứ 6, optional).
-    // Mặc định 0.2 (20%). Giá trị phải trong (0, 1]; nếu không hợp lệ fallback về 0.2.
-    let train_buffer_fraction = args
-        .get(6)
-        .and_then(|s| s.parse::<f32>().ok())
-        .filter(|&f| f > 0.0 && f <= 1.0)
-        .unwrap_or(0.2);
-
     let lr = 0.0003;
 
     let config = AlphaZeroTrainerConfig {
@@ -140,7 +132,6 @@ fn main() {
         value_loss_coeff: 0.5,
         batch_size: 512,
         train_epochs_per_iter: train_epochs,
-        train_buffer_fraction,
         mcts_config: MCTSConfig {
             c_puct: 1.5,
             gamma: 0.99,
@@ -272,7 +263,9 @@ fn main() {
     println!(" - Số MCTS Simulations / Turn: {}", n_simulations);
     println!(" - Batch Size: {}", config.batch_size);
     println!(" - Train Epochs / Iter: {}", config.train_epochs_per_iter);
-    println!(" - Train Buffer Fraction: {:.0}%", config.train_buffer_fraction * 100.0);
+    let buffer_capacity = config.replay_buffer_capacity.unwrap_or(100_000);
+    println!(" - Replay Buffer Capacity: {} samples", buffer_capacity);
+    println!(" - Warm-up (train sau ≥ 10%): ≥ {} samples", ((buffer_capacity as f32) * 0.10) as usize);
     println!(" - Temp Threshold (exploration moves): {}", config.temp_threshold_moves);
     println!(" - Dirichlet Alpha: {} | Dirichlet Eps: {}", config.mcts_config.dirichlet_alpha, config.mcts_config.dirichlet_eps);
     println!(" - Learning Rate: {}", config.lr);
