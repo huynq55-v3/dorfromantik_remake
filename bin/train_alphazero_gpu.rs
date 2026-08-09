@@ -265,7 +265,7 @@ fn main() {
     println!(" - Train Epochs / Iter: {}", config.train_epochs_per_iter);
     let buffer_capacity = config.replay_buffer_capacity.unwrap_or(100_000);
     println!(" - Replay Buffer Capacity: {} samples", buffer_capacity);
-    println!(" - Warm-up (train sau ≥ 10%): ≥ {} samples", ((buffer_capacity as f32) * 0.10) as usize);
+    println!(" - Warm-up (train sau ≥ 20%): ≥ {} samples", ((buffer_capacity as f32) * 0.20) as usize);
     println!(" - Temp Threshold (exploration moves): {}", config.temp_threshold_moves);
     println!(" - Dirichlet Alpha: {} | Dirichlet Eps: {}", config.mcts_config.dirichlet_alpha, config.mcts_config.dirichlet_eps);
     println!(" - Learning Rate: {}", config.lr);

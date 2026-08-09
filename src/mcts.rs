@@ -66,6 +66,19 @@ pub struct MCTSSearch {
     pub config: MCTSConfig,
 }
 
+/// Kết quả lá trong MCTS batch (để backprop biết cách áp value / mở rộng node).
+/// - Terminal: lá kết thúc (game over / hết nước đi), value = 0.
+/// - Expand: lá cần mở rộng (chưa expanded) với children (priors) và value từ NN.
+/// - StoredValue: lá đã expanded nhưng traversal dừng lại, dùng value hiện tại.
+/// - PendingEval: tạm thời đánh dấu lá chưa có GPU result (sẽ được chuyển thành `Expand`).
+enum LeafEval {
+    Terminal,
+    Expand { children: Vec<(Action, MCTSNode)>, value: f32 },
+    StoredValue(f32),
+    PendingExtract,
+    PendingEval,
+}
+
 impl MCTSSearch {
     pub fn new(config: MCTSConfig) -> Self {
         Self { config }
@@ -795,6 +808,380 @@ impl MCTSSearch {
         indexed_results.into_iter().map(|(pi, idx, act, val, _)| (pi, idx, act, val)).collect()
     }
 
+
+    /// MCTS Batch Search cho 1 env ĐƠN LẺ dùng Virtual Loss (node ảo) để thăm dò nhiều lá
+    /// trong cùng 1 lượt, gom thành 1 GPU batch leaf-eval để GPU được dùng triệt để.
+    ///
+    /// Thay vì chạy N lượt, mỗi lượt eval 1 lá (hàng nghìn round-trip GPU), hàm này chạy
+    /// `batch_size` lượt traversal tuần tự trên CÙNG 1 cây MCTS, đánh virtual loss lên từng
+    /// đường đi để các lượt kế tiếp trong round phân tán sang nhánh khác, rồi gom toàn bộ
+    /// các lá cần mở rộng thành 1 batch GPU eval duy nhất. Việc trích xuất GraphObservation
+    /// của các lá được song song hóa bằng Rayon (nặng: quét candidate + group queries).
+    pub fn search_virtual_loss_batch(
+        &self,
+        env: &DorfromantikEnv,
+        model: &HexGNNModel,
+        gpu_exec: Option<&GpuNNExecutor>,
+        add_dirichlet: bool,
+        temperature: f32,
+        batch_size: usize,
+    ) -> (Vec<f32>, usize, Action, f32) {
+        use rayon::prelude::*;
+
+        let obs = env.extract_graph_observation();
+        let num_actions = obs.valid_actions.len();
+        if num_actions == 0 {
+            let default_act = Action { q: 0, r: 0, rotation: 0 };
+            return (Vec::new(), 0, default_act, 0.0);
+        }
+
+        // 1. Eval Root qua GPU batch (batch 1 phần tử)
+        let root_refs = [&obs];
+        let root_evals = if let Some(gpu) = gpu_exec {
+            gpu.forward_batch_gpu(&root_refs)
+        } else {
+            model.forward_batch(&root_refs)
+        };
+        let (action_logits, root_val) = root_evals[0].clone();
+
+        let max_logit = action_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = action_logits.iter().map(|l| (l - max_logit).exp()).collect();
+        let sum_exp: f32 = exps.iter().sum::<f32>().max(1e-8);
+        let mut priors: Vec<f32> = exps.iter().map(|e| e / sum_exp).collect();
+
+        if add_dirichlet && num_actions > 1 {
+            let noise = Self::sample_dirichlet(num_actions, self.config.dirichlet_alpha);
+            let eps = self.config.dirichlet_eps;
+            for a in 0..num_actions {
+                priors[a] = (1.0 - eps) * priors[a] + eps * noise[a];
+            }
+        }
+
+        let mut root = MCTSNode::new(1.0);
+        root.is_expanded = true;
+        root.children = obs.valid_actions
+            .iter()
+            .zip(priors.iter())
+            .map(|(&act, &p)| (act, MCTSNode::new(p)))
+            .collect();
+
+        let mut q_min_f = f32::INFINITY;
+        let mut q_max_f = f32::NEG_INFINITY;
+
+        const VLOSS: f32 = 3.0;
+        let bs = batch_size.max(1);
+        let mut done_count = 0usize;
+
+        while done_count < self.config.n_simulations {
+            let round_bs = bs.min(self.config.n_simulations - done_count);
+
+            // path_sims[s] = (env tại lá, node_path, rewards) cho lượt s
+            let mut path_sims: Vec<(DorfromantikEnv, Vec<usize>, Vec<f32>)> = Vec::with_capacity(round_bs);
+            // eval_spec[s] = mô tả kết quả lá của lượt s
+            let mut eval_spec: Vec<LeafEval> = Vec::with_capacity(round_bs);
+            // các sim có lá cần trích xuất obs (được parallel hóa ở Phase B)
+            let mut pending_extract: Vec<usize> = Vec::new();
+
+            // ---- Phase A: round_bs lượt traversal tuần tự, đánh virtual loss mỗi lượt ----
+            for s in 0..round_bs {
+                let mut sim_env = env.clone();
+                let mut node_path: Vec<usize> = Vec::new();
+                let mut rewards: Vec<f32> = Vec::new();
+
+                // SELECTION (read-only; cây đang tính cả virtual loss của các lượt trước trong round)
+                let mut curr: &MCTSNode = &root;
+                let mut traversal_done = false;
+                loop {
+                    if curr.is_terminal || !curr.is_expanded || curr.children.is_empty() {
+                        break;
+                    }
+                    let total_n = curr.children.iter().map(|(_, c)| c.visit_count).sum::<u32>() as f32;
+                    let sqrt_n = total_n.sqrt();
+                    let mut best_idx = 0usize;
+                    let mut best_ucb = f32::NEG_INFINITY;
+                    for (idx, (_, child)) in curr.children.iter().enumerate() {
+                        let q_val = if child.visit_count > 0 {
+                            let q = child.q_value();
+                            if q_max_f > q_min_f + 1e-6 {
+                                (q - q_min_f) / (q_max_f - q_min_f)
+                            } else {
+                                0.5
+                            }
+                        } else {
+                            0.0
+                        };
+                        let ucb = q_val
+                            + self.config.c_puct * child.prior * sqrt_n
+                                / (1.0 + child.visit_count as f32);
+                        if ucb > best_ucb {
+                            best_ucb = ucb;
+                            best_idx = idx;
+                        }
+                    }
+
+                    let (chosen_action, _) = curr.children[best_idx];
+                    let res = sim_env.step(chosen_action);
+                    let scaled_r = res.reward * 0.01;
+                    node_path.push(best_idx);
+                    rewards.push(scaled_r);
+                    curr = &curr.children[best_idx].1;
+                    if res.done {
+                        traversal_done = true;
+                        break;
+                    }
+                }
+
+                // Phân loại lá: terminal | cần trích xuất obs (pending) | stored value
+                if traversal_done || curr.is_terminal {
+                    eval_spec.push(LeafEval::Terminal);
+                } else if !curr.is_expanded {
+                    eval_spec.push(LeafEval::PendingExtract);
+                    pending_extract.push(s);
+                } else {
+                    eval_spec.push(LeafEval::StoredValue(curr.q_value()));
+                }
+
+                // Đánh virtual loss lên đường đi (CHỈ trên các node con trong path)
+                Self::apply_virtual_loss(&mut root, &node_path, VLOSS);
+
+                path_sims.push((sim_env, node_path, rewards));
+            }
+
+            // ---- Phase B-0: trích xuất GraphObservation song song cho các lá pending ----
+            // (parallel hóa cost nặng của extract_graph_observation)
+            let extracted: Vec<(usize, crate::env::GraphObservation)> = pending_extract
+                .par_iter()
+                .filter_map(|&s| {
+                    let env_clone = &path_sims[s].0;
+                    let leaf_obs = env_clone.extract_graph_observation();
+                    if leaf_obs.valid_actions.is_empty() { None } else { Some((s, leaf_obs)) }
+                })
+                .collect();
+            for (s, _) in &extracted {
+                eval_spec[*s] = LeafEval::PendingEval; // đánh dấu cần eval (đã có obs thật)
+            }
+            // các pending không nằm trong extracted => hết nước đi => Terminal
+            for &s in &pending_extract {
+                if matches!(eval_spec[s], LeafEval::PendingExtract) {
+                    eval_spec[s] = LeafEval::Terminal;
+                }
+            }
+
+            // ---- Phase B: gom tất cả lá PendingEval thành 1 GPU batch ----
+            let mut layer_obs: Vec<crate::env::GraphObservation> = Vec::new();
+            let mut layer_positions: Vec<usize> = Vec::new();
+            for &(s, ref leaf_obs) in &extracted {
+                layer_obs.push(leaf_obs.clone());
+                layer_positions.push(s);
+            }
+
+            let mut layer_res: Vec<(Vec<f32>, f32)> = Vec::new();
+            if !layer_obs.is_empty() {
+                let leaf_refs: Vec<&crate::env::GraphObservation> = layer_obs.iter().collect();
+                layer_res = if let Some(gpu) = gpu_exec {
+                    gpu.forward_batch_gpu(&leaf_refs)
+                } else {
+                    model.forward_batch(&leaf_refs)
+                };
+            }
+
+            // Chuyển PendingEval (đã có obs + GPU result) thành Expand
+            for (pos, &sidx) in layer_positions.iter().enumerate() {
+                if let LeafEval::PendingEval = eval_spec[sidx] {
+                    let gpu_r = layer_res.get(pos).cloned().unwrap_or_else(|| {
+                        (vec![0.0f32; layer_obs[pos].valid_actions.len()], 0.0f32)
+                    });
+                    let (logits, val) = gpu_r;
+                    let obs = &layer_obs[pos];
+                    let l_max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let l_exps: Vec<f32> = logits.iter().map(|l| (l - l_max).exp()).collect();
+                    let l_sum: f32 = l_exps.iter().sum::<f32>().max(1e-8);
+                    let l_probs: Vec<f32> = l_exps.iter().map(|e| e / l_sum).collect();
+                    let children: Vec<(Action, MCTSNode)> = obs.valid_actions
+                        .iter()
+                        .zip(l_probs.iter())
+                        .map(|(&act, &p)| (act, MCTSNode::new(p)))
+                        .collect();
+                    eval_spec[sidx] = LeafEval::Expand { children, value: val };
+                }
+            }
+
+            // ---- Phase C: Backprop từng lượt (gỡ virtual loss, áp value thật, mở rộng lá) ----
+            for s in 0..round_bs {
+                let (_, node_path, rewards) = &path_sims[s];
+                let leaf_eval = std::mem::replace(&mut eval_spec[s], LeafEval::Terminal);
+                Self::backprop_single(
+                    &mut root, node_path, rewards,
+                    leaf_eval, VLOSS, self.config.gamma,
+                    &mut q_min_f, &mut q_max_f,
+                );
+            }
+
+            done_count += round_bs;
+        }
+
+        // ---- Chọn action cuối (greedy theo visit count) ----
+        let visit_counts: Vec<f32> = root.children.iter().map(|(_, c)| c.visit_count as f32).collect();
+        let total_visits: f32 = visit_counts.iter().sum::<f32>().max(1.0);
+
+        if std::env::var("DORFO_DEBUG").is_ok() {
+            // In phân bố priors + visit_counts top-5 để xem cây MCTS có khám phá đa nhánh không
+            let mut entries: Vec<(f32, f32)> = root.children
+                .iter()
+                .zip(visit_counts.iter())
+                .map(|((_, c), &v)| (c.prior, v))
+                .collect();
+            entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let entrop = {
+                let s: f32 = visit_counts.iter().sum::<f32>().max(1.0);
+                let mut e = 0.0f32;
+                for &v in &visit_counts {
+                    if v > 0.0 {
+                        let p = v / s;
+                        e -= p * p.ln();
+                    }
+                }
+                e
+            };
+            eprintln!("[DEBUG] sims={} total_visits={} entropy={:.3} | top5(vis,p): {:?}",
+                self.config.n_simulations, total_visits, entrop,
+                entries.iter().take(5).map(|&(p, v)| (v, (p * 100.0).round() as i32)).collect::<Vec<_>>());
+        }
+
+
+        let pi_probs = if temperature <= 1e-3 {
+            let max_idx = visit_counts
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(idx, _)| idx)
+                .unwrap_or(0);
+            let mut p = vec![0.0f32; num_actions];
+            p[max_idx] = 1.0;
+            p
+        } else {
+            let powered: Vec<f32> = visit_counts.iter().map(|&v| (v / total_visits).powf(1.0 / temperature)).collect();
+            let sum_pow: f32 = powered.iter().sum::<f32>().max(1e-8);
+            powered.iter().map(|p| p / sum_pow).collect()
+        };
+
+        let chosen_idx = if temperature <= 1e-3 {
+            visit_counts
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(idx, _)| idx)
+                .unwrap_or(0)
+        } else {
+            let mut rng = rand::thread_rng();
+            let r: f32 = rng.gen_range(0.0..1.0);
+            let mut cum = 0.0f32;
+            let mut selected = num_actions - 1;
+            for (k, &p) in pi_probs.iter().enumerate() {
+                cum += p;
+                if r <= cum {
+                    selected = k;
+                    break;
+                }
+            }
+            selected
+        };
+
+        let chosen_action = root.children[chosen_idx].0;
+        (pi_probs, chosen_idx, chosen_action, root_val)
+    }
+
+    /// Đánh dấu Virtual Loss lên toàn bộ đường đi (tăng visit_count, giảm total_value)
+    /// trên CÁC NODE CON trong path, để trong cùng 1 round các lượt traversal kế tiếp
+    /// tránh trùng nhánh. Root không bị đánh (shared, không nên bị discourage).
+    fn apply_virtual_loss(
+        root: &mut MCTSNode,
+        node_path: &[usize],
+        vloss: f32,
+    ) {
+        let mut curr = &mut *root;
+        for &idx in node_path {
+            if idx < curr.children.len() {
+                curr = &mut curr.children[idx].1;
+                curr.visit_count += 1;
+                curr.total_value -= vloss;
+            }
+        }
+    }
+
+    /// Backprop 1 lượt cho batch MCTS: gỡ virtual loss trên path, áp value thật (đã discount),
+    /// và mở rộng lá nếu cần. Root chỉ nhận value thật (không virtual loss). Cập nhật q_min/q_max.
+    fn backprop_single(
+        root: &mut MCTSNode,
+        node_path: &[usize],
+        rewards: &[f32],
+        leaf_eval: LeafEval,
+        vloss: f32,
+        gamma: f32,
+        q_min: &mut f32,
+        q_max: &mut f32,
+    ) {
+        // Vị trí node tại lá
+        let mut curr = &mut *root;
+        for &idx in node_path {
+            if idx < curr.children.len() {
+                curr = &mut curr.children[idx].1;
+            } else {
+                break;
+            }
+        }
+
+        // Áp dụng outcome của lá lên node lá
+        let leaf_value = match &leaf_eval {
+            LeafEval::Terminal => {
+                curr.is_terminal = true;
+                0.0
+            }
+            LeafEval::Expand { children, value } => {
+                if !curr.is_expanded {
+                    curr.is_expanded = true;
+                    curr.children = children.clone();
+                }
+                *value
+            }
+            LeafEval::StoredValue(v) => *v,
+            LeafEval::PendingExtract | LeafEval::PendingEval => curr.q_value(),
+        };
+
+        // Sinh chuỗi discounted returns dọc theo path
+        let depth = node_path.len();
+        let mut returns = vec![0.0f32; depth];
+        let mut g = leaf_value;
+        for d in (0..depth).rev() {
+            g = rewards[d] + gamma * g;
+            returns[d] = g;
+        }
+
+        // Root: chỉ nhận value thật (+1 visit, +g). Không virtual loss vì root không bị đánh.
+        root.visit_count += 1;
+        root.total_value += g;
+        let rq = root.q_value();
+        if rq < *q_min { *q_min = rq; }
+        if rq > *q_max { *q_max = rq; }
+
+        // Các node con dọc path: gỡ virtual loss (1 lượt) rồi áp returns thật.
+        let mut trav = &mut *root;
+        for d in 0..depth {
+            let idx = node_path[d];
+            if idx < trav.children.len() {
+                trav = &mut trav.children[idx].1;
+                trav.visit_count = trav.visit_count.saturating_sub(1);
+                trav.total_value += vloss;
+                trav.visit_count += 1;
+                trav.total_value += returns[d];
+
+                let q = trav.q_value();
+                if q < *q_min { *q_min = q; }
+                if q > *q_max { *q_max = q; }
+            }
+        }
+    }
+
     fn run_sim_traversal_range(
         &self,
         range: std::ops::Range<usize>,
@@ -1016,6 +1403,3 @@ impl MCTSSearch {
         });
     }
 }
-
-
-

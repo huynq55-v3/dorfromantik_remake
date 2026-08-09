@@ -45,9 +45,12 @@ path = "bin/train_alphazero_gpu.rs"
 name = "debug_seed"
 path = "bin/debug_seed.rs"
 
+[[bin]]
+name = "gen_replay"
+path = "bin/gen_replay.rs"
+
 [profile.release]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
 panic = "abort"
-

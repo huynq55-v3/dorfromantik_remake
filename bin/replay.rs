@@ -70,8 +70,13 @@ struct GameRecord {
 
 #[macroquad::main("Dorfromantik Replay Visualizer")]
 async fn main() {
-    let file_content = fs::read_to_string("models/best_game_record.json")
-        .expect("Failed to read models/best_game_record.json");
+    // Tham số 1: tên file game replay (vd "best_game_record.json" hoặc "test_replay.json").
+    // Mặc định "models/best_game_record.json".
+    let args: Vec<String> = std::env::args().collect();
+    let game_file = args.get(1).map(|s| s.as_str()).unwrap_or("models/best_game_record.json");
+
+    let file_content = fs::read_to_string(game_file)
+        .unwrap_or_else(|e| panic!("Failed to read {}: {}", game_file, e));
     let record: GameRecord = serde_json::from_str(&file_content)
         .expect("Failed to parse JSON");
 

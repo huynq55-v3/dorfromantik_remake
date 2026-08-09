@@ -126,6 +126,23 @@ impl DorfromantikEnv {
             }
         }
 
+        // Force nước đi đầu tiên vào vị trí cố định (0, -1) (phía dưới ô trung tâm).
+        // Vì nước đầu đều đối xứng (đặt đâu cũng được), việc cố định vị trí giúp
+        // chuẩn hóa dữ liệu tự chơi, tránh nhiễu tie-breaking ngẫu nhiên giữa các
+        // ô tương đương. Model VẪN tự chọn góc xoay tại vị trí này.
+        // Nếu (0, -1) không có rotation hợp lệ (vd tile toàn nước hiếm gặp) thì
+        // rơi về hành vi bình thường để tránh game over ngay nước đầu.
+        if self.placed_count == 0 {
+            let forced: Vec<Action> = valid
+                .iter()
+                .copied()
+                .filter(|a| a.q == 0 && a.r == -1)
+                .collect();
+            if !forced.is_empty() {
+                valid = forced;
+            }
+        }
+
         valid
     }
 
