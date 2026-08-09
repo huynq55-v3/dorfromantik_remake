@@ -279,22 +279,17 @@ impl DorfromantikEnv {
                     feature[8 + dir] = if placed.contains_key(&n_pos) { 0.0 } else { 1.0 };
                 }
 
-                // 14 & 15: Group Element Count & Group Open Edges
-                let mut max_group_count = 0;
+                // 14: (bỏ — không dùng, giữ = 0 để không phá layout kênh feature)
+                // 15: Group Open Edges (số cạnh mở của group liên thông, giúp biết quest sắp bị bịt hay không)
                 let mut max_open_edges = 0;
                 for dir in 0..6 {
                     if let Some(gt) = pt.edge_config.edges[dir].to_group_type() {
                         let open = self.board.count_group_open_edges(pos, gt);
-                        let count = self.board.get_quest_external_count(pos, gt);
-                        if count > max_group_count {
-                            max_group_count = count;
-                        }
                         if open > max_open_edges {
                             max_open_edges = open;
                         }
                     }
                 }
-                feature[14] = ((1.0 + max_group_count as f32).log2() / (100.0_f32).log2()).clamp(0.0, 1.0);
                 feature[15] = (max_open_edges as f32 / 12.0).clamp(0.0, 1.0);
 
                 // 16..27: Quest features
