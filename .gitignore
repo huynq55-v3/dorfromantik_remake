@@ -2,3 +2,4 @@
 /.agents
 models/alphazero_latest.bin
 /models
+/test_replay.json

@@ -38,19 +38,21 @@ impl AlphaZeroReplayBuffer {
         self.buffer.push_back(sample);
     }
 
-    /// Thêm một batch sample vào buffer, lọc trùng (không thêm sample có cùng state đã tồn tại).
+    /// Thêm một batch sample vào buffer, lọc trùng (không thêm sample trùng HOÀN TOÀN:
+    /// cùng state + cùng target_pi + cùng target_val). Hai sample cùng board nhưng khác
+    /// target sẽ được thêm riêng biệt (đúng tinh thần AlphaZero).
     /// Trả về số sample MỚI thực sự được giữ lại trong batch này (trừ các sample bị trùng).
     /// Số này là lượng train cho iteration tương ứng.
     pub fn push_batch(&mut self, samples: Vec<AlphaZeroSample>) -> usize {
         // Tập chữ ký của các sample hiện có trong buffer (để loại trùng khi thêm mới)
         let mut seen: HashSet<u64> = HashSet::with_capacity(self.buffer.len() + samples.len());
         for s in &self.buffer {
-            seen.insert(observation_hash(&s.obs));
+            seen.insert(sample_full_hash(s));
         }
 
         let mut retained = 0usize;
         for s in samples {
-            let sig = observation_hash(&s.obs);
+            let sig = sample_full_hash(&s);
             if seen.insert(sig) {
                 self.push(s);
                 retained += 1;
@@ -112,16 +114,17 @@ impl AlphaZeroReplayBuffer {
         self.buffer.is_empty()
     }
 
-    /// Lọc bỏ các sample trùng lặp về state (cùng chữ ký observation giữ nguyên target nhãn).
-    /// Giữ lại sample đầu tiên cho mỗi state duy nhất, bỏ các bản sao còn lại.
-    /// Được gọi ngay trước khi train để tránh model overfit vào những state lặp lại.
+    /// Lọc bỏ các sample trùng lặp HOÀN TOÀN (cùng state + target_pi + target_val).
+    /// Giữ lại sample đầu tiên cho mỗi chữ ký duy nhất, bỏ các bản sao còn lại.
+    /// Các sample cùng board nhưng khác target giữ nguyên (không bị dedup).
+    /// Được gọi ngay trước khi train để tránh model overfit vào những bản sao y hệt.
     pub fn deduplicate(&mut self) -> usize {
         let mut seen: HashSet<u64> = HashSet::with_capacity(self.buffer.len());
         let mut unique: VecDeque<AlphaZeroSample> = VecDeque::with_capacity(self.buffer.len());
         let mut removed = 0usize;
 
         for sample in self.buffer.drain(..) {
-            let sig = observation_hash(&sample.obs);
+            let sig = sample_full_hash(&sample);
             if seen.insert(sig) {
                 unique.push_back(sample);
             } else {
@@ -1077,5 +1080,20 @@ fn observation_hash(obs: &GraphObservation) -> u64 {
             v.to_bits().hash(&mut h);
         }
     }
+    h.finish()
+}
+
+/// Hash TOÀN BỘ sample gồm state (obs) + target_pi + target_val.
+/// Chỉ coi 2 sample là TRÙNG khi cả state lẫn target huấn luyện đều giống hệt nhau.
+/// Điều này đúng tinh thần AlphaZero: cùng board nhưng khác target (do model/exploration
+/// khác lần) vẫn là 2 sample hợp lệ cần train riêng, không bị dedup.
+fn sample_full_hash(sample: &AlphaZeroSample) -> u64 {
+    use std::hash::DefaultHasher;
+    let mut h = DefaultHasher::new();
+    observation_hash(&sample.obs).hash(&mut h);
+    for &p in &sample.target_pi {
+        p.to_bits().hash(&mut h);
+    }
+    sample.target_val.to_bits().hash(&mut h);
     h.finish()
 }
