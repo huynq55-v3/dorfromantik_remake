@@ -216,6 +216,12 @@ impl DorfromantikEnv {
         let new_tile = self.generator.generate_tile(None, active_count, None, self.quest_manager.level);
         self.tile_queue.push_back(new_tile);
 
+        // Nếu đạt ngưỡng điểm -> tile N+4 trở thành Train Station (KHÔNG thay tile N+3)
+        if self.generator.should_grant_reward(self.score_manager.total_score) {
+            let reward = self.generator.grant_reward();
+            self.tile_queue.push_back(reward);
+        }
+
         // Kích hoạt QuestWatcher CHỈ cho ô đầu cọc bài (front) — giống simulator.rs dòng 350-368
         if let Some(front_tile) = self.tile_queue.front_mut() {
             if let GeneratedTile::Quest { ref mut quest_data, .. } = front_tile {

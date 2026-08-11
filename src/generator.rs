@@ -17,6 +17,12 @@ pub struct TileGenerator {
     pub at_least_two_empty_edges_for_x_turns: i32,
     pub base_tile_counter: usize,
     pub global_quest_probability_multiplier: f32,
+    // SpecialTileSpawner (Train Station reward)
+    pub last_rewarded_score: usize,
+    pub last_rewarded_step: i32,
+    pub score_treshold: usize,
+    pub increase_amount: usize,
+    pub increase_treshold: bool,
 }
 
 impl TileGenerator {
@@ -51,6 +57,11 @@ impl TileGenerator {
             at_least_two_empty_edges_for_x_turns: 5,
             base_tile_counter: 0,
             global_quest_probability_multiplier,
+            last_rewarded_score: 0,
+            last_rewarded_step: 0,
+            score_treshold: 2500,
+            increase_amount: 25,
+            increase_treshold: true,
         }
     }
 
@@ -65,6 +76,28 @@ impl TileGenerator {
             seed,
             is_generated: false,
         }
+    }
+
+    /// Kiểm tra xem có nên thưởng Train Station khi đạt ngưỡng điểm không.
+    /// Logic khớp C# SpecialTileSpawner.CheckScoreCondition().
+    pub fn should_grant_reward(&self, score: usize) -> bool {
+        if self.increase_treshold {
+            score > self.last_rewarded_score + self.score_treshold + self.last_rewarded_step as usize * self.increase_amount
+        } else {
+            score > self.last_rewarded_score + self.score_treshold
+        }
+    }
+
+    /// Cấp thưởng Train Station: cập nhật state spawner + trả về tile station.
+    pub fn grant_reward(&mut self) -> GeneratedTile {
+        // C#: lastRewardedScore += scoreTreshold + lastRewardedStep * increaseAmount; lastRewardedStep++
+        self.last_rewarded_score += self.score_treshold + self.last_rewarded_step as usize * self.increase_amount;
+        self.last_rewarded_step += 1;
+
+        let id = self.base_tile_counter;
+        self.base_tile_counter += 1;
+        let base = BaseTile::new(id, -1, "SpecialTile");
+        GeneratedTile::Reward { base_tile: base }
     }
 
     /// 2. Bảng xác suất QuestTile theo số lượng Active Quest trong game
@@ -377,4 +410,3 @@ mod tests {
         }
     }
 }
-

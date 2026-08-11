@@ -391,9 +391,20 @@ pub enum GeneratedTile {
         base_tile: BaseTile,
         quest_data: QuestTileData,
     },
+    Reward {
+        base_tile: BaseTile,
+    },
 }
 
 impl GeneratedTile {
+    /// Tạo tile Station (Reward) đặc biệt với 6 cạnh WaterTrainStation.
+    /// 2 segment chồng lên nhau trên cả 6 cạnh: Water (element=1) và TrainTracks (element=6).
+    pub fn new_reward_station(id: usize, seed: i32) -> Self {
+        GeneratedTile::Reward {
+            base_tile: BaseTile::new(id, seed, "SpecialTile"),
+        }
+    }
+
     /// Xuất chuỗi cấu hình địa hình giống hệt text vàng trong C# Plugin (ví dụ: "3AA 1AV", "2AA 4AF", "1AF")
     pub fn tile_preset_string(&self) -> String {
         match self {
@@ -407,6 +418,7 @@ impl GeneratedTile {
             GeneratedTile::Quest { quest_data, .. } => {
                 quest_data.config_string()
             }
+            GeneratedTile::Reward { .. } => "6AW 6AT".to_string(),
         }
     }
 
@@ -414,6 +426,7 @@ impl GeneratedTile {
         match self {
             GeneratedTile::Normal { base_tile, .. } => base_tile,
             GeneratedTile::Quest { base_tile, .. } => base_tile,
+            GeneratedTile::Reward { base_tile, .. } => base_tile,
         }
     }
 
@@ -482,6 +495,9 @@ impl GeneratedTile {
                         }
                     }
                 }
+            }
+            GeneratedTile::Reward { .. } => {
+                return HexEdgeConfig::new([EdgeType::WaterTrainStation; 6]);
             }
         }
 
@@ -556,6 +572,22 @@ impl GeneratedTile {
                     });
                 }
             }
+            GeneratedTile::Reward { .. } => {
+                // Water segment: element_count = 1 (1 river layer phủ toàn tile)
+                result.push(TileSegmentData {
+                    group_type: GroupType::Water,
+                    segment_type: SegmentType::ST6A,
+                    element_count: 1,
+                    edges: (0..6).collect(),
+                });
+                // Train segment: element_count = 6 (6 train tracks, mỗi cạnh 1)
+                result.push(TileSegmentData {
+                    group_type: GroupType::TrainTracks,
+                    segment_type: SegmentType::ST6A,
+                    element_count: 6,
+                    edges: (0..6).collect(),
+                });
+            }
         }
         result
     }
@@ -568,4 +600,3 @@ pub struct TileSegmentData {
     pub element_count: usize,
     pub edges: Vec<usize>,
 }
-

@@ -22,6 +22,9 @@ fn main() {
                         base_tile.name
                     );
                 }
+                GeneratedTile::Reward { base_tile } => {
+                    println!("Tile {:02}: REWARD | Name: {}", i, base_tile.name);
+                }
             }
         }
         let valid = env.get_valid_actions();

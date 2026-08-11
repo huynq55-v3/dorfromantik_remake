@@ -362,6 +362,17 @@ async fn main() {
                     let next_gen = generator.generate_tile(None, active_count, None, quest_manager.level);
                     tile_queue.push_back(next_gen);
 
+                    // Nếu đạt ngưỡng điểm -> tile N+4 trở thành Train Station (KHÔNG thay tile N+3)
+                    let should_reward = generator.should_grant_reward(score_manager.total_score);
+                    if should_reward {
+                        let reward = generator.grant_reward();
+                        println!(
+                            "   ===> 🏆 REWARD SPAWN (Train Station) | Score: {} | Step: {}",
+                            score_manager.total_score, generator.last_rewarded_step
+                        );
+                        tile_queue.push_back(reward);
+                    }
+
                     // Update TargetValue cho ô mới ở đầu cọc bài dựa theo trạng thái bàn chơi
                     if let Some(front_tile) = tile_queue.front_mut() {
                         init_active_quest_tile_target(front_tile, &game_board, &mut quest_manager);

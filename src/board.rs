@@ -338,6 +338,14 @@ impl Board {
                     if count > 0 { count } else { 0 }
                 }
             }
+            GeneratedTile::Reward { .. } => {
+                // Station: Water segment = 1 element, Train segment = 6 elements
+                match gt {
+                    GroupType::Water => 1,
+                    GroupType::TrainTracks => 6,
+                    _ => 0,
+                }
+            }
         }
     }
 
