@@ -99,7 +99,7 @@ impl QuestManager {
     pub fn target_value_increase(&self, group_type: GroupType) -> f32 {
         match group_type {
             GroupType::Water => 0.09,
-            GroupType::TrainTracks => 0.09,
+            GroupType::TrainTracks => 0.06,
             GroupType::Agriculture => 0.20,
             GroupType::Forest => 1.70,
             GroupType::Village => 0.30,
