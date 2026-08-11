@@ -4,13 +4,13 @@ use std::io::{Read, Write};
 use serde::{Serialize, Deserialize};
 
 /// Hidden dimension dùng chung cho toàn bộ backbone GNN và các MLP Head.
-pub const HIDDEN_DIM: usize = 128;
+pub const HIDDEN_DIM: usize = 256;
 /// Số chiều feature của mỗi action (định nghĩa trong env::GraphObservation).
 pub const ACTION_FEAT_DIM: usize = 16;
 /// Số layer message passing (aggregate + combine / residual block).
 pub const N_GNN_LAYERS: usize = 4;
 /// Số chiều feature của mỗi node (định nghĩa trong env::GraphObservation).
-pub const NODE_FEAT_DIM: usize = 40;
+pub const NODE_FEAT_DIM: usize = 70;
 
 /// Trọng số Ma trận Linear Layer trong Rust cùng với Adam Optimizer Moments (m, v)
 #[derive(Debug, Clone, Serialize, Deserialize)]

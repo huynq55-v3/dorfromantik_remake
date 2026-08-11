@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use crate::game_config::GroupType;
-use crate::tile::{GeneratedTile, HexEdgeConfig, EqualityComparison};
+use crate::tile::{GeneratedTile, HexEdgeConfig, EqualityComparison, EdgeType};
 
 static LAST_LOGGED_HOVER: Mutex<Option<((i32, i32), usize, String)>> = Mutex::new(None);
 
@@ -476,6 +476,89 @@ impl Board {
         }
 
         self.count_open_edges_for_tiles(&member_tiles, group_type, None)
+    }
+
+    /// Kênh (index 0..5) trong mảng 5 feature [nhà, cây, rock, water, train] cho 1 GroupType.
+    fn group_type_channel(gt: GroupType) -> usize {
+        match gt {
+            GroupType::Village => 0,
+            GroupType::Forest => 1,
+            GroupType::Agriculture => 2,
+            GroupType::Water => 3,
+            GroupType::TrainTracks => 4,
+        }
+    }
+
+    /// Đếm 5-feature theo CẠNH cho 1 tile ĐÃ ĐẶT tại `pos`. Trả về `[[f32;5]; 6]` (6 cạnh).
+    ///
+    /// Mỗi cạnh 5 feature: [nhà, cây, rock, water, train].
+    /// - Cạnh ĐÃ NỐI hợp lệ (có tile kế + compatible): toàn bộ = 0 (đã đóng, không cần đếm).
+    /// - Cạnh bị BLOCK (có tile kế nhưng KHÔNG compatible): toàn bộ = 0 (vĩnh viễn chặn).
+    /// - Cạnh CHƯA NỐI (ô trống): đếm group liên thông của cạnh đó
+    ///   feature[group.channel] = group.total_element_count (tổng cả cụm: nước/train được cộng dồn
+    ///   vào group đã mở sẵn, station đếm group nước hoặc group train của segment chứa cạnh).
+    /// Trả về tổng (water, train) của các group liên thông mà tile tại `pos` đang tham gia.
+    /// Duyệt mọi cạnh của tile để tìm group Water và group TrainTracks (mỗi loại 1 group).
+    fn station_water_train_counts(&self, pos: (i32, i32)) -> (Option<usize>, Option<usize>) {
+        let (mut water, mut train) = (None, None);
+        for dir in 0..6 {
+            if let Some(&gid) = self.edge_to_group.get(&(pos, dir)) {
+                if let Some(group) = self.groups.get(&gid) {
+                    match group.group_type {
+                        GroupType::Water => water = Some(group.total_element_count),
+                        GroupType::TrainTracks => train = Some(group.total_element_count),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        (water, train)
+    }
+
+    /// Đếm 5-feature theo CẠNH cho 1 tile ĐÃ ĐẶT tại `pos`. Trả về `[[f32;5]; 6]` (6 cạnh).
+    ///
+    /// Mỗi cạnh 5 feature: [nhà, cây, rock, water, train].
+    /// - Cạnh có tile kế (ĐÃ NỐI hợp lệ hoặc bị BLOCK/mismatch): toàn bộ = 0 (không cần đếm).
+    /// - Cạnh CHƯA NỐI (mở ra ô trống):
+    ///   - Cạnh Water/FlexibleWater/TrainTracks/Village/Forest/Agriculture:
+    ///     feature[group_type của cạnh] = total_element_count của group liên thông chứa cạnh đó
+    ///     (train/water được cộng dồn vào group đã mở sẵn từ các tile khác).
+    ///   - Cạnh WaterTrainStation: ghi CẢ 2 con số:
+    ///     water = total của water group mà tile tham gia, train = total của train group mà tile tham gia.
+    pub fn count_edge_features(&self, pos: (i32, i32)) -> [[f32; 5]; 6] {
+        let mut out = [[0.0f32; 5]; 6];
+        let Some(pt) = self.placed_tiles.get(&pos) else {
+            return out;
+        };
+
+        for dir in 0..6 {
+            let n_pos = get_neighbor_pos(pos.0, pos.1, dir);
+            // Có tile kế (đã nối hoặc bị block): không ghi gì cả.
+            if self.placed_tiles.contains_key(&n_pos) {
+                continue;
+            }
+
+            // Cạnh station: 2 con số water + train của tile.
+            if matches!(pt.edge_config.edges[dir], EdgeType::WaterTrainStation) {
+                let (w, t) = self.station_water_train_counts(pos);
+                if let Some(w) = w {
+                    out[dir][3] = w as f32;
+                }
+                if let Some(t) = t {
+                    out[dir][4] = t as f32;
+                }
+                continue;
+            }
+
+            // Cạnh mở ra ô trống (không phải station): đếm group liên thông của chính cạnh đó.
+            if let Some(&gid) = self.edge_to_group.get(&(pos, dir)) {
+                if let Some(group) = self.groups.get(&gid) {
+                    let ch = Self::group_type_channel(group.group_type);
+                    out[dir][ch] = group.total_element_count as f32;
+                }
+            }
+        }
+        out
     }
 
     /// Trả về số lượng Quest đang active (Incomplete) trên bàn bài
@@ -1002,5 +1085,58 @@ mod tests {
         // Remaining target must be 4 houses (5 - 1 = 4), NOT 3 houses!
         let remaining = board.get_quest_remaining_target((0, 0));
         assert_eq!(remaining, 4);
+    }
+
+    #[test]
+    fn test_count_edge_features_train_chain() {
+        let mut board = Board::new();
+
+        // A = (0,0) train ST1A, edge 0 (top -> (0,1))
+        let tile_a = GeneratedTile::Normal {
+            base_tile: BaseTile::new(1, 1, "NormalTile"),
+            segments: vec![SegmentData {
+                index: 0,
+                group_type: GroupType::TrainTracks,
+                segment_type: SegmentType::ST1A,
+                occupied_edges: vec![0],
+                rotation: 0,
+                is_hybrid: false,
+            }],
+        };
+        assert!(board.place_tile(0, 0, tile_a, 0));
+
+        // A đứng 1 mình: cạnh 0 mở -> train = 1 (group chỉ có tile A), các cạnh khác = 0
+        let fa = board.count_edge_features((0, 0));
+        assert_eq!(fa[0][4], 1.0);
+        for d in 1..6 {
+            assert_eq!(fa[d][4], 0.0, "edge {} train should be 0", d);
+        }
+
+        // B = (0,1) train ST2C, edges {0 (top), 3 (bottom -> (0,0)=A)}
+        let tile_b = GeneratedTile::Normal {
+            base_tile: BaseTile::new(2, 2, "NormalTile"),
+            segments: vec![SegmentData {
+                index: 0,
+                group_type: GroupType::TrainTracks,
+                segment_type: SegmentType::ST2C,
+                occupied_edges: vec![3, 0],
+                rotation: 0,
+                is_hybrid: false,
+            }],
+        };
+        assert!(board.place_tile(0, 1, tile_b, 0));
+
+        // B.edge3 nối vào A -> đã nối, feature = 0 (không đếm)
+        let fb = board.count_edge_features((0, 1));
+        assert_eq!(fb[3][4], 0.0, "connected edge should be 0");
+
+        // B.edge0 (top) vẫn mở, thuộc cluster train {A,B} = 2 elements -> train = 2
+        assert_eq!(fb[0][4], 2.0, "open end of cluster should count full cluster");
+
+        // A.edge0 giờ đã nối vào B -> feature = 0
+        let fa2 = board.count_edge_features((0, 0));
+        assert_eq!(fa2[0][4], 0.0, "A edge0 connected should be 0");
+        // Các feature khác của A vẫn = 0 (không có group nhà/cây/rock/water)
+        assert_eq!(fa2[0].iter().enumerate().filter(|(i, v)| *i != 4 && **v != 0.0).count(), 0);
     }
 }

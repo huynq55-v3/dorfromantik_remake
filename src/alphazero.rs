@@ -230,7 +230,7 @@ impl AlphaZeroReplayBuffer {
 
             let mut node_features = Vec::with_capacity(n_nodes);
             for _ in 0..n_nodes {
-                let mut feat = [0.0f32; 40];
+                let mut feat = [0.0f32; 70];
                 for val in feat.iter_mut() {
                     reader.read_exact(&mut buf4)?;
                     *val = f32::from_le_bytes(buf4);

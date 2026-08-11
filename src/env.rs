@@ -30,7 +30,7 @@ pub struct GraphObservation {
     /// Danh sách vị trí tọa độ của tất cả các node trong đồ thị (Placed + Candidates)
     pub node_positions: Vec<(i32, i32)>,
     /// Tensor đặc trưng của các node: [N, 40]
-    pub node_features: Vec<[f32; 40]>,
+    pub node_features: Vec<[f32; 70]>,
     /// Danh sách các cạnh nối giữa các node kề nhau: Vec<(from_idx, to_idx)>
     pub edge_index: Vec<(usize, usize)>,
     /// Danh sách tất cả các Action hợp lệ ở bước đi hiện tại
@@ -276,7 +276,7 @@ impl DorfromantikEnv {
         let tile_2 = self.tile_queue.get(2);
 
         for &pos in &node_positions {
-            let mut feature = [0.0f32; 40];
+            let mut feature = [0.0f32; 70];
             let is_placed = placed.contains_key(&pos);
 
             feature[0] = if is_placed { 1.0 } else { 0.0 };
@@ -333,6 +333,15 @@ impl DorfromantikEnv {
                         // (đã trừ object sẵn có trên chính quest tile, khớp với badge hiển thị +5 / =7)
                         let remaining_need = quest_data.remaining_display_value() as f32;
                         feature[24] = (remaining_need / 100.0).clamp(0.0, 1.0);
+                    }
+                }
+
+                // 40..70: 30 feature đếm group theo cạnh (6 cạnh × 5 loại: nhà, cây, rock, water, train).
+                // Chỉ áp dụng cho tile ĐÃ ĐẶT (ô trống không có địa hình nên vẫn = 0).
+                let edge_feats = self.board.count_edge_features(pos);
+                for edge_idx in 0..6 {
+                    for ch in 0..5 {
+                        feature[40 + edge_idx * 5 + ch] = edge_feats[edge_idx][ch];
                     }
                 }
             } else {
