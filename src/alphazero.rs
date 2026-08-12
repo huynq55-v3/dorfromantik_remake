@@ -677,24 +677,32 @@ impl AlphaZeroPipeline {
     /// Thêm 1 board state có Q-value cao vào danh sách (top 2000 state Q tốt nhất).
     /// Q = total_score + target_val * 100.
     pub fn add_high_q_state(&mut self, q_value: f32, remaining_tiles: usize, moves: &[GameMoveRecord]) {
-        // Bỏ qua nếu chuỗi moves đã tồn tại; chỉ cập nhật Q-value nếu cao hơn.
-        for s in self.max_score_states.iter_mut() {
+        // Tìm state trùng chuỗi moves (cùng board config qua dãy nước đi).
+        let mut found = None;
+        for (i, s) in self.max_score_states.iter().enumerate() {
             if s.moves.len() == moves.len()
                 && s.moves.iter().zip(moves.iter()).all(|(a, b)| a.q == b.q && a.r == b.r && a.rotation == b.rotation)
             {
-                if q_value > s.q_value {
-                    s.q_value = q_value;
-                    s.remaining_tiles = remaining_tiles;
-                }
-                return;
+                found = Some(i);
+                break;
             }
         }
-        self.max_score_states.push(MaxScoreStateRecord {
-            q_value,
-            remaining_tiles,
-            moves: moves.to_vec(),
-        });
+        match found {
+            // Luôn ghi đè Q-value và remaining_tiles bằng giá trị mới (kể cả thấp hơn).
+            Some(i) => {
+                self.max_score_states[i].q_value = q_value;
+                self.max_score_states[i].remaining_tiles = remaining_tiles;
+            }
+            None => {
+                self.max_score_states.push(MaxScoreStateRecord {
+                    q_value,
+                    remaining_tiles,
+                    moves: moves.to_vec(),
+                });
+            }
+        }
         // Sắp xếp giảm dần theo Q-value, giữ tối đa 2000 state.
+        // State bị ghi đè bằng Q thấp sẽ bị đẩy ra ngoài top 2000 và bị loại bỏ.
         self.max_score_states.sort_by(|a, b| b.q_value.partial_cmp(&a.q_value).unwrap_or(std::cmp::Ordering::Equal));
         if self.max_score_states.len() > 2000 {
             self.max_score_states.truncate(2000);
@@ -756,6 +764,10 @@ impl AlphaZeroPipeline {
         let mut envs: Vec<DorfromantikEnv> = Vec::with_capacity(n_envs);
         let mut from_state = vec![false; n_envs];
         let mut move_counts = vec![0usize; n_envs];
+        // Số nước đi gốc khi env khởi động từ board state (offset lịch sử cho move_records).
+        let mut hist_offset = vec![0usize; n_envs];
+        // Moves gốc của state để replay về đúng board khi from-state envs tự chơi tiếp.
+        let mut env_source_moves: Vec<Vec<GameMoveRecord>> = vec![Vec::new(); n_envs];
         if !self.max_score_states.is_empty() {
             let count = ((n_envs as f32) * 0.80) as usize;
             // Dùng 1 RNG đơn giản để chọn ngẫu nhiên các env nào từ state (không phụ thuộc ngoài)
@@ -775,11 +787,22 @@ impl AlphaZeroPipeline {
                 // Chọn 1 board state Q-value cao (danh sách đã sort giảm dần).
                 if let Some(state) = self.max_score_states.get(idx % self.max_score_states.len()) {
                     // Replay moves để đạt board state (depth = moves.len()).
-                    for m in &state.moves {
-                        let _ = env.step(crate::env::Action { q: m.q, r: m.r, rotation: m.rotation });
+                    let mut replay_ok = true;
+                    for m in state.moves.iter() {
+                        let valid = env.get_valid_actions();
+                        let act = crate::env::Action { q: m.q, r: m.r, rotation: m.rotation };
+                        if !valid.contains(&act) {
+                            replay_ok = false;
+                            break;
+                        }
+                        let _ = env.step(act);
                         if env.is_game_over() { break; }
                     }
-                    move_counts[idx] = state.moves.len();
+                    if replay_ok && env.placed_count == state.moves.len() {
+                        move_counts[idx] = state.moves.len();
+                        hist_offset[idx] = state.moves.len();
+                        env_source_moves[idx] = state.moves.clone();
+                    }
                 }
             }
             envs.push(env);
@@ -787,6 +810,10 @@ impl AlphaZeroPipeline {
 
         let mut raw_steps: Vec<Vec<(GraphObservation, Vec<f32>, f32)>> = vec![Vec::new(); n_envs];
         let mut move_records: Vec<Vec<GameMoveRecord>> = vec![Vec::new(); n_envs];
+        // Khởi tạo move_records từ moves gốc (env from-state) để add_high_q_state lưu state với lịch sử đầy đủ.
+        for idx in 0..n_envs {
+            move_records[idx].extend(env_source_moves[idx].clone());
+        }
         let mut active = vec![true; n_envs];
         let mut turn_counter = 0usize;
         let mut total_moves = 0usize;
@@ -888,11 +915,13 @@ impl AlphaZeroPipeline {
 
                 // Thu thập board state có Q-value cao (điểm hiện tại + tiềm năng tương lai).
                 // Chỉ giữ khi còn >= 10 tile chưa đặt.
-                if t < move_records[i].len() {
-                    let m = &move_records[i][t];
+                let off = hist_offset[i];
+                if t < move_records[i].len() - off {
+                    let real = off + t;
+                    let m = &move_records[i][real];
                     if m.remaining_tiles >= 10 {
                         let q = m.total_score as f32 + g * 100.0;
-                        self.add_high_q_state(q, m.remaining_tiles, &move_records[i][..=t]);
+                        self.add_high_q_state(q, m.remaining_tiles, &move_records[i][..=real]);
                     }
                 }
             }
@@ -1210,5 +1239,52 @@ mod tests {
         // Giữ 2000 Q cao nhất: 2199..2000.
         assert_eq!(pipe.max_score_states[0].q_value, 2199.0);
         assert_eq!(pipe.max_score_states[1999].q_value, 200.0);
+    }
+}
+
+#[cfg(test)]
+mod tests_overwrite {
+    use super::*;
+
+    #[test]
+    fn test_high_q_state_overwrites_lower_q() {
+        let mut pipe = AlphaZeroPipeline::new(AlphaZeroTrainerConfig::default());
+        let mk = |tag: i32| GameMoveRecord { step: 0, q: tag, r: 0, rotation: 0, score_gained: 0, total_score: tag as usize, remaining_tiles: 50 };
+
+        // State cùng moves (cùng tag=5): đầu Q=90, sau ghi đè bằng Q=40 (thấp hơn).
+        pipe.add_high_q_state(90.0, 40, &[mk(5)]);
+        assert_eq!(pipe.max_score_states.len(), 1);
+        pipe.add_high_q_state(40.0, 30, &[mk(5)]);
+        assert_eq!(pipe.max_score_states.len(), 1, "trùng moves phải ghi đè, không thêm mới");
+        assert_eq!(pipe.max_score_states[0].q_value, 40.0, "Q mới thấp hơn vẫn phải ghi đè");
+        assert_eq!(pipe.max_score_states[0].remaining_tiles, 30);
+    }
+
+    #[test]
+    fn test_high_q_state_overwrite_sorts_out_of_top() {
+        let mut pipe = AlphaZeroPipeline::new(AlphaZeroTrainerConfig::default());
+        let mk = |tag: i32| GameMoveRecord { step: 0, q: tag, r: 0, rotation: 0, score_gained: 0, total_score: tag as usize, remaining_tiles: 50 };
+
+        // Tạo 2001 state khác nhau Q từ 0..2000.
+        for i in 0..2001 {
+            pipe.add_high_q_state(i as f32, 40, &[mk(i)]);
+        }
+        assert_eq!(pipe.max_score_states.len(), 2000, "chỉ giữ top 2000");
+        // State có tag=0 (Q thấp nhất) bị loại khỏi top.
+        assert!(pipe.max_score_states.iter().all(|s| s.q_value > 0.0), "state Q thấp nhất bị loại");
+        // State Q=2000 (top) hiện nằm trong danh sách.
+        assert!(pipe.max_score_states.iter().any(|s| s.q_value == 2000.0));
+
+        // Ghi đè state Q=2000 bằng Q=-5 (rất thấp). State vẫn chiếm 1 slot (số lượng không đổi),
+        // nên -5 trở thành mức Q thấp nhất đang hiện diện trong top.
+        pipe.add_high_q_state(-5.0, 40, &[mk(2000)]);
+        assert_eq!(pipe.max_score_states.len(), 2000);
+        assert!(pipe.max_score_states.iter().any(|s| s.q_value == -5.0), "ghi đè thấp vẫn trong top vì không làm tăng số lượng");
+
+        // Push thêm 1 state mới (Q=1999) -> vượt 2001 -> cắt xuống 2000,
+        // state có Q thấp nhất (=-5) bị loại khỏi top.
+        pipe.add_high_q_state(1999.0, 40, &[mk(3000)]);
+        assert_eq!(pipe.max_score_states.len(), 2000);
+        assert!(pipe.max_score_states.iter().all(|s| s.q_value > -5.0), "state bị ghi đè Q âm đã bị loại khỏi top");
     }
 }
