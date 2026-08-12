@@ -372,7 +372,7 @@ pub struct GameMatchRecord {
 }
 
 /// Bản ghi board state đạt điểm cao nhất tại 1 depth (placed_count).
-/// Dùng để khởi động lại 20% envs từ vị thế tốt thay vì từ bàn trống.
+/// Dùng để khởi động lại 80% envs từ vị thế tốt thay vì từ bàn trống.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MaxScoreStateRecord {
     pub depth: usize,
@@ -662,7 +662,7 @@ pub struct AlphaZeroPipeline {
     pub replay_buffer: AlphaZeroReplayBuffer,
     /// Số sample MỚI thực sự được giữ lại trong lần self-play vừa rồi (dùng để quyết định lượng train).
     pub last_new_samples: usize,
-    /// Danh sách board state đạt điểm cao nhất tại mỗi depth (khởi động lại 20% envs).
+    /// Danh sách board state đạt điểm cao nhất tại mỗi depth (khởi động lại 80% envs).
     pub max_score_states: Vec<MaxScoreStateRecord>,
 }
 
@@ -782,12 +782,12 @@ impl AlphaZeroPipeline {
         let temp_thresh = self.config.temp_threshold_moves;
         let mcts = MCTSSearch::new(mcts_cfg.clone());
 
-        // Xác định trước 20% envs sẽ khởi động từ board state max-score (nếu có sẵn).
+        // Xác định trước 80% envs sẽ khởi động từ board state max-score (nếu có sẵn).
         let mut envs: Vec<DorfromantikEnv> = Vec::with_capacity(n_envs);
         let mut from_state = vec![false; n_envs];
         let mut move_counts = vec![0usize; n_envs];
         if !self.max_score_states.is_empty() {
-            let count = ((n_envs as f32) * 0.20) as usize;
+            let count = ((n_envs as f32) * 0.80) as usize;
             // Dùng 1 RNG đơn giản để chọn ngẫu nhiên các env nào từ state (không phụ thuộc ngoài)
             let mut chosen = std::collections::HashSet::new();
             let seed_rng = base_seed as u64;
@@ -890,7 +890,7 @@ impl AlphaZeroPipeline {
         let mut best_record: Option<GameMatchRecord> = None;
 
         for i in 0..n_envs {
-            // Ghi nhận max-score states tại các depth (dùng để khởi động lại 20% envs iter sau).
+            // Ghi nhận max-score states tại các depth (dùng để khởi động lại 80% envs iter sau).
             self.merge_max_score_state(&move_records[i]);
 
             let final_score = envs[i].score_manager.total_score;
