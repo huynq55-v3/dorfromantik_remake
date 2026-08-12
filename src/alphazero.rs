@@ -371,21 +371,14 @@ pub struct GameMatchRecord {
     pub moves: Vec<GameMoveRecord>,
 }
 
-/// Bản ghi board state đạt điểm cao nhất tại 1 depth (placed_count).
+/// Bản ghi board state có Q-value cao.
 /// Dùng để khởi động lại 80% envs từ vị thế tốt thay vì từ bàn trống.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MaxScoreStateRecord {
-    pub depth: usize,
-    /// Điểm cao nhất đạt được tại depth này.
-    pub best_score: usize,
-    /// Tất cả các cấu hình game cùng đạt best_score (mỗi cấu hình là 1 chuỗi moves để replay).
-    pub states: Vec<GameStateRecord>,
-}
-
-/// Một cấu hình board state cụ thể (score tại depth đó + moves để tái hiện).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct GameStateRecord {
-    pub score: usize,
+    /// Q-value ước lượng tổng điểm cuối game: total_score + target_val * 100.
+    pub q_value: f32,
+    /// Số tile còn lại (phải >= 10 mới được lưu).
+    pub remaining_tiles: usize,
     /// Các actions dùng để đạt board state này (replay deterministic theo seed).
     pub moves: Vec<GameMoveRecord>,
 }
@@ -681,60 +674,32 @@ impl AlphaZeroPipeline {
         }
     }
 
-    /// Gộp điểm cao nhất của 1 ván chơi vào danh sách max-score states theo depth.
-    /// Mỗi depth giữ best_score + TẤT CẢ cấu hình đạt đúng best_score đó.
-    /// CHỈ lưu state khi còn >= 5 tile chưa đặt (để có đủ không gian chơi tiếp từ vị thế đó).
-    pub fn merge_max_score_state(&mut self, moves: &[GameMoveRecord]) {
-        for (i, m) in moves.iter().enumerate() {
-            // Chỉ lưu khi số tile còn lại >= 5.
-            if (m.remaining_tiles) < 5 {
-                continue;
-            }
-            let depth = i + 1; // placed_count sau khi xong move i
-            let score = m.total_score;
-            // Tìm state hiện có cho depth này
-            let existing_idx = self.max_score_states.iter().position(|s| s.depth == depth);
-            match existing_idx {
-                Some(idx) => {
-                    let best = &mut self.max_score_states[idx].best_score;
-                    if score > *best {
-                        // Score mới cao hơn => reset best, chỉ giữ state này.
-                        *best = score;
-                        self.max_score_states[idx].states = vec![GameStateRecord {
-                            score,
-                            moves: moves[..depth].to_vec(),
-                        }];
-                    } else if score == self.max_score_states[idx].best_score {
-                        // Cùng đạt best score => thêm cấu hình vào danh sách (nếu chưa có moves này).
-                        let already = self.max_score_states[idx].states.iter().any(|s| {
-                            s.moves.len() == depth
-                                && s.moves.iter().zip(moves[..depth].iter()).all(|(a, b)| {
-                                    a.q == b.q && a.r == b.r && a.rotation == b.rotation
-                                })
-                        });
-                        if !already {
-                            self.max_score_states[idx].states.push(GameStateRecord {
-                                score,
-                                moves: moves[..depth].to_vec(),
-                            });
-                        }
-                    }
+    /// Thêm 1 board state có Q-value cao vào danh sách (top 2000 state Q tốt nhất).
+    /// Q = total_score + target_val * 100.
+    pub fn add_high_q_state(&mut self, q_value: f32, remaining_tiles: usize, moves: &[GameMoveRecord]) {
+        // Bỏ qua nếu chuỗi moves đã tồn tại; chỉ cập nhật Q-value nếu cao hơn.
+        for s in self.max_score_states.iter_mut() {
+            if s.moves.len() == moves.len()
+                && s.moves.iter().zip(moves.iter()).all(|(a, b)| a.q == b.q && a.r == b.r && a.rotation == b.rotation)
+            {
+                if q_value > s.q_value {
+                    s.q_value = q_value;
+                    s.remaining_tiles = remaining_tiles;
                 }
-                None => {
-                    self.max_score_states.push(MaxScoreStateRecord {
-                        depth,
-                        best_score: score,
-                        states: vec![GameStateRecord {
-                            score,
-                            moves: moves[..depth].to_vec(),
-                        }],
-                    });
-                }
+                return;
             }
         }
+        self.max_score_states.push(MaxScoreStateRecord {
+            q_value,
+            remaining_tiles,
+            moves: moves.to_vec(),
+        });
+        // Sắp xếp giảm dần theo Q-value, giữ tối đa 2000 state.
+        self.max_score_states.sort_by(|a, b| b.q_value.partial_cmp(&a.q_value).unwrap_or(std::cmp::Ordering::Equal));
+        if self.max_score_states.len() > 2000 {
+            self.max_score_states.truncate(2000);
+        }
     }
-
-    /// Thu thập dữ liệu tự chơi GPU (Parallel GPU Self-Play)
     pub fn collect_self_play_data_gpu(
         &mut self,
         eval_tx: &crossbeam_channel::Sender<crate::gpu_engine::GpuEvalRequest>,
@@ -807,16 +772,14 @@ impl AlphaZeroPipeline {
         for idx in 0..n_envs {
             let mut env = DorfromantikEnv::new(base_seed, initial_stack, tile_limit);
             if from_state[idx] {
-                // Chọn 1 record depth + 1 cấu hình trong states (đơn giản dựa trên idx).
+                // Chọn 1 board state Q-value cao (danh sách đã sort giảm dần).
                 if let Some(state) = self.max_score_states.get(idx % self.max_score_states.len()) {
-                    if let Some(cfg) = state.states.get(idx % state.states.len()) {
-                        // Replay moves để đạt board state tại depth = state.depth
-                        for m in &cfg.moves {
-                            let _ = env.step(crate::env::Action { q: m.q, r: m.r, rotation: m.rotation });
-                            if env.is_game_over() { break; }
-                        }
-                        move_counts[idx] = state.depth;
+                    // Replay moves để đạt board state (depth = moves.len()).
+                    for m in &state.moves {
+                        let _ = env.step(crate::env::Action { q: m.q, r: m.r, rotation: m.rotation });
+                        if env.is_game_over() { break; }
                     }
+                    move_counts[idx] = state.moves.len();
                 }
             }
             envs.push(env);
@@ -895,9 +858,6 @@ impl AlphaZeroPipeline {
         let mut best_record: Option<GameMatchRecord> = None;
 
         for i in 0..n_envs {
-            // Ghi nhận max-score states tại các depth (dùng để khởi động lại 80% envs iter sau).
-            self.merge_max_score_state(&move_records[i]);
-
             let final_score = envs[i].score_manager.total_score;
             let placed_count = envs[i].placed_count;
             total_score += final_score;
@@ -925,6 +885,16 @@ impl AlphaZeroPipeline {
                     target_pi: pi,
                     target_val: g,
                 });
+
+                // Thu thập board state có Q-value cao (điểm hiện tại + tiềm năng tương lai).
+                // Chỉ giữ khi còn >= 10 tile chưa đặt.
+                if t < move_records[i].len() {
+                    let m = &move_records[i][t];
+                    if m.remaining_tiles >= 10 {
+                        let q = m.total_score as f32 + g * 100.0;
+                        self.add_high_q_state(q, m.remaining_tiles, &move_records[i][..=t]);
+                    }
+                }
             }
             samples.reverse();
             self.last_new_samples += self.replay_buffer.push_batch(samples);
@@ -1211,53 +1181,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_merge_max_score_state_keeps_all_best_per_depth() {
+    fn test_add_high_q_state_keeps_top_n_sorted() {
         let mut pipe = AlphaZeroPipeline::new(AlphaZeroTrainerConfig::default());
+        let mk = |q: i32| GameMoveRecord { step: 0, q, r: 0, rotation: 0, score_gained: 0, total_score: q as usize, remaining_tiles: 50 };
 
-        // Ván 1: depth 1 score 10, depth 2 score 20
-        let moves1 = vec![
-            GameMoveRecord { step: 0, q: 0, r: 1, rotation: 0, score_gained: 10, total_score: 10, remaining_tiles: 99 },
-            GameMoveRecord { step: 1, q: 0, r: 2, rotation: 1, score_gained: 10, total_score: 20, remaining_tiles: 98 },
-        ];
-        pipe.merge_max_score_state(&moves1);
+        // Thêm 2 state với Q khác nhau => giữ 2, sort Q giảm dần.
+        pipe.add_high_q_state(50.0, 50, &[mk(1)]);
+        pipe.add_high_q_state(80.0, 50, &[mk(2)]);
         assert_eq!(pipe.max_score_states.len(), 2);
+        assert_eq!(pipe.max_score_states[0].q_value, 80.0);
+        assert_eq!(pipe.max_score_states[1].q_value, 50.0);
 
-        // Ván 2: depth 1 score 30 (cao hơn), depth 2 score 20 (bằng best => thêm cấu hình)
-        let moves2 = vec![
-            GameMoveRecord { step: 0, q: 1, r: 1, rotation: 0, score_gained: 30, total_score: 30, remaining_tiles: 99 },
-            GameMoveRecord { step: 1, q: 1, r: 2, rotation: 2, score_gained: 0, total_score: 20, remaining_tiles: 98 },
-        ];
-        pipe.merge_max_score_state(&moves2);
-
-        // depth 1: best = 30, chỉ 1 cấu hình (ván 2), duration 20 bị thay thế
-        let d1 = pipe.max_score_states.iter().find(|s| s.depth == 1).unwrap();
-        assert_eq!(d1.best_score, 30);
-        assert_eq!(d1.states.len(), 1); // ván 1 (score 10) bị thay bằng ván 2 (score 30)
-        assert_eq!(d1.states[0].moves[0].q, 1);
-
-        // depth 2: best = 20, có 2 cấu hình (ván 1 và ván 2 đều đạt 20)
-        let d2 = pipe.max_score_states.iter().find(|s| s.depth == 2).unwrap();
-        assert_eq!(d2.best_score, 20);
-        assert_eq!(d2.states.len(), 2);
+        // Trùng moves (cùng q) => không thêm mới, giữ 2 state.
+        pipe.add_high_q_state(90.0, 50, &[mk(2)]);
+        assert_eq!(pipe.max_score_states.len(), 2);
+        assert_eq!(pipe.max_score_states[0].q_value, 90.0); // cập nhật Q nhưng giữ vị trí sort lại
     }
 
     #[test]
-    fn test_merge_max_score_state_skips_low_remaining_tiles() {
+    fn test_add_high_q_state_truncates_to_2000() {
         let mut pipe = AlphaZeroPipeline::new(AlphaZeroTrainerConfig::default());
-
-        // depth 5 nhưng chỉ còn 3 tile (remaining_tiles = 3 < 5) => không lưu
-        let moves = vec![
-            GameMoveRecord { step: 0, q: 0, r: 1, rotation: 0, score_gained: 10, total_score: 10, remaining_tiles: 99 },
-            GameMoveRecord { step: 1, q: 0, r: 2, rotation: 1, score_gained: 10, total_score: 20, remaining_tiles: 98 },
-            GameMoveRecord { step: 2, q: 0, r: 3, rotation: 2, score_gained: 10, total_score: 30, remaining_tiles: 97 },
-            GameMoveRecord { step: 3, q: 0, r: 4, rotation: 3, score_gained: 10, total_score: 40, remaining_tiles: 96 },
-            GameMoveRecord { step: 4, q: 0, r: 5, rotation: 4, score_gained: 10, total_score: 50, remaining_tiles: 3 },
-        ];
-        pipe.merge_max_score_state(&moves);
-
-        // Chỉ depth 1..4 được lưu (remaining_tiles >= 5), depth 5 (remaining = 3) bị bỏ.
-        let d5 = pipe.max_score_states.iter().find(|s| s.depth == 5);
-        assert!(d5.is_none(), "depth 5 với remaining_tiles=3 không được lưu");
-        assert_eq!(pipe.max_score_states.len(), 4);
+        // Thêm hơn 2000 state Q khác nhau.
+        for i in 0..2200 {
+            let m = GameMoveRecord { step: 0, q: i as i32, r: 0, rotation: 0, score_gained: 0, total_score: i, remaining_tiles: 50 };
+            pipe.add_high_q_state(i as f32, 50, &[m]);
+        }
+        assert_eq!(pipe.max_score_states.len(), 2000);
+        // Giữ 2000 Q cao nhất: 2199..2000.
+        assert_eq!(pipe.max_score_states[0].q_value, 2199.0);
+        assert_eq!(pipe.max_score_states[1999].q_value, 200.0);
     }
 }
