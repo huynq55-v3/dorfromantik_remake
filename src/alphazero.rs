@@ -683,8 +683,13 @@ impl AlphaZeroPipeline {
 
     /// Gộp điểm cao nhất của 1 ván chơi vào danh sách max-score states theo depth.
     /// Mỗi depth giữ best_score + TẤT CẢ cấu hình đạt đúng best_score đó.
+    /// CHỈ lưu state khi còn >= 5 tile chưa đặt (để có đủ không gian chơi tiếp từ vị thế đó).
     pub fn merge_max_score_state(&mut self, moves: &[GameMoveRecord]) {
         for (i, m) in moves.iter().enumerate() {
+            // Chỉ lưu khi số tile còn lại >= 5.
+            if (m.remaining_tiles) < 5 {
+                continue;
+            }
             let depth = i + 1; // placed_count sau khi xong move i
             let score = m.total_score;
             // Tìm state hiện có cho depth này
@@ -1234,5 +1239,25 @@ mod tests {
         let d2 = pipe.max_score_states.iter().find(|s| s.depth == 2).unwrap();
         assert_eq!(d2.best_score, 20);
         assert_eq!(d2.states.len(), 2);
+    }
+
+    #[test]
+    fn test_merge_max_score_state_skips_low_remaining_tiles() {
+        let mut pipe = AlphaZeroPipeline::new(AlphaZeroTrainerConfig::default());
+
+        // depth 5 nhưng chỉ còn 3 tile (remaining_tiles = 3 < 5) => không lưu
+        let moves = vec![
+            GameMoveRecord { step: 0, q: 0, r: 1, rotation: 0, score_gained: 10, total_score: 10, remaining_tiles: 99 },
+            GameMoveRecord { step: 1, q: 0, r: 2, rotation: 1, score_gained: 10, total_score: 20, remaining_tiles: 98 },
+            GameMoveRecord { step: 2, q: 0, r: 3, rotation: 2, score_gained: 10, total_score: 30, remaining_tiles: 97 },
+            GameMoveRecord { step: 3, q: 0, r: 4, rotation: 3, score_gained: 10, total_score: 40, remaining_tiles: 96 },
+            GameMoveRecord { step: 4, q: 0, r: 5, rotation: 4, score_gained: 10, total_score: 50, remaining_tiles: 3 },
+        ];
+        pipe.merge_max_score_state(&moves);
+
+        // Chỉ depth 1..4 được lưu (remaining_tiles >= 5), depth 5 (remaining = 3) bị bỏ.
+        let d5 = pipe.max_score_states.iter().find(|s| s.depth == 5);
+        assert!(d5.is_none(), "depth 5 với remaining_tiles=3 không được lưu");
+        assert_eq!(pipe.max_score_states.len(), 4);
     }
 }
