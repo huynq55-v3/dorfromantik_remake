@@ -426,12 +426,21 @@ impl DorfromantikEnv {
             let curr_cfg = curr.to_hex_edge_config();
             let is_quest_tile = if matches!(curr, GeneratedTile::Quest { .. }) { 1.0 } else { 0.0 };
 
+            // Quest info của tile SẮP ĐẶT: equality (MoreThan/Exactly) + con số bubble ban đầu.
+            let mut curr_equality_more = 0.0f32;
+            let mut curr_remaining = 0.0f32;
+            if let GeneratedTile::Quest { quest_data, .. } = curr {
+                curr_remaining = (quest_data.remaining_display_value() as f32 / 100.0).clamp(0.0, 1.0);
+                if let EqualityComparison::MoreThan = quest_data.equality {
+                    curr_equality_more = 1.0;
+                }
+            }
+
             for act in &valid_actions {
                 let mut feat = [0.0f32; 16];
                 let mut matching_count = 0;
                 let mut mismatching_count = 0;
                 let mut quest_adj = 0.0f32;
-                let mut quest_connect = 0.0f32;
 
                 for dir in 0..6 {
                     let n_pos = get_neighbor_pos(act.q, act.r, dir);
@@ -445,11 +454,6 @@ impl DorfromantikEnv {
 
                         if is_match {
                             matching_count += 1;
-                            if let GeneratedTile::Quest { quest_data, .. } = &n_tile.tile {
-                                if !n_tile.quest_finalized && Some(quest_data.primary_group_type()) == c_edge.to_group_type() {
-                                    quest_connect = 1.0;
-                                }
-                            }
                         } else {
                             mismatching_count += 1;
                         }
@@ -464,10 +468,10 @@ impl DorfromantikEnv {
 
                 feat[0] = matching_count as f32 / 6.0;
                 feat[1] = mismatching_count as f32 / 6.0;
-                feat[2] = 0.0; // Bỏ open_count feature tránh gây bias kéo dài ra ô trống ở rìa
+                feat[2] = curr_remaining; // Con số bubble của tile sắp đặt (0 nếu không phải quest)
                 feat[3] = if matching_count > 0 && mismatching_count == 0 { 1.0 } else { 0.0 };
                 feat[4] = quest_adj;
-                feat[5] = quest_connect;
+                feat[5] = curr_equality_more; // 1 = MoreThan, 0 = Exactly (chỉ có nghĩa khi tile là quest)
                 feat[6] = is_quest_tile;
                 feat[7] = act.rotation as f32 / 6.0;
                 // Tọa độ vị trí action (thay thế 2 feature trùng lặp feat[0] & feat[5])

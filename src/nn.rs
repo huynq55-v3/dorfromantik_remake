@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use serde::{Serialize, Deserialize};
 
 /// Hidden dimension dùng chung cho toàn bộ backbone GNN và các MLP Head.
-pub const HIDDEN_DIM: usize = 256;
+pub const HIDDEN_DIM: usize = 128;
 /// Số chiều feature của mỗi action (định nghĩa trong env::GraphObservation).
 pub const ACTION_FEAT_DIM: usize = 16;
 /// Số layer message passing (aggregate + combine / residual block).

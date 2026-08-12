@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 use dorfromantik_remake::alphazero::{
-    evaluate_alphazero_agent, AlphaZeroPipeline, AlphaZeroTrainerConfig, GameMatchRecord,
+    evaluate_alphazero_agent, AlphaZeroPipeline, AlphaZeroTrainerConfig, GameMatchRecord, MaxScoreStateRecord,
 };
 use dorfromantik_remake::gpu_engine::GpuEngine;
 use dorfromantik_remake::gpu_nn::GpuNNExecutor;
@@ -83,7 +83,7 @@ fn main() {
     }
 
     let (target_seed, initial_stack, tile_limit) = load_monthly_game_config();
-    let parallel_envs = 256;
+    let parallel_envs = 512;
 
     // Đọc số simulations từ tham số dòng lệnh nếu có (mặc định 400)
     let args: Vec<String> = std::env::args().collect();
@@ -130,7 +130,7 @@ fn main() {
         lr,
         gamma: 0.99,
         value_loss_coeff: 0.5,
-        batch_size: 512,
+        batch_size: 1024,
         train_epochs_per_iter: train_epochs,
         mcts_config: MCTSConfig {
             c_puct: 1.5,
@@ -154,6 +154,7 @@ fn main() {
     let buffer_path = format!("{}/alphazero_buffer.bin", model_dir);
     let meta_path = format!("{}/alphazero_meta.txt", model_dir);
     let best_game_path = format!("{}/best_game_record.json", model_dir);
+    let max_score_states_path = format!("{}/max_score_states.json", model_dir);
 
     let mut pipeline = AlphaZeroPipeline::new(config.clone());
     let mut start_iter = 0;
@@ -221,6 +222,19 @@ fn main() {
         }
     }
 
+    // 3.5. Khôi phục danh sách max-score states (để khởi động lại 20% envs từ vị thế tốt)
+    if Path::new(&max_score_states_path).exists() {
+        if let Ok(content) = fs::read_to_string(&max_score_states_path) {
+            if let Ok(states) = serde_json::from_str::<Vec<MaxScoreStateRecord>>(&content) {
+                pipeline.max_score_states = states;
+                println!(
+                    "[MaxScoreStates] Đã khôi phục {} state max-score từ `{}`.",
+                    pipeline.max_score_states.len(), max_score_states_path
+                );
+            }
+        }
+    }
+
     // 4. Khôi phục Replay Buffer nếu có
     if Path::new(&buffer_path).exists() {
         println!("[Buffer] Đang nạp Replay Buffer từ `{}`...", buffer_path);
@@ -263,7 +277,7 @@ fn main() {
     println!(" - Số MCTS Simulations / Turn: {}", n_simulations);
     println!(" - Batch Size: {}", config.batch_size);
     println!(" - Train Epochs / Iter: {}", config.train_epochs_per_iter);
-    let buffer_capacity = config.replay_buffer_capacity.unwrap_or(100_000);
+    let buffer_capacity = config.replay_buffer_capacity.unwrap_or(200_000);
     println!(" - Replay Buffer Capacity: {} samples", buffer_capacity);
     println!(" - Warm-up (train sau ≥ 20%): ≥ {} samples", ((buffer_capacity as f32) * 0.20) as usize);
     println!(" - Temp Threshold (exploration moves): {}", config.temp_threshold_moves);
@@ -370,6 +384,13 @@ fn main() {
 
         if let Err(e) = pipeline.replay_buffer.save_to_file(&buffer_path) {
             println!("[Save Error] Không thể lưu replay buffer: {:?}", e);
+        }
+
+        // Lưu danh sách max-score states (20% envs khởi động lại từ vị thế tốt ở iter sau)
+        if let Ok(json_str) = serde_json::to_string_pretty(&pipeline.max_score_states) {
+            if let Err(e) = fs::write(&max_score_states_path, json_str) {
+                println!("[Save Error] Không thể lưu max_score_states: {:?}", e);
+            }
         }
 
         // E. Đánh giá (Evaluation) mỗi 5 iterations
