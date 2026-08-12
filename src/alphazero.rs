@@ -748,6 +748,77 @@ impl AlphaZeroPipeline {
         (avg_score, max_score, avg_placed, best_record)
     }
 
+    /// Cập nhật lại toàn bộ Q-value của max_score_states bằng MCTS song song (batch).
+    /// Mỗi state: replay moves trong file để dựng board, rồi chạy MCTS `n_simulations` sim
+    /// (temp thấp, không dirichlet) lấy root value; Q mới = total_score hiện tại + root_value * 100.
+    /// State không replay được sẽ GIỮ NGUYÊN (không cập nhật, không xóa). Trả về số state đã cập nhật.
+    pub fn refresh_max_score_state_q_values(
+        &mut self,
+        gpu_exec: Option<&GpuNNExecutor>,
+        n_simulations: usize,
+    ) -> usize {
+        let base_seed = self.config.target_seed;
+        let initial_stack = self.config.initial_stack;
+        let tile_limit = self.config.tile_limit;
+        let n = self.max_score_states.len();
+        if n == 0 {
+            return 0;
+        }
+
+        let mut mcts_cfg = self.config.mcts_config.clone();
+        mcts_cfg.n_simulations = n_simulations;
+        let mcts = MCTSSearch::new(mcts_cfg.clone());
+
+        // BƯỚC 1: replay từng moves trong file để dựng lại board state (kiểm tra hợp lệ).
+        let mut valid_envs: Vec<DorfromantikEnv> = Vec::with_capacity(n);
+        let mut orig_idx: Vec<usize> = Vec::with_capacity(n);
+        let mut base_scores: Vec<usize> = Vec::with_capacity(n);
+        for (i, st) in self.max_score_states.iter().enumerate() {
+            let mut env = DorfromantikEnv::new(base_seed, initial_stack, tile_limit);
+            let mut ok = true;
+            for m in &st.moves {
+                let act = crate::env::Action { q: m.q, r: m.r, rotation: m.rotation };
+                if !env.get_valid_actions().contains(&act) {
+                    ok = false;
+                    break;
+                }
+                env.step(act);
+                if env.is_game_over() {
+                    break;
+                }
+            }
+            if ok && env.placed_count == st.moves.len() {
+                base_scores.push(env.score_manager.total_score);
+                valid_envs.push(env);
+                orig_idx.push(i);
+            } else {
+                base_scores.push(0);
+            }
+        }
+        let b_count = valid_envs.len();
+        if b_count == 0 {
+            return 0;
+        }
+
+        // BƯỚC 2: sau khi đã make move, chạy MCTS 800 sim batch (temp 0.2, KHÔNG dirichlet).
+        let active: Vec<usize> = (0..b_count).collect();
+        let results = mcts.search_batch_indexed(&valid_envs, &active, &self.model, gpu_exec, false, 0.2);
+
+        // BƯỚC 3: ghi đè Q value: total_score + root_value * 100.
+        for (k, &st_idx) in orig_idx.iter().enumerate() {
+            let root_val = results[k].3;
+            self.max_score_states[st_idx].q_value = base_scores[st_idx] as f32 + root_val * 100.0;
+        }
+
+        // BƯỚC 4: sort giảm dần, giữ top 2000 (giống add_high_q_state).
+        self.max_score_states.sort_by(|a, b| b.q_value.partial_cmp(&a.q_value).unwrap_or(std::cmp::Ordering::Equal));
+        if self.max_score_states.len() > 2000 {
+            self.max_score_states.truncate(2000);
+        }
+
+        b_count
+    }
+
     /// Thu thập dữ liệu tự chơi bằng Vectorized Batch MCTS (Không channel, không lock-step stall)
     /// Khi có gpu_exec: dùng GPU inference cho neural network evaluation.
     pub fn collect_self_play_data_batch(&mut self, gpu_exec: Option<&GpuNNExecutor>) -> (f32, usize, usize, Option<GameMatchRecord>) {

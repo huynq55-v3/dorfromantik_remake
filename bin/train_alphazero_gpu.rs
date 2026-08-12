@@ -328,6 +328,17 @@ fn main() {
             exec.sync_weights(&pipeline.model);
         }
 
+        // A.5. Refresh Q-value của toàn bộ max-score states bằng MCTS 800 sim (song song batch)
+        let refresh_start = Instant::now();
+        let n_refreshed = pipeline.refresh_max_score_state_q_values(gpu_executor.as_ref(), 800);
+        let refresh_dur = refresh_start.elapsed();
+        println!(
+            "[Refresh Q] Cập nhật Q-value {}/{} states với 800 sim trong {:.2}s",
+            n_refreshed,
+            pipeline.max_score_states.len(),
+            refresh_dur.as_secs_f32()
+        );
+
         // B. Tự chơi (Vectorized Batch MCTS + GPU Neural Network Inference)
         let self_play_start = Instant::now();
         let (avg_score, max_score, avg_placed, best_self_play_record) =
