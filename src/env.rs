@@ -6,6 +6,41 @@ use crate::quest_manager::QuestManager;
 use crate::score_manager::ScoreManager;
 use crate::tile::{EqualityComparison, GeneratedTile};
 
+/// Node feature indices (70 dims). Định nghĩa tường minh để tránh magic numbers.
+pub mod node_feat {
+    pub const IS_PLACED: usize = 0;
+    pub const IS_CANDIDATE: usize = 1;
+    pub const EDGE_TERRAIN_START: usize = 2;   // 6 edges
+    pub const OPEN_EDGE_START: usize = 8;      // 6 flags
+    pub const GROUP_OPEN_EDGES: usize = 15;
+    pub const QUEST_ACTIVE: usize = 16;
+    pub const QUEST_GROUP_TYPE_START: usize = 17; // 5 groups
+    pub const QUEST_EQUALITY_MORE: usize = 22;
+    pub const QUEST_EQUALITY_EXACTLY: usize = 23;
+    pub const QUEST_REMAINING: usize = 24;
+    pub const UPCOMING_TILE1_START: usize = 27;   // 6 edges
+    pub const UPCOMING_TILE2_START: usize = 33;   // 6 edges
+    pub const STEP_RATIO: usize = 39;
+    pub const EDGE_FEATURES_START: usize = 40;    // 6 edges × 5 groups
+    pub const DIM: usize = 70;
+}
+
+/// Action feature indices (16 dims).
+pub mod action_feat {
+    pub const MATCHING_COUNT: usize = 0;
+    pub const MISMATCHING_COUNT: usize = 1;
+    pub const CURR_REMAINING: usize = 2;
+    pub const ALL_MATCH: usize = 3;
+    pub const QUEST_ADJ: usize = 4;
+    pub const CURR_EQUALITY_MORE: usize = 5;
+    pub const IS_QUEST_TILE: usize = 6;
+    pub const ROTATION: usize = 7;
+    pub const EDGE_TYPES_START: usize = 8;  // 6 edge types
+    pub const POS_Q: usize = 14;
+    pub const POS_R: usize = 15;
+    pub const DIM: usize = 16;
+}
+
 /// Hành động đặt tile trong môi trường RL
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Action {
@@ -51,6 +86,24 @@ pub struct DorfromantikEnv {
     pub score_manager: ScoreManager,
     pub tile_queue: VecDeque<GeneratedTile>,
     pub placed_count: usize,
+}
+
+/// Trạng thái lưu tạm để undo 1 bước step() — không clone placed_tiles.
+#[derive(Debug, Clone)]
+pub struct EnvUndoState {
+    pub board_undo: crate::board::BoardUndoState,
+    pub action_q: Option<i32>,
+    pub action_r: Option<i32>,
+    pub placed_count: usize,
+    pub total_score: usize,
+    pub remaining_tiles: usize,
+    pub is_game_over: bool,
+    pub placed_tiles_count: usize,
+    pub perfect_count: usize,
+    pub consecutive_perfects: usize,
+    pub quest_manager_clone: QuestManager,
+    pub generator_clone: TileGenerator,
+    pub tile_queue_clone: VecDeque<GeneratedTile>,
 }
 
 impl DorfromantikEnv {
@@ -255,6 +308,67 @@ impl DorfromantikEnv {
             || self.get_valid_actions().is_empty()
     }
 
+    /// Lưu trạng thái trước khi step, để có thể undo.
+    pub fn save_checkpoint(&self, action: Action) -> EnvUndoState {
+        EnvUndoState {
+            board_undo: self.board.save_undo_state(),
+            action_q: Some(action.q),
+            action_r: Some(action.r),
+            placed_count: self.placed_count,
+            total_score: self.score_manager.total_score,
+            remaining_tiles: self.score_manager.remaining_tiles,
+            is_game_over: self.score_manager.is_game_over,
+            placed_tiles_count: self.score_manager.placed_tiles_count,
+            perfect_count: self.score_manager.perfect_count,
+            consecutive_perfects: self.score_manager.consecutive_perfects,
+            quest_manager_clone: self.quest_manager.clone(),
+            generator_clone: self.generator.clone(),
+            tile_queue_clone: self.tile_queue.clone(),
+        }
+    }
+
+    /// Lưu checkpoint gốc (không có action — dùng để quay về trạng thái đầu MCTS search).
+    pub fn save_root_checkpoint(&self) -> EnvUndoState {
+        EnvUndoState {
+            board_undo: self.board.save_undo_state(),
+            action_q: None,
+            action_r: None,
+            placed_count: self.placed_count,
+            total_score: self.score_manager.total_score,
+            remaining_tiles: self.score_manager.remaining_tiles,
+            is_game_over: self.score_manager.is_game_over,
+            placed_tiles_count: self.score_manager.placed_tiles_count,
+            perfect_count: self.score_manager.perfect_count,
+            consecutive_perfects: self.score_manager.consecutive_perfects,
+            quest_manager_clone: self.quest_manager.clone(),
+            generator_clone: self.generator.clone(),
+            tile_queue_clone: self.tile_queue.clone(),
+        }
+    }
+
+    /// Khôi phục trạng thái trước bước step gần nhất.
+    pub fn restore_checkpoint(&mut self, state: EnvUndoState) {
+        if let (Some(q), Some(r)) = (state.action_q, state.action_r) {
+            self.board.restore_undo_state(state.board_undo, (q, r));
+        } else {
+            // Root checkpoint: chỉ restore groups + edge_to_group, không xóa tile
+            self.board.groups = state.board_undo.groups;
+            self.board.edge_to_group = state.board_undo.edge_to_group;
+            self.board.next_group_id = state.board_undo.next_group_id;
+        }
+        // tile_queue_clone đã lưu queue trước khi pop front
+        self.tile_queue = state.tile_queue_clone;
+        self.placed_count = state.placed_count;
+        self.score_manager.total_score = state.total_score;
+        self.score_manager.remaining_tiles = state.remaining_tiles;
+        self.score_manager.is_game_over = state.is_game_over;
+        self.score_manager.placed_tiles_count = state.placed_tiles_count;
+        self.score_manager.perfect_count = state.perfect_count;
+        self.score_manager.consecutive_perfects = state.consecutive_perfects;
+        self.quest_manager = state.quest_manager_clone;
+        self.generator = state.generator_clone;
+    }
+
     /// Trích xuất Đặc trưng Đồ thị (Graph Feature Extraction) cho GNN
     pub fn extract_graph_observation(&self) -> GraphObservation {
         let placed = &self.board.placed_tiles;
@@ -293,13 +407,13 @@ impl DorfromantikEnv {
                 // 2..8: 6 Edges terrain normalized (0.0 .. 1.0)
                 for dir in 0..6 {
                     let edge_type = pt.edge_config.edges[dir];
-                    feature[2 + dir] = (edge_type as usize as f32) / 7.0;
+                    feature[node_feat::EDGE_TERRAIN_START + dir] = (edge_type as usize as f32) / 7.0;
                 }
 
                 // 8..14: Open/Closed edge flags
                 for dir in 0..6 {
                     let n_pos = get_neighbor_pos(pos.0, pos.1, dir);
-                    feature[8 + dir] = if placed.contains_key(&n_pos) { 0.0 } else { 1.0 };
+                    feature[node_feat::OPEN_EDGE_START + dir] = if placed.contains_key(&n_pos) { 0.0 } else { 1.0 };
                 }
 
                 // 14: (bỏ — không dùng, giữ = 0 để không phá layout kênh feature)
@@ -318,7 +432,7 @@ impl DorfromantikEnv {
                 // 16..27: Quest features
                 if let GeneratedTile::Quest { quest_data, .. } = &pt.tile {
                     // Quest đang cần xử lý hay không (1 = active, 0 = đã kết thúc / không còn là quest)
-                    feature[16] = if pt.quest_finalized { 0.0 } else { 1.0 };
+                    feature[node_feat::QUEST_ACTIVE] = if pt.quest_finalized { 0.0 } else { 1.0 };
                     if !pt.quest_finalized {
                         let gt = quest_data.primary_group_type();
                         let gt_idx = match gt {
@@ -328,17 +442,17 @@ impl DorfromantikEnv {
                             GroupType::Water => 3,
                             GroupType::TrainTracks => 4,
                         };
-                        feature[17 + gt_idx] = 1.0;
+                        feature[node_feat::QUEST_GROUP_TYPE_START + gt_idx] = 1.0;
 
                         match quest_data.equality {
-                            EqualityComparison::MoreThan => feature[22] = 1.0,
-                            EqualityComparison::Exactly => feature[23] = 1.0,
+                            EqualityComparison::MoreThan => feature[node_feat::QUEST_EQUALITY_MORE] = 1.0,
+                            EqualityComparison::Exactly => feature[node_feat::QUEST_EQUALITY_EXACTLY] = 1.0,
                         }
 
                         // Con số requirement hiện tại = số object cần thêm bên ngoài để hoàn thành quest
                         // (đã trừ object sẵn có trên chính quest tile, khớp với badge hiển thị +5 / =7)
                         let remaining_need = quest_data.remaining_display_value() as f32;
-                        feature[24] = (remaining_need / 100.0).clamp(0.0, 1.0);
+                        feature[node_feat::QUEST_REMAINING] = (remaining_need / 100.0).clamp(0.0, 1.0);
                     }
                 }
 
@@ -347,7 +461,7 @@ impl DorfromantikEnv {
                 let edge_feats = self.board.count_edge_features(pos);
                 for edge_idx in 0..6 {
                     for ch in 0..5 {
-                        feature[40 + edge_idx * 5 + ch] = edge_feats[edge_idx][ch];
+                        feature[node_feat::EDGE_FEATURES_START + edge_idx * 5 + ch] = edge_feats[edge_idx][ch];
                     }
                 }
             } else {
@@ -358,7 +472,7 @@ impl DorfromantikEnv {
                     if let Some(n_tile) = placed.get(&n_pos) {
                         let opp_dir = (dir + 3) % 6;
                         let edge_type = n_tile.edge_config.edges[opp_dir];
-                        feature[2 + dir] = (edge_type as usize as f32) / 7.0;
+                        feature[node_feat::EDGE_TERRAIN_START + dir] = (edge_type as usize as f32) / 7.0;
                     }
                 }
 
@@ -380,7 +494,7 @@ impl DorfromantikEnv {
                                     }
                                 }
                             }
-                            feature[8 + rot] = (perfect_matches as f32) / 6.0;
+                            feature[node_feat::OPEN_EDGE_START + rot] = (perfect_matches as f32) / 6.0;
                         }
                     }
                 }
@@ -390,7 +504,7 @@ impl DorfromantikEnv {
             if let Some(t1) = tile_1 {
                 let cfg = t1.to_hex_edge_config();
                 for i in 0..6 {
-                    feature[27 + i] = (cfg.edges[i] as usize as f32) / 7.0;
+                    feature[node_feat::UPCOMING_TILE1_START + i] = (cfg.edges[i] as usize as f32) / 7.0;
                 }
             }
 
@@ -398,12 +512,12 @@ impl DorfromantikEnv {
             if let Some(t2) = tile_2 {
                 let cfg = t2.to_hex_edge_config();
                 for i in 0..6 {
-                    feature[33 + i] = (cfg.edges[i] as usize as f32) / 7.0;
+                    feature[node_feat::UPCOMING_TILE2_START + i] = (cfg.edges[i] as usize as f32) / 7.0;
                 }
             }
 
             // 39: Step ratio
-            feature[39] = (self.placed_count as f32 / self.tile_limit as f32).clamp(0.0, 1.0);
+            feature[node_feat::STEP_RATIO] = (self.placed_count as f32 / self.tile_limit as f32).clamp(0.0, 1.0);
 
             node_features.push(feature);
         }
@@ -445,7 +559,7 @@ impl DorfromantikEnv {
                 for dir in 0..6 {
                     let n_pos = get_neighbor_pos(act.q, act.r, dir);
                     let c_edge = curr_cfg.edge_at(dir, act.rotation);
-                    feat[8 + dir] = (c_edge as usize as f32) / 7.0;
+                    feat[action_feat::EDGE_TYPES_START + dir] = (c_edge as usize as f32) / 7.0;
 
                     if let Some(n_tile) = placed.get(&n_pos) {
                         let opp_dir = (dir + 3) % 6;
@@ -466,18 +580,16 @@ impl DorfromantikEnv {
                     }
                 }
 
-                feat[0] = matching_count as f32 / 6.0;
-                feat[1] = mismatching_count as f32 / 6.0;
-                feat[2] = curr_remaining; // Con số bubble của tile sắp đặt (0 nếu không phải quest)
-                feat[3] = if matching_count > 0 && mismatching_count == 0 { 1.0 } else { 0.0 };
-                feat[4] = quest_adj;
-                feat[5] = curr_equality_more; // 1 = MoreThan, 0 = Exactly (chỉ có nghĩa khi tile là quest)
-                feat[6] = is_quest_tile;
-                feat[7] = act.rotation as f32 / 6.0;
-                // Tọa độ vị trí action (thay thế 2 feature trùng lặp feat[0] & feat[5])
-                // Giúp model nhận biết spatial layout, tránh học diagonal chain bias
-                feat[14] = (act.q as f32 / 30.0).clamp(-1.0, 1.0);
-                feat[15] = (act.r as f32 / 30.0).clamp(-1.0, 1.0);
+                feat[action_feat::MATCHING_COUNT] = matching_count as f32 / 6.0;
+                feat[action_feat::MISMATCHING_COUNT] = mismatching_count as f32 / 6.0;
+                feat[action_feat::CURR_REMAINING] = curr_remaining;
+                feat[action_feat::ALL_MATCH] = if matching_count > 0 && mismatching_count == 0 { 1.0 } else { 0.0 };
+                feat[action_feat::QUEST_ADJ] = quest_adj;
+                feat[action_feat::CURR_EQUALITY_MORE] = curr_equality_more;
+                feat[action_feat::IS_QUEST_TILE] = is_quest_tile;
+                feat[action_feat::ROTATION] = act.rotation as f32 / 6.0;
+                feat[action_feat::POS_Q] = (act.q as f32 / 30.0).clamp(-1.0, 1.0);
+                feat[action_feat::POS_R] = (act.r as f32 / 30.0).clamp(-1.0, 1.0);
 
                 action_features.push(feat);
             }

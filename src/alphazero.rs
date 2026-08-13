@@ -413,7 +413,7 @@ pub fn run_self_play_episode(
             (0.2f32, false)
         };
 
-        let (pi_probs, _, chosen_action, _) = mcts.search(&env, model, add_dirichlet, temperature);
+        let (pi_probs, _, chosen_action, _) = mcts.search(&mut env, model, add_dirichlet, temperature);
         let prev_score = env.score_manager.total_score;
         let res = env.step(chosen_action);
         let score_gained = env.score_manager.total_score.saturating_sub(prev_score);
@@ -466,136 +466,6 @@ pub fn run_self_play_episode(
     (samples, record)
 }
 
-/// Thu thập dữ liệu 1 ván tự chơi GPU (Self-Play Episode) qua GpuEvalQueue
-pub fn run_self_play_episode_gpu(
-    seed: i32,
-    initial_stack: usize,
-    tile_limit: usize,
-    eval_tx: &crossbeam_channel::Sender<crate::gpu_engine::GpuEvalRequest>,
-    mcts_config: &MCTSConfig,
-    temp_threshold: usize,
-) -> (Vec<AlphaZeroSample>, GameMatchRecord) {
-    let mut env = DorfromantikEnv::new(seed, initial_stack, tile_limit);
-    let mcts = MCTSSearch::new(mcts_config.clone());
-
-    let mut raw_steps: Vec<(GraphObservation, Vec<f32>, f32)> = Vec::new();
-    let mut move_records: Vec<GameMoveRecord> = Vec::new();
-    let mut move_count = 0;
-
-    loop {
-        let obs = env.extract_graph_observation();
-        if obs.valid_actions.is_empty() {
-            break;
-        }
-
-        let (temperature, add_dirichlet) = if move_count < temp_threshold {
-            (1.0f32, true)
-        } else {
-            (0.2f32, false)
-        };
-
-        let (pi_probs, _, chosen_action, _) = mcts.search_gpu(&env, eval_tx, add_dirichlet, temperature);
-        let prev_score = env.score_manager.total_score;
-        let res = env.step(chosen_action);
-        let score_gained = env.score_manager.total_score.saturating_sub(prev_score);
-        let scaled_r = res.reward * 0.01;
-
-        move_records.push(GameMoveRecord {
-            step: move_count,
-            q: chosen_action.q,
-            r: chosen_action.r,
-            rotation: chosen_action.rotation,
-            score_gained,
-            total_score: env.score_manager.total_score,
-            remaining_tiles: env.score_manager.remaining_tiles,
-        });
-
-        raw_steps.push((obs, pi_probs, scaled_r));
-        move_count += 1;
-
-        if res.done {
-            break;
-        }
-    }
-
-    let final_score = env.score_manager.total_score;
-    let placed_count = env.placed_count;
-
-    let total_steps = raw_steps.len();
-    let mut samples = Vec::with_capacity(total_steps);
-    let mut g = 0.0f32;
-
-    for t in (0..total_steps).rev() {
-        let (obs, pi, r) = raw_steps[t].clone();
-        g = r + mcts_config.gamma * g;
-        samples.push(AlphaZeroSample {
-            obs,
-            target_pi: pi,
-            target_val: g,
-        });
-    }
-
-    samples.reverse();
-    let record = GameMatchRecord {
-        seed,
-        total_score: final_score,
-        total_placed: placed_count,
-        is_eval: false,
-        moves: move_records,
-    };
-    (samples, record)
-}
-
-/// Đánh giá sức mạnh của Model hiện tại với MCTS Greedy trên GPU
-pub fn evaluate_alphazero_agent_gpu(
-    seed: i32,
-    initial_stack: usize,
-    tile_limit: usize,
-    eval_tx: &crossbeam_channel::Sender<crate::gpu_engine::GpuEvalRequest>,
-    mcts_config: &MCTSConfig,
-) -> (usize, usize, GameMatchRecord) {
-    let mut env = DorfromantikEnv::new(seed, initial_stack, tile_limit);
-    let mcts = MCTSSearch::new(mcts_config.clone());
-    let mut move_records: Vec<GameMoveRecord> = Vec::new();
-    let mut move_count = 0;
-
-    while !env.is_game_over() {
-        let obs = env.extract_graph_observation();
-        if obs.valid_actions.is_empty() {
-            break;
-        }
-        let (_, _, chosen_action, _) = mcts.search_gpu(&env, eval_tx, false, 0.0);
-        let prev_score = env.score_manager.total_score;
-        let res = env.step(chosen_action);
-        let score_gained = env.score_manager.total_score.saturating_sub(prev_score);
-
-        move_records.push(GameMoveRecord {
-            step: move_count,
-            q: chosen_action.q,
-            r: chosen_action.r,
-            rotation: chosen_action.rotation,
-            score_gained,
-            total_score: env.score_manager.total_score,
-            remaining_tiles: env.score_manager.remaining_tiles,
-        });
-        move_count += 1;
-
-        if res.done {
-            break;
-        }
-    }
-
-    let record = GameMatchRecord {
-        seed,
-        total_score: env.score_manager.total_score,
-        total_placed: env.placed_count,
-        is_eval: true,
-        moves: move_records,
-    };
-
-    (env.score_manager.total_score, env.placed_count, record)
-}
-
 /// Đánh giá sức mạnh của Model hiện tại với MCTS Greedy (Nhiệt độ = 0.0) trên Seed mục tiêu
 
 pub fn evaluate_alphazero_agent(
@@ -616,7 +486,7 @@ pub fn evaluate_alphazero_agent(
             break;
         }
         // Đánh giá thuần túy: temperature = 0.0 (chọn max visit count), không dirichlet noise
-        let (_, _, chosen_action, _) = mcts.search(&env, model, false, 0.0);
+        let (_, _, chosen_action, _) = mcts.search(&mut env, model, false, 0.0);
         let prev_score = env.score_manager.total_score;
         let res = env.step(chosen_action);
         let score_gained = env.score_manager.total_score.saturating_sub(prev_score);
@@ -708,46 +578,6 @@ impl AlphaZeroPipeline {
             self.max_score_states.truncate(2000);
         }
     }
-    pub fn collect_self_play_data_gpu(
-        &mut self,
-        eval_tx: &crossbeam_channel::Sender<crate::gpu_engine::GpuEvalRequest>,
-    ) -> (f32, usize, usize, Option<GameMatchRecord>) {
-        let n_envs = self.config.num_parallel_envs;
-        let base_seed = self.config.target_seed;
-        let initial_stack = self.config.initial_stack;
-        let tile_limit = self.config.tile_limit;
-        let mcts_cfg = self.config.mcts_config.clone();
-        let temp_thresh = self.config.temp_threshold_moves;
-
-        let seeds: Vec<i32> = vec![base_seed; n_envs];
-
-        let results: Vec<(Vec<AlphaZeroSample>, GameMatchRecord)> = seeds
-            .into_par_iter()
-            .map(|s| run_self_play_episode_gpu(s, initial_stack, tile_limit, eval_tx, &mcts_cfg, temp_thresh))
-            .collect();
-
-        let mut total_score = 0;
-        let mut max_score = 0;
-        let mut total_placed = 0;
-        let mut best_record: Option<GameMatchRecord> = None;
-
-        for (samples, record) in results {
-            let score = record.total_score;
-            let placed = record.total_placed;
-            total_score += score;
-            if score >= max_score {
-                max_score = score;
-                best_record = Some(record);
-            }
-            total_placed += placed;
-            self.replay_buffer.push_batch(samples);
-        }
-
-        let avg_score = total_score as f32 / n_envs as f32;
-        let avg_placed = total_placed / n_envs;
-        (avg_score, max_score, avg_placed, best_record)
-    }
-
     /// Cập nhật lại toàn bộ Q-value của max_score_states bằng MCTS song song (batch).
     /// Mỗi state: replay moves trong file để dựng board, rồi chạy MCTS `n_simulations` sim
     /// (temp thấp, không dirichlet) lấy root value; Q mới = total_score hiện tại + root_value * 100.
@@ -799,10 +629,12 @@ impl AlphaZeroPipeline {
         if b_count == 0 {
             return 0;
         }
+        eprintln!("[DEBUG refresh] BƯỚC 1 replay done: {} valid envs. Starting MCTS...", b_count);
 
         // BƯỚC 2: sau khi đã make move, chạy MCTS 800 sim batch (temp 0.2, KHÔNG dirichlet).
         let active: Vec<usize> = (0..b_count).collect();
         let results = mcts.search_batch_indexed(&valid_envs, &active, &self.model, gpu_exec, false, 0.2);
+        eprintln!("[DEBUG refresh] MCTS search done: {} results", results.len());
 
         // BƯỚC 3: ghi đè Q value: total_score + root_value * 100.
         for (k, &st_idx) in orig_idx.iter().enumerate() {

@@ -162,18 +162,35 @@ impl Linear {
     }
 }
 
-/// Mạng 4-Hop Residual Graph Neural Network (Hidden Dim = 128) kết hợp Action & Value Head
+/// Một tầng GNN: self-transform + neighbor-aggregate transform
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GNNLayer {
+    pub w_self: Linear,
+    pub w_neigh: Linear,
+}
+
+impl GNNLayer {
+    pub fn new(in_dim: usize, out_dim: usize) -> Self {
+        Self {
+            w_self: Linear::new(in_dim, out_dim),
+            w_neigh: Linear::new(in_dim, out_dim),
+        }
+    }
+
+    pub fn new_zero(in_dim: usize, out_dim: usize) -> Self {
+        Self {
+            w_self: Linear::new_zero(in_dim, out_dim),
+            w_neigh: Linear::new_zero(in_dim, out_dim),
+        }
+    }
+}
+
+/// Mạng N-Hop Residual Graph Neural Network (Hidden Dim = 128) kết hợp Action & Value Head
+/// Số tầng GNN được cấu hình qua `N_GNN_LAYERS` (mặc định = 4).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HexGNNModel {
-    // 4 GNN Layers (Backbone, Hidden Dim = HIDDEN_DIM)
-    pub w_self1: Linear,     // 40 -> HIDDEN_DIM
-    pub w_neigh1: Linear,    // 40 -> HIDDEN_DIM
-    pub w_self2: Linear,     // H -> H
-    pub w_neigh2: Linear,    // H -> H
-    pub w_self3: Linear,     // H -> H
-    pub w_neigh3: Linear,    // H -> H
-    pub w_self4: Linear,     // H -> H
-    pub w_neigh4: Linear,    // H -> H
+    /// Các tầng GNN: layer[0] nhận NODE_FEAT_DIM -> HIDDEN_DIM, các layer sau HIDDEN_DIM -> HIDDEN_DIM
+    pub layers: Vec<GNNLayer>,
 
     // Action Scoring MLP Head: [h(u) (H) + action_feature (16)] = H+16 -> H -> 1
     pub w_act1: Linear,      // H+16 -> H
@@ -188,15 +205,15 @@ pub struct HexGNNModel {
 
 impl HexGNNModel {
     pub fn new() -> Self {
+        let mut layers = Vec::with_capacity(N_GNN_LAYERS);
+        // Layer 0: NODE_FEAT_DIM -> HIDDEN_DIM
+        layers.push(GNNLayer::new(NODE_FEAT_DIM, HIDDEN_DIM));
+        // Layers 1..N-1: HIDDEN_DIM -> HIDDEN_DIM
+        for _ in 1..N_GNN_LAYERS {
+            layers.push(GNNLayer::new(HIDDEN_DIM, HIDDEN_DIM));
+        }
         Self {
-            w_self1: Linear::new(NODE_FEAT_DIM, HIDDEN_DIM),
-            w_neigh1: Linear::new(NODE_FEAT_DIM, HIDDEN_DIM),
-            w_self2: Linear::new(HIDDEN_DIM, HIDDEN_DIM),
-            w_neigh2: Linear::new(HIDDEN_DIM, HIDDEN_DIM),
-            w_self3: Linear::new(HIDDEN_DIM, HIDDEN_DIM),
-            w_neigh3: Linear::new(HIDDEN_DIM, HIDDEN_DIM),
-            w_self4: Linear::new(HIDDEN_DIM, HIDDEN_DIM),
-            w_neigh4: Linear::new(HIDDEN_DIM, HIDDEN_DIM),
+            layers,
             w_act1: Linear::new(HIDDEN_DIM + ACTION_FEAT_DIM, HIDDEN_DIM),
             w_act2: Linear::new(HIDDEN_DIM, 1),
             w_val1: Linear::new(HIDDEN_DIM, HIDDEN_DIM),
@@ -206,15 +223,13 @@ impl HexGNNModel {
     }
 
     pub fn new_zero() -> Self {
+        let mut layers = Vec::with_capacity(N_GNN_LAYERS);
+        layers.push(GNNLayer::new_zero(NODE_FEAT_DIM, HIDDEN_DIM));
+        for _ in 1..N_GNN_LAYERS {
+            layers.push(GNNLayer::new_zero(HIDDEN_DIM, HIDDEN_DIM));
+        }
         Self {
-            w_self1: Linear::new_zero(NODE_FEAT_DIM, HIDDEN_DIM),
-            w_neigh1: Linear::new_zero(NODE_FEAT_DIM, HIDDEN_DIM),
-            w_self2: Linear::new_zero(HIDDEN_DIM, HIDDEN_DIM),
-            w_neigh2: Linear::new_zero(HIDDEN_DIM, HIDDEN_DIM),
-            w_self3: Linear::new_zero(HIDDEN_DIM, HIDDEN_DIM),
-            w_neigh3: Linear::new_zero(HIDDEN_DIM, HIDDEN_DIM),
-            w_self4: Linear::new_zero(HIDDEN_DIM, HIDDEN_DIM),
-            w_neigh4: Linear::new_zero(HIDDEN_DIM, HIDDEN_DIM),
+            layers,
             w_act1: Linear::new_zero(HIDDEN_DIM + ACTION_FEAT_DIM, HIDDEN_DIM),
             w_act2: Linear::new_zero(HIDDEN_DIM, 1),
             w_val1: Linear::new_zero(HIDDEN_DIM, HIDDEN_DIM),
@@ -229,14 +244,10 @@ impl HexGNNModel {
                 *x *= factor;
             }
         };
-        scale(&mut self.w_self1.weight); scale(&mut self.w_self1.bias);
-        scale(&mut self.w_neigh1.weight); scale(&mut self.w_neigh1.bias);
-        scale(&mut self.w_self2.weight); scale(&mut self.w_self2.bias);
-        scale(&mut self.w_neigh2.weight); scale(&mut self.w_neigh2.bias);
-        scale(&mut self.w_self3.weight); scale(&mut self.w_self3.bias);
-        scale(&mut self.w_neigh3.weight); scale(&mut self.w_neigh3.bias);
-        scale(&mut self.w_self4.weight); scale(&mut self.w_self4.bias);
-        scale(&mut self.w_neigh4.weight); scale(&mut self.w_neigh4.bias);
+        for layer in &mut self.layers {
+            scale(&mut layer.w_self.weight); scale(&mut layer.w_self.bias);
+            scale(&mut layer.w_neigh.weight); scale(&mut layer.w_neigh.bias);
+        }
         scale(&mut self.w_act1.weight); scale(&mut self.w_act1.bias);
         scale(&mut self.w_act2.weight); scale(&mut self.w_act2.bias);
         scale(&mut self.w_val1.weight); scale(&mut self.w_val1.bias);
@@ -246,14 +257,10 @@ impl HexGNNModel {
     pub fn clip_grad_norm(&mut self, max_norm: f32) {
         let mut total_sq = 0.0f32;
         let sum_sq = |w: &[f32]| -> f32 { w.iter().map(|x| x * x).sum() };
-        total_sq += sum_sq(&self.w_self1.weight) + sum_sq(&self.w_self1.bias);
-        total_sq += sum_sq(&self.w_neigh1.weight) + sum_sq(&self.w_neigh1.bias);
-        total_sq += sum_sq(&self.w_self2.weight) + sum_sq(&self.w_self2.bias);
-        total_sq += sum_sq(&self.w_neigh2.weight) + sum_sq(&self.w_neigh2.bias);
-        total_sq += sum_sq(&self.w_self3.weight) + sum_sq(&self.w_self3.bias);
-        total_sq += sum_sq(&self.w_neigh3.weight) + sum_sq(&self.w_neigh3.bias);
-        total_sq += sum_sq(&self.w_self4.weight) + sum_sq(&self.w_self4.bias);
-        total_sq += sum_sq(&self.w_neigh4.weight) + sum_sq(&self.w_neigh4.bias);
+        for layer in &self.layers {
+            total_sq += sum_sq(&layer.w_self.weight) + sum_sq(&layer.w_self.bias);
+            total_sq += sum_sq(&layer.w_neigh.weight) + sum_sq(&layer.w_neigh.bias);
+        }
         total_sq += sum_sq(&self.w_act1.weight) + sum_sq(&self.w_act1.bias);
         total_sq += sum_sq(&self.w_act2.weight) + sum_sq(&self.w_act2.bias);
         total_sq += sum_sq(&self.w_val1.weight) + sum_sq(&self.w_val1.bias);
@@ -272,14 +279,10 @@ impl HexGNNModel {
                 *w_i += *o_i;
             }
         };
-        add(&mut self.w_self1.weight, &other.w_self1.weight); add(&mut self.w_self1.bias, &other.w_self1.bias);
-        add(&mut self.w_neigh1.weight, &other.w_neigh1.weight); add(&mut self.w_neigh1.bias, &other.w_neigh1.bias);
-        add(&mut self.w_self2.weight, &other.w_self2.weight); add(&mut self.w_self2.bias, &other.w_self2.bias);
-        add(&mut self.w_neigh2.weight, &other.w_neigh2.weight); add(&mut self.w_neigh2.bias, &other.w_neigh2.bias);
-        add(&mut self.w_self3.weight, &other.w_self3.weight); add(&mut self.w_self3.bias, &other.w_self3.bias);
-        add(&mut self.w_neigh3.weight, &other.w_neigh3.weight); add(&mut self.w_neigh3.bias, &other.w_neigh3.bias);
-        add(&mut self.w_self4.weight, &other.w_self4.weight); add(&mut self.w_self4.bias, &other.w_self4.bias);
-        add(&mut self.w_neigh4.weight, &other.w_neigh4.weight); add(&mut self.w_neigh4.bias, &other.w_neigh4.bias);
+        for (l, ol) in self.layers.iter_mut().zip(other.layers.iter()) {
+            add(&mut l.w_self.weight, &ol.w_self.weight); add(&mut l.w_self.bias, &ol.w_self.bias);
+            add(&mut l.w_neigh.weight, &ol.w_neigh.weight); add(&mut l.w_neigh.bias, &ol.w_neigh.bias);
+        }
         add(&mut self.w_act1.weight, &other.w_act1.weight); add(&mut self.w_act1.bias, &other.w_act1.bias);
         add(&mut self.w_act2.weight, &other.w_act2.weight); add(&mut self.w_act2.bias, &other.w_act2.bias);
         add(&mut self.w_val1.weight, &other.w_val1.weight); add(&mut self.w_val1.bias, &other.w_val1.bias);
@@ -310,8 +313,9 @@ impl HexGNNModel {
         mean
     }
 
-    /// Forward pass sử dụng kiến trúc 4 GNN Layers với Residual Connections (Hidden Dim = 128).
-    ///
+    /// Forward pass GNN với N layers (configurable qua N_GNN_LAYERS).
+    /// Layer 0: NODE_FEAT_DIM -> HIDDEN_DIM (không residual).
+    /// Layer 1..N-1: HIDDEN_DIM -> HIDDEN_DIM (có residual connection).
     /// Trả về (action_logits, state_value) cho một graph.
     pub fn forward(
         &self,
@@ -327,65 +331,49 @@ impl HexGNNModel {
             return (vec![0.0; num_actions], 0.0);
         }
 
-        // --- GNN LAYER 1: NODE_FEAT_DIM -> HIDDEN_DIM ---
+        // --- GNN LAYERS ---
         let mut x_flat = vec![0.0f32; n_nodes * NODE_FEAT_DIM];
         for u in 0..n_nodes {
             x_flat[u * NODE_FEAT_DIM..(u + 1) * NODE_FEAT_DIM].copy_from_slice(&node_features[u]);
         }
-        let neigh1 = Self::aggregate_neighbors(&x_flat, NODE_FEAT_DIM, n_nodes, edge_index);
-        let out_self1 = self.w_self1.forward(&x_flat, n_nodes * NODE_FEAT_DIM);
-        let out_neigh1 = self.w_neigh1.forward(&neigh1, n_nodes * NODE_FEAT_DIM);
 
-        let mut h1 = vec![0.0f32; n_nodes * HIDDEN_DIM];
-        for i in 0..n_nodes * HIDDEN_DIM {
-            let sum = out_self1[i] + out_neigh1[i];
-            h1[i] = if sum > 0.0 { sum } else { 0.0 };
+        let _n_layers = self.layers.len();
+        let mut h_prev: Option<Vec<f32>> = None;
+        let mut h_curr = x_flat;
+        let mut curr_dim = NODE_FEAT_DIM;
+
+        for (li, layer) in self.layers.iter().enumerate() {
+            let out_dim = if li == 0 { HIDDEN_DIM } else { HIDDEN_DIM };
+            let neigh = Self::aggregate_neighbors(&h_curr, curr_dim, n_nodes, edge_index);
+            let out_self = layer.w_self.forward(&h_curr, n_nodes * curr_dim);
+            let out_neigh = layer.w_neigh.forward(&neigh, n_nodes * curr_dim);
+
+            let mut h_next = vec![0.0f32; n_nodes * out_dim];
+            let has_residual = li > 0;
+            for i in 0..n_nodes * out_dim {
+                let sum = out_self[i] + out_neigh[i];
+                let relu = if sum > 0.0 { sum } else { 0.0 };
+                h_next[i] = if has_residual {
+                    relu + h_prev.as_ref().unwrap()[i]
+                } else {
+                    relu
+                };
+            }
+            h_prev = Some(h_next.clone());
+            h_curr = h_next;
+            curr_dim = out_dim;
         }
 
-        // --- GNN LAYER 2: HIDDEN_DIM -> HIDDEN_DIM (Residual) ---
-        let neigh2 = Self::aggregate_neighbors(&h1, HIDDEN_DIM, n_nodes, edge_index);
-        let out_self2 = self.w_self2.forward(&h1, n_nodes * HIDDEN_DIM);
-        let out_neigh2 = self.w_neigh2.forward(&neigh2, n_nodes * HIDDEN_DIM);
+        let h_final = h_prev.unwrap(); // embedding cuối cùng sau tất cả layers
 
-        let mut h2 = vec![0.0f32; n_nodes * HIDDEN_DIM];
-        for i in 0..n_nodes * HIDDEN_DIM {
-            let sum = out_self2[i] + out_neigh2[i];
-            let relu = if sum > 0.0 { sum } else { 0.0 };
-            h2[i] = relu + h1[i];
-        }
-
-        // --- GNN LAYER 3: HIDDEN_DIM -> HIDDEN_DIM (Residual) ---
-        let neigh3 = Self::aggregate_neighbors(&h2, HIDDEN_DIM, n_nodes, edge_index);
-        let out_self3 = self.w_self3.forward(&h2, n_nodes * HIDDEN_DIM);
-        let out_neigh3 = self.w_neigh3.forward(&neigh3, n_nodes * HIDDEN_DIM);
-
-        let mut h3 = vec![0.0f32; n_nodes * HIDDEN_DIM];
-        for i in 0..n_nodes * HIDDEN_DIM {
-            let sum = out_self3[i] + out_neigh3[i];
-            let relu = if sum > 0.0 { sum } else { 0.0 };
-            h3[i] = relu + h2[i];
-        }
-
-        // --- GNN LAYER 4: HIDDEN_DIM -> HIDDEN_DIM (Residual) ---
-        let neigh4 = Self::aggregate_neighbors(&h3, HIDDEN_DIM, n_nodes, edge_index);
-        let out_self4 = self.w_self4.forward(&h3, n_nodes * HIDDEN_DIM);
-        let out_neigh4 = self.w_neigh4.forward(&neigh4, n_nodes * HIDDEN_DIM);
-
-        let mut h4 = vec![0.0f32; n_nodes * HIDDEN_DIM];
-        for i in 0..n_nodes * HIDDEN_DIM {
-            let sum = out_self4[i] + out_neigh4[i];
-            let relu = if sum > 0.0 { sum } else { 0.0 };
-            h4[i] = relu + h3[i];
-        }
-
-        // --- ACTION SCORING MLP HEAD: [h4(u) (H) + act_feat (16)] = H+16 -> H -> 1 ---
+        // --- ACTION SCORING MLP HEAD: [h_final(u) (H) + act_feat (16)] = H+16 -> H -> 1 ---
         let act_in_dim = HIDDEN_DIM + ACTION_FEAT_DIM;
         let mut act_in = vec![0.0f32; num_actions * act_in_dim];
         for (a_idx, act) in valid_actions.iter().enumerate() {
             let pos_idx = node_positions.iter().position(|&p| p == (act.q, act.r)).unwrap_or(0);
             let u = pos_idx.min(n_nodes - 1);
             act_in[a_idx * act_in_dim..a_idx * act_in_dim + HIDDEN_DIM]
-                .copy_from_slice(&h4[u * HIDDEN_DIM..(u + 1) * HIDDEN_DIM]);
+                .copy_from_slice(&h_final[u * HIDDEN_DIM..(u + 1) * HIDDEN_DIM]);
             if a_idx < action_features.len() {
                 act_in[a_idx * act_in_dim + HIDDEN_DIM..(a_idx + 1) * act_in_dim]
                     .copy_from_slice(&action_features[a_idx]);
@@ -399,19 +387,19 @@ impl HexGNNModel {
         }
         let action_logits = self.w_act2.forward(&act_relu, num_actions * HIDDEN_DIM);
 
-        // --- VALUE HEAD: mean_h4 (H) -> H -> 1 ---
-        let mut mean_h4 = vec![0.0f32; HIDDEN_DIM];
+        // --- VALUE HEAD: mean_h_final (H) -> H -> 1 ---
+        let mut mean_h = vec![0.0f32; HIDDEN_DIM];
         for u in 0..n_nodes {
             for i in 0..HIDDEN_DIM {
-                mean_h4[i] += h4[u * HIDDEN_DIM + i];
+                mean_h[i] += h_final[u * HIDDEN_DIM + i];
             }
         }
         let inv_n = 1.0 / n_nodes as f32;
         for i in 0..HIDDEN_DIM {
-            mean_h4[i] *= inv_n;
+            mean_h[i] *= inv_n;
         }
 
-        let val_hidden = self.w_val1.forward(&mean_h4, HIDDEN_DIM);
+        let val_hidden = self.w_val1.forward(&mean_h, HIDDEN_DIM);
         let mut val_relu = vec![0.0f32; HIDDEN_DIM];
         for i in 0..HIDDEN_DIM {
             val_relu[i] = if val_hidden[i] > 0.0 { val_hidden[i] } else { 0.0 };
@@ -474,50 +462,37 @@ impl HexGNNModel {
             }
         }
 
-        // Layer 1: NODE_FEAT_DIM -> HIDDEN_DIM
-        let neigh1 = Self::aggregate_neighbors(&x_flat, NODE_FEAT_DIM, total_nodes, &combined_edges);
-        let out_self1 = self.w_self1.forward(&x_flat, total_nodes * NODE_FEAT_DIM);
-        let out_neigh1 = self.w_neigh1.forward(&neigh1, total_nodes * NODE_FEAT_DIM);
-        let mut h1 = vec![0.0f32; total_nodes * HIDDEN_DIM];
-        for i in 0..total_nodes * HIDDEN_DIM {
-            let sum = out_self1[i] + out_neigh1[i];
-            h1[i] = if sum > 0.0 { sum } else { 0.0 };
+        // --- GNN LAYERS (batched) ---
+        let _n_layers = self.layers.len();
+        let mut h_prev: Option<Vec<f32>> = None;
+        let mut h_curr = x_flat;
+        let mut curr_dim = NODE_FEAT_DIM;
+
+        for (li, layer) in self.layers.iter().enumerate() {
+            let out_dim = HIDDEN_DIM;
+            let neigh = Self::aggregate_neighbors(&h_curr, curr_dim, total_nodes, &combined_edges);
+            let out_self = layer.w_self.forward(&h_curr, total_nodes * curr_dim);
+            let out_neigh = layer.w_neigh.forward(&neigh, total_nodes * curr_dim);
+
+            let mut h_next = vec![0.0f32; total_nodes * out_dim];
+            let has_residual = li > 0;
+            for i in 0..total_nodes * out_dim {
+                let sum = out_self[i] + out_neigh[i];
+                let relu = if sum > 0.0 { sum } else { 0.0 };
+                h_next[i] = if has_residual {
+                    relu + h_prev.as_ref().unwrap()[i]
+                } else {
+                    relu
+                };
+            }
+            h_prev = Some(h_next.clone());
+            h_curr = h_next;
+            curr_dim = out_dim;
         }
 
-        // Layer 2: HIDDEN_DIM -> HIDDEN_DIM (Residual)
-        let neigh2 = Self::aggregate_neighbors(&h1, HIDDEN_DIM, total_nodes, &combined_edges);
-        let out_self2 = self.w_self2.forward(&h1, total_nodes * HIDDEN_DIM);
-        let out_neigh2 = self.w_neigh2.forward(&neigh2, total_nodes * HIDDEN_DIM);
-        let mut h2 = vec![0.0f32; total_nodes * HIDDEN_DIM];
-        for i in 0..total_nodes * HIDDEN_DIM {
-            let sum = out_self2[i] + out_neigh2[i];
-            let relu = if sum > 0.0 { sum } else { 0.0 };
-            h2[i] = relu + h1[i];
-        }
+        let h_final = h_prev.unwrap();
 
-        // Layer 3: HIDDEN_DIM -> HIDDEN_DIM (Residual)
-        let neigh3 = Self::aggregate_neighbors(&h2, HIDDEN_DIM, total_nodes, &combined_edges);
-        let out_self3 = self.w_self3.forward(&h2, total_nodes * HIDDEN_DIM);
-        let out_neigh3 = self.w_neigh3.forward(&neigh3, total_nodes * HIDDEN_DIM);
-        let mut h3 = vec![0.0f32; total_nodes * HIDDEN_DIM];
-        for i in 0..total_nodes * HIDDEN_DIM {
-            let sum = out_self3[i] + out_neigh3[i];
-            let relu = if sum > 0.0 { sum } else { 0.0 };
-            h3[i] = relu + h2[i];
-        }
-
-        // Layer 4: HIDDEN_DIM -> HIDDEN_DIM (Residual)
-        let neigh4 = Self::aggregate_neighbors(&h3, HIDDEN_DIM, total_nodes, &combined_edges);
-        let out_self4 = self.w_self4.forward(&h3, total_nodes * HIDDEN_DIM);
-        let out_neigh4 = self.w_neigh4.forward(&neigh4, total_nodes * HIDDEN_DIM);
-        let mut h4 = vec![0.0f32; total_nodes * HIDDEN_DIM];
-        for i in 0..total_nodes * HIDDEN_DIM {
-            let sum = out_self4[i] + out_neigh4[i];
-            let relu = if sum > 0.0 { sum } else { 0.0 };
-            h4[i] = relu + h3[i];
-        }
-
-        // Flatten Action Features & Node Embeddings: [h4(u) (H) + act_feat (16)] = H+16
+        // Flatten Action Features & Node Embeddings: [h_final(u) (H) + act_feat (16)] = H+16
         let act_in_dim = HIDDEN_DIM + ACTION_FEAT_DIM;
         let mut act_in = vec![0.0f32; total_actions * act_in_dim];
         let mut global_act_idx = 0usize;
@@ -531,7 +506,7 @@ impl HexGNNModel {
                 let u = offset + pos_idx.min(n_nodes.saturating_sub(1));
 
                 act_in[global_act_idx * act_in_dim..global_act_idx * act_in_dim + HIDDEN_DIM]
-                    .copy_from_slice(&h4[u * HIDDEN_DIM..(u + 1) * HIDDEN_DIM]);
+                    .copy_from_slice(&h_final[u * HIDDEN_DIM..(u + 1) * HIDDEN_DIM]);
                 if a_idx < obs.action_features.len() {
                     act_in[global_act_idx * act_in_dim + HIDDEN_DIM..(global_act_idx + 1) * act_in_dim]
                         .copy_from_slice(&obs.action_features[a_idx]);
@@ -548,7 +523,7 @@ impl HexGNNModel {
         let all_action_logits = self.w_act2.forward(&act_relu, total_actions * HIDDEN_DIM);
 
         // Value Head for each Graph
-        let mut mean_h4_batch = vec![0.0f32; b_count * HIDDEN_DIM];
+        let mut mean_h_batch = vec![0.0f32; b_count * HIDDEN_DIM];
         for (i, obs) in observations.iter().enumerate() {
             let offset = node_offsets[i];
             let n_nodes = obs.node_features.len();
@@ -556,13 +531,13 @@ impl HexGNNModel {
                 let inv_n = 1.0 / n_nodes as f32;
                 for u in 0..n_nodes {
                     for d in 0..HIDDEN_DIM {
-                        mean_h4_batch[i * HIDDEN_DIM + d] += h4[(offset + u) * HIDDEN_DIM + d] * inv_n;
+                        mean_h_batch[i * HIDDEN_DIM + d] += h_final[(offset + u) * HIDDEN_DIM + d] * inv_n;
                     }
                 }
             }
         }
 
-        let val_hidden = self.w_val1.forward(&mean_h4_batch, b_count * HIDDEN_DIM);
+        let val_hidden = self.w_val1.forward(&mean_h_batch, b_count * HIDDEN_DIM);
         let mut val_relu = vec![0.0f32; b_count * HIDDEN_DIM];
         for i in 0..b_count * HIDDEN_DIM {
             val_relu[i] = if val_hidden[i] > 0.0 { val_hidden[i] } else { 0.0 };
@@ -715,60 +690,50 @@ impl HexGNNModel {
         }
 
         // ================= FORWARD PASS TRACING =================
-        // GNN 1
+        let n_layers = self.layers.len();
+
         let mut x_flat = vec![0.0f32; n_nodes * NODE_FEAT_DIM];
         for u in 0..n_nodes {
             x_flat[u * NODE_FEAT_DIM..(u + 1) * NODE_FEAT_DIM].copy_from_slice(&node_features[u]);
         }
-        let neigh1 = Self::aggregate_neighbors(&x_flat, NODE_FEAT_DIM, n_nodes, edge_index);
-        let out_self1 = self.w_self1.forward(&x_flat, n_nodes * NODE_FEAT_DIM);
-        let out_neigh1 = self.w_neigh1.forward(&neigh1, n_nodes * NODE_FEAT_DIM);
-        let mut h1_pre = vec![0.0f32; n_nodes * HIDDEN_DIM];
-        let mut h1 = vec![0.0f32; n_nodes * HIDDEN_DIM];
-        for i in 0..n_nodes * HIDDEN_DIM {
-            let sum = out_self1[i] + out_neigh1[i];
-            h1_pre[i] = sum;
-            h1[i] = if sum > 0.0 { sum } else { 0.0 };
+
+        // Lưu kết quả forward của từng layer để dùng trong backprop
+        let mut h_vals: Vec<Vec<f32>> = Vec::with_capacity(n_layers);
+        let mut h_pres: Vec<Vec<f32>> = Vec::with_capacity(n_layers);
+        let mut neighs: Vec<Vec<f32>> = Vec::with_capacity(n_layers);
+        let mut layer_in_dims: Vec<usize> = Vec::with_capacity(n_layers);
+
+        let mut h_curr = x_flat.clone();
+        let mut curr_dim = NODE_FEAT_DIM;
+
+        for (li, layer) in self.layers.iter().enumerate() {
+            let out_dim = HIDDEN_DIM;
+            let neigh = Self::aggregate_neighbors(&h_curr, curr_dim, n_nodes, edge_index);
+            let out_self = layer.w_self.forward(&h_curr, n_nodes * curr_dim);
+            let out_neigh = layer.w_neigh.forward(&neigh, n_nodes * curr_dim);
+
+            let mut h_pre = vec![0.0f32; n_nodes * out_dim];
+            let mut h_val = vec![0.0f32; n_nodes * out_dim];
+            let has_residual = li > 0;
+            for i in 0..n_nodes * out_dim {
+                let sum = out_self[i] + out_neigh[i];
+                h_pre[i] = sum;
+                let relu = if sum > 0.0 { sum } else { 0.0 };
+                h_val[i] = if has_residual {
+                    relu + h_vals[li - 1][i]
+                } else {
+                    relu
+                };
+            }
+            layer_in_dims.push(curr_dim);
+            neighs.push(neigh);
+            h_pres.push(h_pre);
+            h_vals.push(h_val.clone());
+            h_curr = h_val;
+            curr_dim = out_dim;
         }
 
-        // GNN 2
-        let neigh2 = Self::aggregate_neighbors(&h1, HIDDEN_DIM, n_nodes, edge_index);
-        let out_self2 = self.w_self2.forward(&h1, n_nodes * HIDDEN_DIM);
-        let out_neigh2 = self.w_neigh2.forward(&neigh2, n_nodes * HIDDEN_DIM);
-        let mut h2_pre = vec![0.0f32; n_nodes * HIDDEN_DIM];
-        let mut h2 = vec![0.0f32; n_nodes * HIDDEN_DIM];
-        for i in 0..n_nodes * HIDDEN_DIM {
-            let sum = out_self2[i] + out_neigh2[i];
-            h2_pre[i] = sum;
-            let relu = if sum > 0.0 { sum } else { 0.0 };
-            h2[i] = relu + h1[i];
-        }
-
-        // GNN 3
-        let neigh3 = Self::aggregate_neighbors(&h2, HIDDEN_DIM, n_nodes, edge_index);
-        let out_self3 = self.w_self3.forward(&h2, n_nodes * HIDDEN_DIM);
-        let out_neigh3 = self.w_neigh3.forward(&neigh3, n_nodes * HIDDEN_DIM);
-        let mut h3_pre = vec![0.0f32; n_nodes * HIDDEN_DIM];
-        let mut h3 = vec![0.0f32; n_nodes * HIDDEN_DIM];
-        for i in 0..n_nodes * HIDDEN_DIM {
-            let sum = out_self3[i] + out_neigh3[i];
-            h3_pre[i] = sum;
-            let relu = if sum > 0.0 { sum } else { 0.0 };
-            h3[i] = relu + h2[i];
-        }
-
-        // GNN 4
-        let neigh4 = Self::aggregate_neighbors(&h3, HIDDEN_DIM, n_nodes, edge_index);
-        let out_self4 = self.w_self4.forward(&h3, n_nodes * HIDDEN_DIM);
-        let out_neigh4 = self.w_neigh4.forward(&neigh4, n_nodes * HIDDEN_DIM);
-        let mut h4_pre = vec![0.0f32; n_nodes * HIDDEN_DIM];
-        let mut h4 = vec![0.0f32; n_nodes * HIDDEN_DIM];
-        for i in 0..n_nodes * HIDDEN_DIM {
-            let sum = out_self4[i] + out_neigh4[i];
-            h4_pre[i] = sum;
-            let relu = if sum > 0.0 { sum } else { 0.0 };
-            h4[i] = relu + h3[i];
-        }
+        let h_final = h_vals.last().unwrap();
 
         // Action MLP Forward
         let act_in_dim = HIDDEN_DIM + ACTION_FEAT_DIM;
@@ -780,7 +745,7 @@ impl HexGNNModel {
             act_node_idx.push(u);
 
             act_in[a_idx * act_in_dim..a_idx * act_in_dim + HIDDEN_DIM]
-                .copy_from_slice(&h4[u * HIDDEN_DIM..(u + 1) * HIDDEN_DIM]);
+                .copy_from_slice(&h_final[u * HIDDEN_DIM..(u + 1) * HIDDEN_DIM]);
             if a_idx < action_features.len() {
                 act_in[a_idx * act_in_dim + HIDDEN_DIM..(a_idx + 1) * act_in_dim]
                     .copy_from_slice(&action_features[a_idx]);
@@ -794,16 +759,16 @@ impl HexGNNModel {
         let _action_logits = self.w_act2.forward(&act_relu, num_actions * HIDDEN_DIM);
 
         // Value Forward
-        let mut mean_h4 = vec![0.0f32; HIDDEN_DIM];
+        let mut mean_h = vec![0.0f32; HIDDEN_DIM];
         for u in 0..n_nodes {
             for i in 0..HIDDEN_DIM {
-                mean_h4[i] += h4[u * HIDDEN_DIM + i];
+                mean_h[i] += h_final[u * HIDDEN_DIM + i];
             }
         }
         for i in 0..HIDDEN_DIM {
-            mean_h4[i] /= n_nodes as f32;
+            mean_h[i] /= n_nodes as f32;
         }
-        let val_hidden = self.w_val1.forward(&mean_h4, HIDDEN_DIM);
+        let val_hidden = self.w_val1.forward(&mean_h, HIDDEN_DIM);
         let mut val_relu = vec![0.0f32; HIDDEN_DIM];
         for i in 0..HIDDEN_DIM {
             val_relu[i] = if val_hidden[i] > 0.0 { val_hidden[i] } else { 0.0 };
@@ -834,11 +799,11 @@ impl HexGNNModel {
             }
         }
 
-        let mut d_h4 = vec![0.0f32; n_nodes * HIDDEN_DIM];
+        let mut d_h_final = vec![0.0f32; n_nodes * HIDDEN_DIM];
         for a in 0..num_actions {
             let u = act_node_idx[a];
             for i in 0..HIDDEN_DIM {
-                d_h4[u * HIDDEN_DIM + i] += d_act_in[a * act_in_dim + i];
+                d_h_final[u * HIDDEN_DIM + i] += d_act_in[a * act_in_dim + i];
             }
         }
 
@@ -850,147 +815,89 @@ impl HexGNNModel {
             d_val_relu[i] = value_grad * self.w_val2.weight[i];
         }
 
-        let mut d_mean_h4 = vec![0.0f32; HIDDEN_DIM];
+        let mut d_mean_h = vec![0.0f32; HIDDEN_DIM];
         for i in 0..HIDDEN_DIM {
             let d_h = if val_hidden[i] > 0.0 { d_val_relu[i] } else { 0.0 };
             grads.w_val1.bias[i] += d_h;
             let w_off = i * HIDDEN_DIM;
             for j in 0..HIDDEN_DIM {
-                grads.w_val1.weight[w_off + j] += d_h * mean_h4[j];
-                d_mean_h4[j] += d_h * self.w_val1.weight[w_off + j];
+                grads.w_val1.weight[w_off + j] += d_h * mean_h[j];
+                d_mean_h[j] += d_h * self.w_val1.weight[w_off + j];
             }
         }
 
         for u in 0..n_nodes {
             for i in 0..HIDDEN_DIM {
-                d_h4[u * HIDDEN_DIM + i] += d_mean_h4[i] / n_nodes as f32;
+                d_h_final[u * HIDDEN_DIM + i] += d_mean_h[i] / n_nodes as f32;
             }
         }
 
-        // 3. Backprop through GNN LAYER 4
-        let mut d_h3 = vec![0.0f32; n_nodes * HIDDEN_DIM];
-        let mut d_relu4 = vec![0.0f32; n_nodes * HIDDEN_DIM];
-        for i in 0..n_nodes * HIDDEN_DIM {
-            d_h3[i] += d_h4[i]; // Residual gradient
-            d_relu4[i] = if h4_pre[i] > 0.0 { d_h4[i] } else { 0.0 };
-        }
-
-        let mut d_neigh4 = vec![0.0f32; n_nodes * HIDDEN_DIM];
-        for u in 0..n_nodes {
-            for o in 0..HIDDEN_DIM {
-                let g = d_relu4[u * HIDDEN_DIM + o];
-                grads.w_self4.bias[o] += g;
-                grads.w_neigh4.bias[o] += g;
-                let w_off = o * HIDDEN_DIM;
-                for i in 0..HIDDEN_DIM {
-                    grads.w_self4.weight[w_off + i] += g * h3[u * HIDDEN_DIM + i];
-                    d_h3[u * HIDDEN_DIM + i] += g * self.w_self4.weight[w_off + i];
-
-                    grads.w_neigh4.weight[w_off + i] += g * neigh4[u * HIDDEN_DIM + i];
-                    d_neigh4[u * HIDDEN_DIM + i] += g * self.w_neigh4.weight[w_off + i];
-                }
-            }
-        }
-
+        // Pre-compute neighbor counts
         let mut neighbor_count = vec![0usize; n_nodes];
         for &(u, _) in edge_index {
             if u < n_nodes {
                 neighbor_count[u] += 1;
             }
         }
-        for &(u, v) in edge_index {
-            if u < n_nodes && v < n_nodes {
-                let count_u = neighbor_count[u].max(1) as f32;
-                for i in 0..HIDDEN_DIM {
-                    d_h3[v * HIDDEN_DIM + i] += d_neigh4[u * HIDDEN_DIM + i] / count_u;
+
+        // 3. Backprop through GNN layers (từ cuối về đầu)
+        let mut d_h_curr = d_h_final;
+        for li in (0..n_layers).rev() {
+            let has_residual = li > 0;
+            let in_dim = layer_in_dims[li];
+            let out_dim = HIDDEN_DIM;
+            let layer = &self.layers[li];
+            let grad_layer = &mut grads.layers[li];
+
+            let mut d_h_prev = if has_residual {
+                vec![0.0f32; n_nodes * out_dim]
+            } else {
+                Vec::new()
+            };
+
+            let mut d_relu = vec![0.0f32; n_nodes * out_dim];
+            if has_residual {
+                for i in 0..n_nodes * out_dim {
+                    d_h_prev[i] += d_h_curr[i];
+                    d_relu[i] = if h_pres[li][i] > 0.0 { d_h_curr[i] } else { 0.0 };
+                }
+            } else {
+                for i in 0..n_nodes * out_dim {
+                    d_relu[i] = if h_pres[li][i] > 0.0 { d_h_curr[i] } else { 0.0 };
                 }
             }
-        }
 
-        // 4. Backprop through GNN LAYER 3
-        let mut d_h2 = vec![0.0f32; n_nodes * HIDDEN_DIM];
-        let mut d_relu3 = vec![0.0f32; n_nodes * HIDDEN_DIM];
-        for i in 0..n_nodes * HIDDEN_DIM {
-            d_h2[i] += d_h3[i]; // Residual gradient
-            d_relu3[i] = if h3_pre[i] > 0.0 { d_h3[i] } else { 0.0 };
-        }
+            let mut d_neigh = vec![0.0f32; n_nodes * out_dim];
+            let h_in = if has_residual { &h_vals[li - 1] } else { &x_flat };
 
-        let mut d_neigh3 = vec![0.0f32; n_nodes * HIDDEN_DIM];
-        for u in 0..n_nodes {
-            for o in 0..HIDDEN_DIM {
-                let g = d_relu3[u * HIDDEN_DIM + o];
-                grads.w_self3.bias[o] += g;
-                grads.w_neigh3.bias[o] += g;
-                let w_off = o * HIDDEN_DIM;
-                for i in 0..HIDDEN_DIM {
-                    grads.w_self3.weight[w_off + i] += g * h2[u * HIDDEN_DIM + i];
-                    d_h2[u * HIDDEN_DIM + i] += g * self.w_self3.weight[w_off + i];
+            for u in 0..n_nodes {
+                for o in 0..out_dim {
+                    let g = d_relu[u * out_dim + o];
+                    grad_layer.w_self.bias[o] += g;
+                    grad_layer.w_neigh.bias[o] += g;
+                    let w_off = o * in_dim;
+                    for i in 0..in_dim {
+                        grad_layer.w_self.weight[w_off + i] += g * h_in[u * in_dim + i];
+                        if has_residual {
+                            d_h_prev[u * out_dim + i] += g * layer.w_self.weight[w_off + i];
+                        }
 
-                    grads.w_neigh3.weight[w_off + i] += g * neigh3[u * HIDDEN_DIM + i];
-                    d_neigh3[u * HIDDEN_DIM + i] += g * self.w_neigh3.weight[w_off + i];
+                        grad_layer.w_neigh.weight[w_off + i] += g * neighs[li][u * in_dim + i];
+                        d_neigh[u * out_dim + i] += g * layer.w_neigh.weight[w_off + i];
+                    }
                 }
             }
-        }
 
-        for &(u, v) in edge_index {
-            if u < n_nodes && v < n_nodes {
-                let count_u = neighbor_count[u].max(1) as f32;
-                for i in 0..HIDDEN_DIM {
-                    d_h2[v * HIDDEN_DIM + i] += d_neigh3[u * HIDDEN_DIM + i] / count_u;
+            if has_residual {
+                for &(u, v) in edge_index {
+                    if u < n_nodes && v < n_nodes {
+                        let count_u = neighbor_count[u].max(1) as f32;
+                        for i in 0..out_dim {
+                            d_h_prev[v * out_dim + i] += d_neigh[u * out_dim + i] / count_u;
+                        }
+                    }
                 }
-            }
-        }
-
-        // 5. Backprop through GNN LAYER 2
-        let mut d_h1 = vec![0.0f32; n_nodes * HIDDEN_DIM];
-        let mut d_relu2 = vec![0.0f32; n_nodes * HIDDEN_DIM];
-        for i in 0..n_nodes * HIDDEN_DIM {
-            d_h1[i] += d_h2[i]; // Residual gradient
-            d_relu2[i] = if h2_pre[i] > 0.0 { d_h2[i] } else { 0.0 };
-        }
-
-        let mut d_neigh2 = vec![0.0f32; n_nodes * HIDDEN_DIM];
-        for u in 0..n_nodes {
-            for o in 0..HIDDEN_DIM {
-                let g = d_relu2[u * HIDDEN_DIM + o];
-                grads.w_self2.bias[o] += g;
-                grads.w_neigh2.bias[o] += g;
-                let w_off = o * HIDDEN_DIM;
-                for i in 0..HIDDEN_DIM {
-                    grads.w_self2.weight[w_off + i] += g * h1[u * HIDDEN_DIM + i];
-                    d_h1[u * HIDDEN_DIM + i] += g * self.w_self2.weight[w_off + i];
-
-                    grads.w_neigh2.weight[w_off + i] += g * neigh2[u * HIDDEN_DIM + i];
-                    d_neigh2[u * HIDDEN_DIM + i] += g * self.w_neigh2.weight[w_off + i];
-                }
-            }
-        }
-
-        for &(u, v) in edge_index {
-            if u < n_nodes && v < n_nodes {
-                let count_u = neighbor_count[u].max(1) as f32;
-                for i in 0..HIDDEN_DIM {
-                    d_h1[v * HIDDEN_DIM + i] += d_neigh2[u * HIDDEN_DIM + i] / count_u;
-                }
-            }
-        }
-
-        // 6. Backprop through GNN LAYER 1
-        let mut d_relu1 = vec![0.0f32; n_nodes * HIDDEN_DIM];
-        for i in 0..n_nodes * HIDDEN_DIM {
-            d_relu1[i] = if h1_pre[i] > 0.0 { d_h1[i] } else { 0.0 };
-        }
-
-        for u in 0..n_nodes {
-            for o in 0..HIDDEN_DIM {
-                let g = d_relu1[u * HIDDEN_DIM + o];
-                grads.w_self1.bias[o] += g;
-                grads.w_neigh1.bias[o] += g;
-                let w_off = o * NODE_FEAT_DIM;
-                for i in 0..NODE_FEAT_DIM {
-                    grads.w_self1.weight[w_off + i] += g * x_flat[u * NODE_FEAT_DIM + i];
-                    grads.w_neigh1.weight[w_off + i] += g * neigh1[u * NODE_FEAT_DIM + i];
-                }
+                d_h_curr = d_h_prev;
             }
         }
     }
@@ -1002,14 +909,10 @@ impl HexGNNModel {
         let beta2 = 0.999f32;
         let eps = 1e-8f32;
 
-        self.w_self1.adam_update(&grads.w_self1.weight, &grads.w_self1.bias, lr, beta1, beta2, eps, t);
-        self.w_neigh1.adam_update(&grads.w_neigh1.weight, &grads.w_neigh1.bias, lr, beta1, beta2, eps, t);
-        self.w_self2.adam_update(&grads.w_self2.weight, &grads.w_self2.bias, lr, beta1, beta2, eps, t);
-        self.w_neigh2.adam_update(&grads.w_neigh2.weight, &grads.w_neigh2.bias, lr, beta1, beta2, eps, t);
-        self.w_self3.adam_update(&grads.w_self3.weight, &grads.w_self3.bias, lr, beta1, beta2, eps, t);
-        self.w_neigh3.adam_update(&grads.w_neigh3.weight, &grads.w_neigh3.bias, lr, beta1, beta2, eps, t);
-        self.w_self4.adam_update(&grads.w_self4.weight, &grads.w_self4.bias, lr, beta1, beta2, eps, t);
-        self.w_neigh4.adam_update(&grads.w_neigh4.weight, &grads.w_neigh4.bias, lr, beta1, beta2, eps, t);
+        for (l, gl) in self.layers.iter_mut().zip(grads.layers.iter()) {
+            l.w_self.adam_update(&gl.w_self.weight, &gl.w_self.bias, lr, beta1, beta2, eps, t);
+            l.w_neigh.adam_update(&gl.w_neigh.weight, &gl.w_neigh.bias, lr, beta1, beta2, eps, t);
+        }
         self.w_act1.adam_update(&grads.w_act1.weight, &grads.w_act1.bias, lr, beta1, beta2, eps, t);
         self.w_act2.adam_update(&grads.w_act2.weight, &grads.w_act2.bias, lr, beta1, beta2, eps, t);
         self.w_val1.adam_update(&grads.w_val1.weight, &grads.w_val1.bias, lr, beta1, beta2, eps, t);
@@ -1023,17 +926,15 @@ impl HexGNNModel {
         let file = File::create(path)?;
         let mut writer = std::io::BufWriter::new(file);
 
-        writer.write_all(b"DORF_GNN_V3")?;
+        // V4 format: lưu số layers để forward/backward compatibility
+        writer.write_all(b"DORF_GNN_V4")?;
         writer.write_all(&(self.step_count as u64).to_le_bytes())?;
+        writer.write_all(&(self.layers.len() as u64).to_le_bytes())?;
 
-        self.w_self1.save_to_writer(&mut writer)?;
-        self.w_neigh1.save_to_writer(&mut writer)?;
-        self.w_self2.save_to_writer(&mut writer)?;
-        self.w_neigh2.save_to_writer(&mut writer)?;
-        self.w_self3.save_to_writer(&mut writer)?;
-        self.w_neigh3.save_to_writer(&mut writer)?;
-        self.w_self4.save_to_writer(&mut writer)?;
-        self.w_neigh4.save_to_writer(&mut writer)?;
+        for layer in &self.layers {
+            layer.w_self.save_to_writer(&mut writer)?;
+            layer.w_neigh.save_to_writer(&mut writer)?;
+        }
         self.w_act1.save_to_writer(&mut writer)?;
         self.w_act2.save_to_writer(&mut writer)?;
         self.w_val1.save_to_writer(&mut writer)?;
@@ -1049,32 +950,55 @@ impl HexGNNModel {
 
         let mut magic = [0u8; 11];
         reader.read_exact(&mut magic)?;
-        if &magic != b"DORF_GNN_V3" {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid model format (expected DORF_GNN_V3)"));
-        }
 
-        let mut buf8 = [0u8; 8];
-        reader.read_exact(&mut buf8)?;
-        let step_count = u64::from_le_bytes(buf8) as usize;
+        let (step_count, layers) = if &magic == b"DORF_GNN_V4" {
+            let mut buf8 = [0u8; 8];
+            reader.read_exact(&mut buf8)?;
+            let step_count = u64::from_le_bytes(buf8) as usize;
+            reader.read_exact(&mut buf8)?;
+            let n_layers = u64::from_le_bytes(buf8) as usize;
 
-        let w_self1 = Linear::load_from_reader(&mut reader)?;
-        let w_neigh1 = Linear::load_from_reader(&mut reader)?;
-        let w_self2 = Linear::load_from_reader(&mut reader)?;
-        let w_neigh2 = Linear::load_from_reader(&mut reader)?;
-        let w_self3 = Linear::load_from_reader(&mut reader)?;
-        let w_neigh3 = Linear::load_from_reader(&mut reader)?;
-        let w_self4 = Linear::load_from_reader(&mut reader)?;
-        let w_neigh4 = Linear::load_from_reader(&mut reader)?;
+            let mut layers = Vec::with_capacity(n_layers);
+            for _ in 0..n_layers {
+                let w_self = Linear::load_from_reader(&mut reader)?;
+                let w_neigh = Linear::load_from_reader(&mut reader)?;
+                layers.push(GNNLayer { w_self, w_neigh });
+            }
+            (step_count, layers)
+        } else if &magic == b"DORF_GNN_V3" {
+            // Backward compatible: V3 format (always 4 layers)
+            let mut buf8 = [0u8; 8];
+            reader.read_exact(&mut buf8)?;
+            let step_count = u64::from_le_bytes(buf8) as usize;
+
+            let w_self1 = Linear::load_from_reader(&mut reader)?;
+            let w_neigh1 = Linear::load_from_reader(&mut reader)?;
+            let w_self2 = Linear::load_from_reader(&mut reader)?;
+            let w_neigh2 = Linear::load_from_reader(&mut reader)?;
+            let w_self3 = Linear::load_from_reader(&mut reader)?;
+            let w_neigh3 = Linear::load_from_reader(&mut reader)?;
+            let w_self4 = Linear::load_from_reader(&mut reader)?;
+            let w_neigh4 = Linear::load_from_reader(&mut reader)?;
+
+            let layers = vec![
+                GNNLayer { w_self: w_self1, w_neigh: w_neigh1 },
+                GNNLayer { w_self: w_self2, w_neigh: w_neigh2 },
+                GNNLayer { w_self: w_self3, w_neigh: w_neigh3 },
+                GNNLayer { w_self: w_self4, w_neigh: w_neigh4 },
+            ];
+            (step_count, layers)
+        } else {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                "Invalid model format (expected DORF_GNN_V3 or DORF_GNN_V4)"));
+        };
+
         let w_act1 = Linear::load_from_reader(&mut reader)?;
         let w_act2 = Linear::load_from_reader(&mut reader)?;
         let w_val1 = Linear::load_from_reader(&mut reader)?;
         let w_val2 = Linear::load_from_reader(&mut reader)?;
 
         Ok(Self {
-            w_self1, w_neigh1,
-            w_self2, w_neigh2,
-            w_self3, w_neigh3,
-            w_self4, w_neigh4,
+            layers,
             w_act1, w_act2,
             w_val1, w_val2,
             step_count,
@@ -1084,11 +1008,10 @@ impl HexGNNModel {
     /// Đếm tổng số tham số (weights + biases) của toàn bộ model.
     pub fn param_count(&self) -> usize {
         let l = |ln: &Linear| ln.weight.len() + ln.bias.len();
-        l(&self.w_self1) + l(&self.w_neigh1)
-            + l(&self.w_self2) + l(&self.w_neigh2)
-            + l(&self.w_self3) + l(&self.w_neigh3)
-            + l(&self.w_self4) + l(&self.w_neigh4)
-            + l(&self.w_act1) + l(&self.w_act2)
-            + l(&self.w_val1) + l(&self.w_val2)
+        let mut total = 0;
+        for layer in &self.layers {
+            total += l(&layer.w_self) + l(&layer.w_neigh);
+        }
+        total + l(&self.w_act1) + l(&self.w_act2) + l(&self.w_val1) + l(&self.w_val2)
     }
 }

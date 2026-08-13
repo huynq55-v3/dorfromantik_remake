@@ -75,13 +75,21 @@ pub struct ElementGroup {
     pub is_closed: bool,
 }
 
+/// Trạng thái lưu tạm để undo 1 nước đi (không clone placed_tiles).
+#[derive(Debug, Clone)]
+pub struct BoardUndoState {
+    pub groups: HashMap<usize, ElementGroup>,
+    pub edge_to_group: HashMap<((i32, i32), usize), usize>,
+    pub next_group_id: usize,
+}
+
 /// Board quản lý bàn chơi và thuật toán ghép cụm ElementGroupManager
 #[derive(Debug, Clone)]
 pub struct Board {
     pub placed_tiles: HashMap<(i32, i32), PlacedTile>,
     pub groups: HashMap<usize, ElementGroup>,
     pub edge_to_group: HashMap<((i32, i32), usize), usize>,
-    next_group_id: usize,
+    pub next_group_id: usize,
 }
 
 impl Default for Board {
@@ -98,6 +106,24 @@ impl Board {
             edge_to_group: HashMap::new(),
             next_group_id: 1,
         }
+    }
+
+    /// Lưu trạng thái groups + edge_to_group để có thể undo place_tile sau này.
+    /// Không clone placed_tiles (phần nặng nhất) — undo chỉ cần xóa tile vừa đặt.
+    pub fn save_undo_state(&self) -> BoardUndoState {
+        BoardUndoState {
+            groups: self.groups.clone(),
+            edge_to_group: self.edge_to_group.clone(),
+            next_group_id: self.next_group_id,
+        }
+    }
+
+    /// Khôi phục trạng thái groups + edge_to_group, xóa tile vừa đặt khỏi placed_tiles.
+    pub fn restore_undo_state(&mut self, state: BoardUndoState, removed_pos: (i32, i32)) {
+        self.placed_tiles.remove(&removed_pos);
+        self.groups = state.groups;
+        self.edge_to_group = state.edge_to_group;
+        self.next_group_id = state.next_group_id;
     }
 
     /// Lấy danh sách các Group ID duy nhất của ô tile tại vị trí pos tương ứng với group_type

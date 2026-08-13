@@ -470,14 +470,14 @@ impl GpuNNExecutor {
         });
 
         macro_rules! wb { ($slice:expr) => { Self::make_weight_buf(&device, $slice) } }
-        let w_self1  = wb!(&model.w_self1.weight);  let b_self1  = wb!(&model.w_self1.bias);
-        let w_neigh1 = wb!(&model.w_neigh1.weight); let b_neigh1 = wb!(&model.w_neigh1.bias);
-        let w_self2  = wb!(&model.w_self2.weight);  let b_self2  = wb!(&model.w_self2.bias);
-        let w_neigh2 = wb!(&model.w_neigh2.weight); let b_neigh2 = wb!(&model.w_neigh2.bias);
-        let w_self3  = wb!(&model.w_self3.weight);  let b_self3  = wb!(&model.w_self3.bias);
-        let w_neigh3 = wb!(&model.w_neigh3.weight); let b_neigh3 = wb!(&model.w_neigh3.bias);
-        let w_self4  = wb!(&model.w_self4.weight);  let b_self4  = wb!(&model.w_self4.bias);
-        let w_neigh4 = wb!(&model.w_neigh4.weight); let b_neigh4 = wb!(&model.w_neigh4.bias);
+        let w_self1  = wb!(&model.layers[0].w_self.weight);  let b_self1  = wb!(&model.layers[0].w_self.bias);
+        let w_neigh1 = wb!(&model.layers[0].w_neigh.weight); let b_neigh1 = wb!(&model.layers[0].w_neigh.bias);
+        let w_self2  = wb!(&model.layers[1].w_self.weight);  let b_self2  = wb!(&model.layers[1].w_self.bias);
+        let w_neigh2 = wb!(&model.layers[1].w_neigh.weight); let b_neigh2 = wb!(&model.layers[1].w_neigh.bias);
+        let w_self3  = wb!(&model.layers[2].w_self.weight);  let b_self3  = wb!(&model.layers[2].w_self.bias);
+        let w_neigh3 = wb!(&model.layers[2].w_neigh.weight); let b_neigh3 = wb!(&model.layers[2].w_neigh.bias);
+        let w_self4  = wb!(&model.layers[3].w_self.weight);  let b_self4  = wb!(&model.layers[3].w_self.bias);
+        let w_neigh4 = wb!(&model.layers[3].w_neigh.weight); let b_neigh4 = wb!(&model.layers[3].w_neigh.bias);
         let w_act1   = wb!(&model.w_act1.weight);   let b_act1   = wb!(&model.w_act1.bias);
         let w_act2   = wb!(&model.w_act2.weight);   let b_act2   = wb!(&model.w_act2.bias);
         let w_val1   = wb!(&model.w_val1.weight);   let b_val1   = wb!(&model.w_val1.bias);
@@ -640,14 +640,14 @@ impl GpuNNExecutor {
                 self.queue.write_buffer(&$buf, 0, bytemuck::cast_slice($data));
             }
         }
-        ww!(self.w_self1,  &model.w_self1.weight);  ww!(self.b_self1,  &model.w_self1.bias);
-        ww!(self.w_neigh1, &model.w_neigh1.weight); ww!(self.b_neigh1, &model.w_neigh1.bias);
-        ww!(self.w_self2,  &model.w_self2.weight);  ww!(self.b_self2,  &model.w_self2.bias);
-        ww!(self.w_neigh2, &model.w_neigh2.weight); ww!(self.b_neigh2, &model.w_neigh2.bias);
-        ww!(self.w_self3,  &model.w_self3.weight);  ww!(self.b_self3,  &model.w_self3.bias);
-        ww!(self.w_neigh3, &model.w_neigh3.weight); ww!(self.b_neigh3, &model.w_neigh3.bias);
-        ww!(self.w_self4,  &model.w_self4.weight);  ww!(self.b_self4,  &model.w_self4.bias);
-        ww!(self.w_neigh4, &model.w_neigh4.weight); ww!(self.b_neigh4, &model.w_neigh4.bias);
+        ww!(self.w_self1,  &model.layers[0].w_self.weight);  ww!(self.b_self1,  &model.layers[0].w_self.bias);
+        ww!(self.w_neigh1, &model.layers[0].w_neigh.weight); ww!(self.b_neigh1, &model.layers[0].w_neigh.bias);
+        ww!(self.w_self2,  &model.layers[1].w_self.weight);  ww!(self.b_self2,  &model.layers[1].w_self.bias);
+        ww!(self.w_neigh2, &model.layers[1].w_neigh.weight); ww!(self.b_neigh2, &model.layers[1].w_neigh.bias);
+        ww!(self.w_self3,  &model.layers[2].w_self.weight);  ww!(self.b_self3,  &model.layers[2].w_self.bias);
+        ww!(self.w_neigh3, &model.layers[2].w_neigh.weight); ww!(self.b_neigh3, &model.layers[2].w_neigh.bias);
+        ww!(self.w_self4,  &model.layers[3].w_self.weight);  ww!(self.b_self4,  &model.layers[3].w_self.bias);
+        ww!(self.w_neigh4, &model.layers[3].w_neigh.weight); ww!(self.b_neigh4, &model.layers[3].w_neigh.bias);
         ww!(self.w_act1,   &model.w_act1.weight);   ww!(self.b_act1,   &model.w_act1.bias);
         ww!(self.w_act2,   &model.w_act2.weight);   ww!(self.b_act2,   &model.w_act2.bias);
         ww!(self.w_val1,   &model.w_val1.weight);   ww!(self.b_val1,   &model.w_val1.bias);
@@ -682,7 +682,7 @@ impl GpuNNExecutor {
         }
         node_offsets.push(total_nodes as u32);
 
-        if total_nodes == 0 || total_actions == 0 || total_nodes > MAX_NODES || total_actions > MAX_ACTIONS {
+        if total_nodes == 0 || total_actions == 0 || total_nodes > MAX_NODES || total_actions > MAX_ACTIONS || batch > MAX_BATCH {
             return None;
         }
 

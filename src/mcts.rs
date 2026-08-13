@@ -96,11 +96,12 @@ impl MCTSSearch {
         samples.into_iter().map(|s| s / sum).collect()
     }
 
-    /// Thực hiện MCTS Search với số lượt simulations quy định (200 simulations)
+    /// Thực hiện MCTS Search với số lượt simulations quy định.
+    /// Dùng save_checkpoint/restore_checkpoint thay vì clone env.
     /// Trả về: (Phân phối xác suất π_mcts, Action index được chọn, Giá trị ước tính Value tại Root)
     pub fn search(
         &self,
-        env: &DorfromantikEnv,
+        env: &mut DorfromantikEnv,
         model: &HexGNNModel,
         add_dirichlet: bool,
         temperature: f32,
@@ -127,7 +128,6 @@ impl MCTSSearch {
         let sum_exp: f32 = exps.iter().sum::<f32>().max(1e-8);
         let mut priors: Vec<f32> = exps.iter().map(|e| e / sum_exp).collect();
 
-        // Thêm Dirichlet noise tại Root trong quá trình Self-Play để khám phá
         if add_dirichlet && num_actions > 1 {
             let noise = Self::sample_dirichlet(num_actions, self.config.dirichlet_alpha);
             let eps = self.config.dirichlet_eps;
@@ -147,14 +147,20 @@ impl MCTSSearch {
         let mut q_min = f32::INFINITY;
         let mut q_max = f32::NEG_INFINITY;
 
-        // 2. Chạy N lượt MCTS Simulations (mỗi lượt là 1 chuỗi Selection -> Expansion -> Value Evaluation -> Backup)
+        // Lưu checkpoint gốc (trước khi bắt đầu simulations)
+        let root_cp = env.save_root_checkpoint();
+
+        // 2. Chạy N lượt MCTS Simulations với undo
         for _ in 0..self.config.n_simulations {
-            let mut sim_env = env.clone();
+            // Khôi phục về trạng thái gốc
+            env.restore_checkpoint(root_cp.clone());
+
             let mut node_path: Vec<usize> = Vec::new();
             let mut step_rewards: Vec<f32> = Vec::new();
+            let mut terminal_leaf = false;
 
             // --- SELECTION PHASE ---
-            let mut curr = &mut root;
+            let mut curr: &MCTSNode = &root;
             while curr.is_expanded && !curr.children.is_empty() && !curr.is_terminal {
                 let total_n = curr.children.iter().map(|(_, c)| c.visit_count).sum::<u32>() as f32;
                 let sqrt_n = (total_n).sqrt();
@@ -168,11 +174,9 @@ impl MCTSSearch {
                         if q_max > q_min + 1e-6 {
                             (q - q_min) / (q_max - q_min)
                         } else {
-                            // Tất cả Q-value bằng nhau (model mới init) → trả về mid-point
                             0.5
                         }
                     } else {
-                        // Chưa visited: prior term hoàn toàn quyết định exploration
                         0.0
                     };
 
@@ -184,28 +188,40 @@ impl MCTSSearch {
                 }
 
                 let (chosen_action, _) = curr.children[best_idx];
-                let res = sim_env.step(chosen_action);
+                let res = env.step(chosen_action);
                 let scaled_r = res.reward * 0.01;
 
                 node_path.push(best_idx);
                 step_rewards.push(scaled_r);
 
-                curr = &mut curr.children[best_idx].1;
-                curr.immediate_reward = scaled_r;
-
                 if res.done {
-                    curr.is_terminal = true;
+                    terminal_leaf = true;
                     break;
                 }
+
+                curr = &curr.children[best_idx].1;
             }
 
             // --- EXPANSION & EVALUATION PHASE ---
-            let leaf_value = if curr.is_terminal {
+            // Tìm node lá trong cây (đi theo path)
+            let leaf_node = {
+                let mut leaf: &mut MCTSNode = &mut root;
+                for &idx in &node_path {
+                    leaf = &mut leaf.children[idx].1;
+                }
+                leaf
+            };
+
+            if terminal_leaf {
+                leaf_node.is_terminal = true;
+            }
+
+            let leaf_value = if leaf_node.is_terminal {
                 0.0
-            } else if !curr.is_expanded {
-                let leaf_obs = sim_env.extract_graph_observation();
+            } else if !leaf_node.is_expanded {
+                let leaf_obs = env.extract_graph_observation();
                 if leaf_obs.valid_actions.is_empty() {
-                    curr.is_terminal = true;
+                    leaf_node.is_terminal = true;
                     0.0
                 } else {
                     let (leaf_logits, val) = model.forward(
@@ -221,8 +237,8 @@ impl MCTSSearch {
                     let l_sum: f32 = l_exps.iter().sum::<f32>().max(1e-8);
                     let l_probs: Vec<f32> = l_exps.iter().map(|e| e / l_sum).collect();
 
-                    curr.is_expanded = true;
-                    curr.children = leaf_obs.valid_actions
+                    leaf_node.is_expanded = true;
+                    leaf_node.children = leaf_obs.valid_actions
                         .iter()
                         .zip(l_probs.iter())
                         .map(|(&act, &p)| (act, MCTSNode::new(p)))
@@ -231,37 +247,36 @@ impl MCTSSearch {
                     val
                 }
             } else {
-                curr.q_value()
+                leaf_node.q_value()
             };
 
             // --- BACKPROPAGATION (BACKUP) PHASE ---
-            // Cập nhật giá trị ngược từ nút lá lên đến nút gốc
             let mut g = leaf_value;
             let depth = node_path.len();
 
-            // Tính toán cumulative return cho từng tầng
             let mut returns = vec![0.0f32; depth];
             for d in (0..depth).rev() {
                 g = step_rewards[d] + self.config.gamma * g;
                 returns[d] = g;
             }
 
-            // Đi theo path từ Root để cập nhật visit_count và total_value
-            let mut traverse = &mut root;
-            traverse.visit_count += 1;
-            traverse.total_value += g;
+            root.visit_count += 1;
+            root.total_value += g;
 
             for d in 0..depth {
                 let child_idx = node_path[d];
-                traverse = &mut traverse.children[child_idx].1;
-                traverse.visit_count += 1;
-                traverse.total_value += returns[d];
+                let child = &mut root.children[child_idx].1;
+                child.visit_count += 1;
+                child.total_value += returns[d];
 
-                let q = traverse.q_value();
+                let q = child.q_value();
                 if q < q_min { q_min = q; }
                 if q > q_max { q_max = q; }
             }
         }
+
+        // Khôi phục env về root sau tất cả simulations
+        env.restore_checkpoint(root_cp);
 
         // 3. Tính Target Policy π_mcts từ Visit Count của các con tại Root
         let visit_counts: Vec<f32> = root.children.iter().map(|(_, c)| c.visit_count as f32).collect();
@@ -286,216 +301,6 @@ impl MCTSSearch {
         };
 
         // Chọn Action theo phân phối pi_probs
-        let chosen_idx = if temperature <= 1e-3 {
-            visit_counts
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                .map(|(idx, _)| idx)
-                .unwrap_or(0)
-        } else {
-            let mut rng = rand::thread_rng();
-            let r: f32 = rng.gen_range(0.0..1.0);
-            let mut cum = 0.0f32;
-            let mut selected = num_actions - 1;
-            for (i, &p) in pi_probs.iter().enumerate() {
-                cum += p;
-                if r <= cum {
-                    selected = i;
-                    break;
-                }
-            }
-            selected
-        };
-
-        let chosen_action = root.children[chosen_idx].0;
-        (pi_probs, chosen_idx, chosen_action, root_val)
-    }
-
-    /// Helper: Gửi GraphObservation sang GpuEvalQueue và nhận kết quả từ GPU
-    fn eval_obs_via_gpu(
-        obs: &crate::env::GraphObservation,
-        eval_tx: &crossbeam_channel::Sender<crate::gpu_engine::GpuEvalRequest>,
-    ) -> (Vec<f32>, f32) {
-        let (resp_tx, resp_rx) = crossbeam_channel::bounded(1);
-        let req = crate::gpu_engine::GpuEvalRequest {
-            obs: obs.clone(),
-            response_tx: resp_tx,
-        };
-        if eval_tx.send(req).is_ok() {
-            if let Ok(res) = resp_rx.recv() {
-                return res;
-            }
-        }
-        (vec![0.0; obs.valid_actions.len()], 0.0)
-    }
-
-    /// MCTS Search GPU Batch Evaluation
-    pub fn search_gpu(
-        &self,
-        env: &DorfromantikEnv,
-        eval_tx: &crossbeam_channel::Sender<crate::gpu_engine::GpuEvalRequest>,
-        add_dirichlet: bool,
-        temperature: f32,
-    ) -> (Vec<f32>, usize, Action, f32) {
-        let obs = env.extract_graph_observation();
-        let num_actions = obs.valid_actions.len();
-
-        if num_actions == 0 {
-            let default_act = Action { q: 0, r: 0, rotation: 0 };
-            return (Vec::new(), 0, default_act, 0.0);
-        }
-
-        // 1. Khởi tạo Root Node và Expand bằng GPU Eval Queue
-        let (action_logits, root_val) = Self::eval_obs_via_gpu(&obs, eval_tx);
-
-        let max_logit = action_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let exps: Vec<f32> = action_logits.iter().map(|l| (l - max_logit).exp()).collect();
-        let sum_exp: f32 = exps.iter().sum::<f32>().max(1e-8);
-        let mut priors: Vec<f32> = exps.iter().map(|e| e / sum_exp).collect();
-
-        if add_dirichlet && num_actions > 1 {
-            let noise = Self::sample_dirichlet(num_actions, self.config.dirichlet_alpha);
-            let eps = self.config.dirichlet_eps;
-            for i in 0..num_actions {
-                priors[i] = (1.0 - eps) * priors[i] + eps * noise[i];
-            }
-        }
-
-        let mut root = MCTSNode::new(1.0);
-        root.is_expanded = true;
-        root.children = obs.valid_actions
-            .iter()
-            .zip(priors.iter())
-            .map(|(&act, &p)| (act, MCTSNode::new(p)))
-            .collect();
-
-        let mut q_min = f32::INFINITY;
-        let mut q_max = f32::NEG_INFINITY;
-
-        // 2. Chạy N lượt MCTS Simulations
-        for _ in 0..self.config.n_simulations {
-            let mut sim_env = env.clone();
-            let mut node_path: Vec<usize> = Vec::new();
-            let mut step_rewards: Vec<f32> = Vec::new();
-
-            let mut curr = &mut root;
-            while curr.is_expanded && !curr.children.is_empty() && !curr.is_terminal {
-                let total_n = curr.children.iter().map(|(_, c)| c.visit_count).sum::<u32>() as f32;
-                let sqrt_n = (total_n).sqrt();
-
-                let mut best_idx = 0;
-                let mut best_ucb = f32::NEG_INFINITY;
-
-                for (idx, (_, child)) in curr.children.iter().enumerate() {
-                    let q_val = if child.visit_count > 0 {
-                        let q = child.q_value();
-                        if q_max > q_min + 1e-6 {
-                            (q - q_min) / (q_max - q_min)
-                        } else {
-                            0.5
-                        }
-                    } else {
-                        0.0
-                    };
-
-                    let ucb = q_val + self.config.c_puct * child.prior * sqrt_n / (1.0 + child.visit_count as f32);
-                    if ucb > best_ucb {
-                        best_ucb = ucb;
-                        best_idx = idx;
-                    }
-                }
-
-                let (chosen_action, _) = curr.children[best_idx];
-                let res = sim_env.step(chosen_action);
-                let scaled_r = res.reward * 0.01;
-
-                node_path.push(best_idx);
-                step_rewards.push(scaled_r);
-
-                curr = &mut curr.children[best_idx].1;
-                curr.immediate_reward = scaled_r;
-
-                if res.done {
-                    curr.is_terminal = true;
-                    break;
-                }
-            }
-
-            // GPU EXPANSION & EVALUATION PHASE
-            let leaf_value = if curr.is_terminal {
-                0.0
-            } else if !curr.is_expanded {
-                let leaf_obs = sim_env.extract_graph_observation();
-                if leaf_obs.valid_actions.is_empty() {
-                    curr.is_terminal = true;
-                    0.0
-                } else {
-                    let (leaf_logits, val) = Self::eval_obs_via_gpu(&leaf_obs, eval_tx);
-
-                    let l_max = leaf_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    let l_exps: Vec<f32> = leaf_logits.iter().map(|l| (l - l_max).exp()).collect();
-                    let l_sum: f32 = l_exps.iter().sum::<f32>().max(1e-8);
-                    let l_probs: Vec<f32> = l_exps.iter().map(|e| e / l_sum).collect();
-
-                    curr.is_expanded = true;
-                    curr.children = leaf_obs.valid_actions
-                        .iter()
-                        .zip(l_probs.iter())
-                        .map(|(&act, &p)| (act, MCTSNode::new(p)))
-                        .collect();
-
-                    val
-                }
-            } else {
-                curr.q_value()
-            };
-
-            // BACKPROPAGATION PHASE
-            let mut g = leaf_value;
-            let depth = node_path.len();
-
-            let mut returns = vec![0.0f32; depth];
-            for d in (0..depth).rev() {
-                g = step_rewards[d] + self.config.gamma * g;
-                returns[d] = g;
-            }
-
-            let mut traverse = &mut root;
-            traverse.visit_count += 1;
-            traverse.total_value += g;
-
-            for d in 0..depth {
-                let child_idx = node_path[d];
-                traverse = &mut traverse.children[child_idx].1;
-                traverse.visit_count += 1;
-                traverse.total_value += returns[d];
-
-                let q = traverse.q_value();
-                if q < q_min { q_min = q; }
-                if q > q_max { q_max = q; }
-            }
-        }
-
-        let visit_counts: Vec<f32> = root.children.iter().map(|(_, c)| c.visit_count as f32).collect();
-        let total_visits: f32 = visit_counts.iter().sum::<f32>().max(1.0);
-
-        let pi_probs = if temperature <= 1e-3 {
-            let max_idx = visit_counts
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                .map(|(idx, _)| idx)
-                .unwrap_or(0);
-            let mut p = vec![0.0f32; num_actions];
-            p[max_idx] = 1.0;
-            p
-        } else {
-            let powered: Vec<f32> = visit_counts.iter().map(|&v| (v / total_visits).powf(1.0 / temperature)).collect();
-            let sum_pow: f32 = powered.iter().sum::<f32>().max(1e-8);
-            powered.iter().map(|p| p / sum_pow).collect()
-        };
-
         let chosen_idx = if temperature <= 1e-3 {
             visit_counts
                 .iter()
@@ -793,21 +598,6 @@ impl MCTSSearch {
 
         results
     }
-
-    /// Vectorized Batch MCTS Search wrapper cho danh sách B environments.
-    pub fn search_batch(
-        &self,
-        envs: &[DorfromantikEnv],
-        model: &HexGNNModel,
-        gpu_exec: Option<&GpuNNExecutor>,
-        add_dirichlet: bool,
-        temperature: f32,
-    ) -> Vec<(Vec<f32>, usize, Action, f32)> {
-        let active_indices: Vec<usize> = (0..envs.len()).collect();
-        let indexed_results = self.search_batch_indexed(envs, &active_indices, model, gpu_exec, add_dirichlet, temperature);
-        indexed_results.into_iter().map(|(pi, idx, act, val, _)| (pi, idx, act, val)).collect()
-    }
-
 
     /// MCTS Batch Search cho 1 env ĐƠN LẺ dùng Virtual Loss (node ảo) để thăm dò nhiều lá
     /// trong cùng 1 lượt, gom thành 1 GPU batch leaf-eval để GPU được dùng triệt để.
