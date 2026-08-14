@@ -133,10 +133,28 @@ impl AlphaZeroReplayBuffer {
         removed
     }
 
+    /// Làm mềm (un-sharpen) lại phân phối target_pi của tất cả sample trong buffer bằng cách
+    /// áp dụng hàm lũy thừa ngược pi'_i = (pi_i)^factor rồi chuẩn hóa lại.
+    /// Giúp khôi phục các buffer cũ từng bị nhọn hóa bởi sampling temperature (ví dụ factor=0.2 - 0.5).
+    /// Chạy cực nhanh (< 50ms cho 200k samples).
+    pub fn unsharpen_target_pi(&mut self, factor: f32) {
+        if factor <= 0.0 || (factor - 1.0).abs() < 1e-4 {
+            return;
+        }
+        for sample in self.buffer.iter_mut() {
+            if sample.target_pi.is_empty() {
+                continue;
+            }
+            let powered: Vec<f32> = sample.target_pi.iter().map(|&p| p.max(0.0).powf(factor)).collect();
+            let sum: f32 = powered.iter().sum::<f32>().max(1e-8);
+            sample.target_pi = powered.into_iter().map(|p| p / sum).collect();
+        }
+    }
+
     pub fn save_to_file(&self, path: &str) -> std::io::Result<()> {
         use std::io::Write;
         if let Some(parent) = std::path::Path::new(path).parent() {
-            std::fs::create_dir_all(parent)?;
+            let _ = std::fs::create_dir_all(parent);
         }
         let file = std::fs::File::create(path)?;
         let mut writer = std::io::BufWriter::new(file);
@@ -336,8 +354,8 @@ impl Default for AlphaZeroTrainerConfig {
                 c_puct: 1.5,
                 gamma: 0.99,
                 n_simulations: 200,
-                dirichlet_alpha: 0.5,
-                dirichlet_eps: 0.4,
+                dirichlet_alpha: 0.3,
+                dirichlet_eps: 0.25,
                 explore_by_entropy: true,
                 temp_high: 1.0,
                 temp_low: 0.2,

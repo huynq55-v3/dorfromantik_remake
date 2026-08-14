@@ -113,6 +113,16 @@ impl MCTSSearch {
         Self { config }
     }
 
+    /// Tính Dirichlet Alpha thích ứng theo số lượng action hợp lệ |A|.
+    /// Theo AlphaZero (Silver et al.), alpha xấp xỉ tỉ lệ nghịch với |A|: alpha ≈ 10.0 / |A|
+    /// Giới hạn trong khoảng [0.05, 0.35] để đảm bảo phân phối hợp lý cả khi ít hay nhiều actions.
+    pub fn get_adaptive_dirichlet_alpha(num_actions: usize, base_alpha: f32) -> f32 {
+        if num_actions <= 1 {
+            return base_alpha;
+        }
+        (10.0 / num_actions as f32).clamp(0.05, 0.35)
+    }
+
     /// Tạo mẫu Dirichlet Noise cho Policy Prior tại Node Gốc
     fn sample_dirichlet(k: usize, alpha: f32) -> Vec<f32> {
         if k == 0 {
@@ -142,7 +152,7 @@ impl MCTSSearch {
 
     /// Thực hiện MCTS Search với số lượt simulations quy định.
     /// Dùng save_checkpoint/restore_checkpoint thay vì clone env.
-    /// Trả về: (Phân phối xác suất π_mcts, Action index được chọn, Giá trị ước tính Value tại Root)
+    /// Trả về: (Phân phối xác suất π_mcts chuẩn hóa tau=1.0, Action index được chọn, Action được chọn, Giá trị ước tính Value tại Root)
     pub fn search(
         &self,
         env: &mut DorfromantikEnv,
@@ -184,7 +194,8 @@ impl MCTSSearch {
         };
 
         if add_noise && num_actions > 1 {
-            let noise = Self::sample_dirichlet(num_actions, self.config.dirichlet_alpha);
+            let alpha = Self::get_adaptive_dirichlet_alpha(num_actions, self.config.dirichlet_alpha);
+            let noise = Self::sample_dirichlet(num_actions, alpha);
             let eps = self.config.dirichlet_eps;
             for i in 0..num_actions {
                 priors[i] = (1.0 - eps) * priors[i] + eps * noise[i];
@@ -333,30 +344,14 @@ impl MCTSSearch {
         // Khôi phục env về root sau tất cả simulations
         env.restore_checkpoint(root_cp);
 
-        // 3. Tính Target Policy π_mcts từ Visit Count của các con tại Root
+        // 3. Tính Target Policy π_mcts chuẩn (tau = 1.0) cho Replay Buffer / Training
         let visit_counts: Vec<f32> = root.children.iter().map(|(_, c)| c.visit_count as f32).collect();
         let total_visits: f32 = visit_counts.iter().sum::<f32>().max(1.0);
+        let target_pi: Vec<f32> = visit_counts.iter().map(|&v| v / total_visits).collect();
 
-        let pi_probs = if temperature <= 1e-3 {
-            // Greedy: Chọn Action có Visit Count cao nhất
-            let max_idx = visit_counts
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                .map(|(idx, _)| idx)
-                .unwrap_or(0);
-            let mut p = vec![0.0f32; num_actions];
-            p[max_idx] = 1.0;
-            p
-        } else {
-            // Softmax Temperature trên Visit Counts: N(a)^(1/tau)
-            let powered: Vec<f32> = visit_counts.iter().map(|&v| (v / total_visits).powf(1.0 / temperature)).collect();
-            let sum_pow: f32 = powered.iter().sum::<f32>().max(1e-8);
-            powered.iter().map(|p| p / sum_pow).collect()
-        };
-
-        // Chọn Action theo phân phối pi_probs
+        // 4. Chọn Action: áp dụng temperature cho sampling
         let chosen_idx = if temperature <= 1e-3 {
+            // Greedy: Chọn Action có Visit Count cao nhất
             visit_counts
                 .iter()
                 .enumerate()
@@ -364,11 +359,16 @@ impl MCTSSearch {
                 .map(|(idx, _)| idx)
                 .unwrap_or(0)
         } else {
+            // Softmax Temperature trên Visit Counts: N(a)^(1/tau)
+            let powered: Vec<f32> = visit_counts.iter().map(|&v| (v / total_visits).powf(1.0 / temperature)).collect();
+            let sum_pow: f32 = powered.iter().sum::<f32>().max(1e-8);
+            let sample_probs: Vec<f32> = powered.iter().map(|p| p / sum_pow).collect();
+
             let mut rng = rand::thread_rng();
             let r: f32 = rng.gen_range(0.0..1.0);
             let mut cum = 0.0f32;
             let mut selected = num_actions - 1;
-            for (i, &p) in pi_probs.iter().enumerate() {
+            for (i, &p) in sample_probs.iter().enumerate() {
                 cum += p;
                 if r <= cum {
                     selected = i;
@@ -379,7 +379,7 @@ impl MCTSSearch {
         };
 
         let chosen_action = root.children[chosen_idx].0;
-        (pi_probs, chosen_idx, chosen_action, root_val)
+        (target_pi, chosen_idx, chosen_action, root_val)
     }
 
     /// Vectorized Batch MCTS Search cho danh sách các active envs theo index (Zero Env-Clone & Zero HashMap overhead)
@@ -444,7 +444,8 @@ impl MCTSSearch {
             root_temps[i] = this_temp;
 
             if add_noise && num_actions > 1 {
-                let noise = Self::sample_dirichlet(num_actions, self.config.dirichlet_alpha);
+                let alpha = Self::get_adaptive_dirichlet_alpha(num_actions, self.config.dirichlet_alpha);
+                let noise = Self::sample_dirichlet(num_actions, alpha);
                 let eps = self.config.dirichlet_eps;
                 for a in 0..num_actions {
                     priors[a] = (1.0 - eps) * priors[a] + eps * noise[a];
@@ -620,24 +621,11 @@ impl MCTSSearch {
 
             let visit_counts: Vec<f32> = root.children.iter().map(|(_, c)| c.visit_count as f32).collect();
             let total_visits: f32 = visit_counts.iter().sum::<f32>().max(1.0);
-            // Dùng nhiệt độ đã quyết định riêng cho env này (entropy-adaptive hoặc tham số gọi)
-            let pi_temperature = root_temps[i];
+            // 1. Target Policy chuẩn cho huấn luyện (luôn là tỉ lệ Visit Counts thuần túy, tau = 1.0)
+            let target_pi: Vec<f32> = visit_counts.iter().map(|&v| v / total_visits).collect();
 
-            let pi_probs = if pi_temperature <= 1e-3 {
-                let max_idx = visit_counts
-                    .iter()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                    .map(|(idx, _)| idx)
-                    .unwrap_or(0);
-                let mut p = vec![0.0f32; num_actions];
-                p[max_idx] = 1.0;
-                p
-            } else {
-                let powered: Vec<f32> = visit_counts.iter().map(|&v| (v / total_visits).powf(1.0 / pi_temperature)).collect();
-                let sum_pow: f32 = powered.iter().sum::<f32>().max(1e-8);
-                powered.iter().map(|p| p / sum_pow).collect()
-            };
+            // 2. Dùng nhiệt độ đã quyết định riêng cho env này để lấy mẫu nước đi (sampling)
+            let pi_temperature = root_temps[i];
 
             let chosen_idx = if pi_temperature <= 1e-3 {
                 visit_counts
@@ -647,11 +635,15 @@ impl MCTSSearch {
                     .map(|(idx, _)| idx)
                     .unwrap_or(0)
             } else {
+                let powered: Vec<f32> = visit_counts.iter().map(|&v| (v / total_visits).powf(1.0 / pi_temperature)).collect();
+                let sum_pow: f32 = powered.iter().sum::<f32>().max(1e-8);
+                let sample_probs: Vec<f32> = powered.iter().map(|p| p / sum_pow).collect();
+
                 let mut rng = rand::thread_rng();
                 let r: f32 = rng.gen_range(0.0..1.0);
                 let mut cum = 0.0f32;
                 let mut selected = num_actions - 1;
-                for (k, &p) in pi_probs.iter().enumerate() {
+                for (k, &p) in sample_probs.iter().enumerate() {
                     cum += p;
                     if r <= cum {
                         selected = k;
@@ -662,7 +654,7 @@ impl MCTSSearch {
             };
 
             let chosen_action = root.children[chosen_idx].0;
-            results.push((pi_probs, chosen_idx, chosen_action, root_val, obs));
+            results.push((target_pi, chosen_idx, chosen_action, root_val, obs));
         }
 
         results
@@ -718,7 +710,8 @@ impl MCTSSearch {
         };
 
         if add_noise && num_actions > 1 {
-            let noise = Self::sample_dirichlet(num_actions, self.config.dirichlet_alpha);
+            let alpha = Self::get_adaptive_dirichlet_alpha(num_actions, self.config.dirichlet_alpha);
+            let noise = Self::sample_dirichlet(num_actions, alpha);
             let eps = self.config.dirichlet_eps;
             for a in 0..num_actions {
                 priors[a] = (1.0 - eps) * priors[a] + eps * noise[a];
@@ -917,22 +910,10 @@ impl MCTSSearch {
         }
 
 
-        let pi_probs = if temperature <= 1e-3 {
-            let max_idx = visit_counts
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                .map(|(idx, _)| idx)
-                .unwrap_or(0);
-            let mut p = vec![0.0f32; num_actions];
-            p[max_idx] = 1.0;
-            p
-        } else {
-            let powered: Vec<f32> = visit_counts.iter().map(|&v| (v / total_visits).powf(1.0 / temperature)).collect();
-            let sum_pow: f32 = powered.iter().sum::<f32>().max(1e-8);
-            powered.iter().map(|p| p / sum_pow).collect()
-        };
+        // 1. Target Policy chuẩn cho huấn luyện (luôn là tỉ lệ Visit Counts thuần túy, tau = 1.0)
+        let target_pi: Vec<f32> = visit_counts.iter().map(|&v| v / total_visits).collect();
 
+        // 2. Dùng nhiệt độ để lấy mẫu nước đi (sampling)
         let chosen_idx = if temperature <= 1e-3 {
             visit_counts
                 .iter()
@@ -941,11 +922,15 @@ impl MCTSSearch {
                 .map(|(idx, _)| idx)
                 .unwrap_or(0)
         } else {
+            let powered: Vec<f32> = visit_counts.iter().map(|&v| (v / total_visits).powf(1.0 / temperature)).collect();
+            let sum_pow: f32 = powered.iter().sum::<f32>().max(1e-8);
+            let sample_probs: Vec<f32> = powered.iter().map(|p| p / sum_pow).collect();
+
             let mut rng = rand::thread_rng();
             let r: f32 = rng.gen_range(0.0..1.0);
             let mut cum = 0.0f32;
             let mut selected = num_actions - 1;
-            for (k, &p) in pi_probs.iter().enumerate() {
+            for (k, &p) in sample_probs.iter().enumerate() {
                 cum += p;
                 if r <= cum {
                     selected = k;
@@ -956,7 +941,7 @@ impl MCTSSearch {
         };
 
         let chosen_action = root.children[chosen_idx].0;
-        (pi_probs, chosen_idx, chosen_action, root_val)
+        (target_pi, chosen_idx, chosen_action, root_val)
     }
 
     /// Đánh dấu Virtual Loss lên toàn bộ đường đi (tăng visit_count, giảm total_value)
