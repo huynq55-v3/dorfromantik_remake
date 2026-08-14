@@ -47,7 +47,7 @@ fn load_monthly_game_config() -> (i32, usize, usize) {
 
 fn main() {
     // arg1 = số simulations (mặc định 400)
-    // arg2 = số envs song song (mặc định 16)
+    // arg2 = batch_size lá cho mỗi vòng GPU eval (mặc định 128)
     // arg3 = model path (mặc định: models/alphazero_best.bin nếu có, fallback alphazero_latest.bin)
     let args: Vec<String> = std::env::args().collect();
     let n_simulations = if args.len() > 1 {
@@ -55,10 +55,10 @@ fn main() {
     } else {
         400
     };
-    let n_envs = if args.len() > 2 {
-        args[2].parse::<usize>().unwrap_or(16)
+    let batch_size = if args.len() > 2 {
+        args[2].parse::<usize>().unwrap_or(128)
     } else {
-        16
+        128
     };
 
     let model_path = if args.len() > 3 {
@@ -96,8 +96,8 @@ fn main() {
 
     let (seed, initial_stack, tile_limit) = load_monthly_game_config();
     println!(
-        "Chạy Double-Buffered Batch MCTS (sims={}, parallel_envs={}) | Seed={} | Stack={} | TileLimit={} ...",
-        n_simulations, n_envs, seed, initial_stack, tile_limit
+        "Chạy Single-Game Replay MCTS (sims={}, batch={}) | Seed={} | Stack={} | TileLimit={} ...",
+        n_simulations, batch_size, seed, initial_stack, tile_limit
     );
 
     let mcts_config = MCTSConfig {
@@ -106,97 +106,108 @@ fn main() {
         n_simulations,
         dirichlet_alpha: 0.3,
         dirichlet_eps: 0.25,
-        explore_by_entropy: true,
+        explore_by_entropy: false,
         temp_high: 1.0,
         temp_low: 0.2,
     };
     let mcts = MCTSSearch::new(mcts_config.clone());
 
-    let mut envs: Vec<DorfromantikEnv> = (0..n_envs)
-        .map(|_| DorfromantikEnv::new(seed, initial_stack, tile_limit))
-        .collect();
-    let mut move_records: Vec<Vec<GameMoveRecord>> = vec![Vec::new(); n_envs];
-    let mut active = vec![true; n_envs];
-    let mut turn_counter = 0usize;
+    let mut env = DorfromantikEnv::new(seed, initial_stack, tile_limit);
+    let mut move_records = Vec::new();
+    let mut move_count = 0usize;
     let t0 = Instant::now();
 
-    while active.iter().any(|&a| a) {
-        let active_indices: Vec<usize> = (0..n_envs).filter(|&i| active[i]).collect();
-        if active_indices.is_empty() {
+    while !env.is_game_over() {
+        let obs = env.extract_graph_observation();
+        let num_actions = obs.valid_actions.len();
+        if num_actions == 0 {
             break;
         }
-        turn_counter += 1;
 
-        let batch_results = mcts.search_batch_indexed(
-            &envs,
-            &active_indices,
+        // 1. Xem GNN raw prediction (Prior Policy & Root Value) trước khi MCTS tìm kiếm
+        let (raw_logits, raw_val) = if let Some(ref gpu) = gpu_executor {
+            let res = gpu.forward_batch_gpu(&[&obs]);
+            res[0].clone()
+        } else {
+            let res = model.forward_batch(&[&obs]);
+            res[0].clone()
+        };
+
+        let max_l = raw_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = raw_logits.iter().map(|l| (l - max_l).exp()).collect();
+        let sum_exp: f32 = exps.iter().sum::<f32>().max(1e-8);
+        let raw_priors: Vec<f32> = exps.iter().map(|e| e / sum_exp).collect();
+
+        // 2. Chạy MCTS Virtual Loss Batch Search (Greedy, T=0)
+        let turn_start = Instant::now();
+        let (target_pi, _, chosen_action, mcts_root_val) = mcts.search_virtual_loss_batch(
+            &env,
             &model,
             gpu_executor.as_ref(),
-            true, // Bật Dirichlet & Entropy giống Self-Play
-            1.0,
+            false, // no dirichlet
+            0.0,   // greedy
+            batch_size,
         );
+        let turn_ms = turn_start.elapsed().as_millis();
 
-        for (k, &idx) in active_indices.iter().enumerate() {
-            let (_, _, chosen_action, _, obs) = &batch_results[k];
+        // 3. Phân tích Top-3 nước đi theo Prior (GNN) vs Top-3 nước đi theo Visit Count (MCTS)
+        let mut gnn_rank: Vec<(usize, f32)> = raw_priors.iter().enumerate().map(|(i, &p)| (i, p)).collect();
+        gnn_rank.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-            if obs.valid_actions.is_empty() {
-                active[idx] = false;
-                continue;
-            }
+        let mut mcts_rank: Vec<(usize, f32)> = target_pi.iter().enumerate().map(|(i, &p)| (i, p)).collect();
+        mcts_rank.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-            let prev_score = envs[idx].score_manager.total_score;
-            let res = envs[idx].step(*chosen_action);
-            let score_gained = envs[idx].score_manager.total_score.saturating_sub(prev_score);
+        let prev_score = env.score_manager.total_score;
+        let res = env.step(chosen_action);
+        let score_gained = env.score_manager.total_score.saturating_sub(prev_score);
 
-            let step = move_records[idx].len();
-            move_records[idx].push(GameMoveRecord {
-                step,
-                q: chosen_action.q,
-                r: chosen_action.r,
-                rotation: chosen_action.rotation,
-                score_gained,
-                total_score: envs[idx].score_manager.total_score,
-                remaining_tiles: envs[idx].score_manager.remaining_tiles,
-            });
-
-            if res.done || envs[idx].is_game_over() {
-                active[idx] = false;
-            }
+        println!(
+            "\n>>> [Move {}] Placed at ({}, {}) Rot: {} | Score: +{} (Total: {}) | Stack: {} | Time: {}ms",
+            move_count + 1, chosen_action.q, chosen_action.r, chosen_action.rotation,
+            score_gained, env.score_manager.total_score, env.score_manager.remaining_tiles, turn_ms
+        );
+        println!("    GNN Root Value: {:.3} | MCTS Root Value: {:.3} | Valid Actions: {}", raw_val, mcts_root_val, num_actions);
+        
+        print!("    Top-3 GNN Prior:  ");
+        for &(idx, p) in gnn_rank.iter().take(3) {
+            let act = obs.valid_actions[idx];
+            print!(" [({}, {}) r:{} | P:{:.1}%]", act.q, act.r, act.rotation, p * 100.0);
         }
+        println!();
 
-        print!(".");
-        if turn_counter % 20 == 0 {
-            print!(" [Turn {} | Active: {}/{}]\n", turn_counter, active.iter().filter(|&&a| a).count(), n_envs);
+        print!("    Top-3 MCTS Visits:");
+        for &(idx, p) in mcts_rank.iter().take(3) {
+            let act = obs.valid_actions[idx];
+            print!(" [({}, {}) r:{} | Visits:{:.1}%]", act.q, act.r, act.rotation, p * 100.0);
         }
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
+        println!();
+
+        move_records.push(GameMoveRecord {
+            step: move_count,
+            q: chosen_action.q,
+            r: chosen_action.r,
+            rotation: chosen_action.rotation,
+            score_gained,
+            total_score: env.score_manager.total_score,
+            remaining_tiles: env.score_manager.remaining_tiles,
+        });
+        move_count += 1;
+
+        if res.done {
+            break;
+        }
     }
-    println!();
 
-    // Tìm ván đạt điểm cao nhất trong số n_envs
-    let mut best_idx = 0usize;
-    let mut best_score = 0usize;
-    for (i, env) in envs.iter().enumerate() {
-        let sc = env.score_manager.total_score;
-        println!("  Env #{} -> Score: {} | Placed: {} tiles", i + 1, sc, env.placed_count);
-        if sc >= best_score {
-            best_score = sc;
-            best_idx = i;
-        }
-    }
-
-    let best_env = &envs[best_idx];
     let record = GameMatchRecord {
         seed,
-        total_score: best_env.score_manager.total_score,
-        total_placed: best_env.placed_count,
+        total_score: env.score_manager.total_score,
+        total_placed: env.placed_count,
         is_eval: true,
-        moves: move_records[best_idx].clone(),
+        moves: move_records,
     };
 
     println!(
-        "\n🏆 VÁN ĐẤU XUẤT SẮC NHẤT (Env #{}): Score={} | Placed={} | Thời gian: {:.2}s",
-        best_idx + 1,
+        "\n🏁 KẾT THÚC VÁN ĐẤU: Score={} | Placed={} | Thời gian: {:.2}s",
         record.total_score,
         record.total_placed,
         t0.elapsed().as_secs_f32()
