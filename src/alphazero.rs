@@ -729,15 +729,21 @@ impl AlphaZeroPipeline {
             let mut env = DorfromantikEnv::new(base_seed, initial_stack, tile_limit);
             let mut ok = true;
             for m in &st.moves {
-                let act = crate::env::Action {
-                    q: m.q,
-                    r: m.r,
-                    rotation: m.rotation,
+                let Some(curr_tile) = env.current_tile() else {
+                    ok = false;
+                    break;
                 };
-                if !env.get_valid_actions().contains(&act) {
+                let period = curr_tile.rotation_symmetry_period();
+                let canonical_rot = m.rotation % period;
+                if !env.board.can_place_tile(m.q, m.r, curr_tile, canonical_rot) {
                     ok = false;
                     break;
                 }
+                let act = crate::env::Action {
+                    q: m.q,
+                    r: m.r,
+                    rotation: canonical_rot,
+                };
                 env.step(act);
                 if env.is_game_over() {
                     break;
@@ -747,8 +753,6 @@ impl AlphaZeroPipeline {
                 base_scores.push(env.score_manager.total_score);
                 valid_envs.push(env);
                 orig_idx.push(i);
-            } else {
-                base_scores.push(0);
             }
         }
         let b_count = valid_envs.len();
@@ -764,7 +768,7 @@ impl AlphaZeroPipeline {
         // BƯỚC 3: ghi đè Q value: total_score + root_value * 100.
         for (k, &st_idx) in orig_idx.iter().enumerate() {
             let root_val = results[k].3;
-            self.max_score_states[st_idx].q_value = base_scores[st_idx] as f32 + root_val * 100.0;
+            self.max_score_states[st_idx].q_value = base_scores[k] as f32 + root_val * 100.0;
         }
 
         // BƯỚC 4: sort giảm dần, giữ top 2000 (giống add_high_q_state).
@@ -822,16 +826,21 @@ impl AlphaZeroPipeline {
                     // Replay moves để đạt board state (depth = moves.len()).
                     let mut replay_ok = true;
                     for m in state.moves.iter() {
-                        let valid = env.get_valid_actions();
-                        let act = crate::env::Action {
-                            q: m.q,
-                            r: m.r,
-                            rotation: m.rotation,
+                        let Some(curr_tile) = env.current_tile() else {
+                            replay_ok = false;
+                            break;
                         };
-                        if !valid.contains(&act) {
+                        let period = curr_tile.rotation_symmetry_period();
+                        let canonical_rot = m.rotation % period;
+                        if !env.board.can_place_tile(m.q, m.r, curr_tile, canonical_rot) {
                             replay_ok = false;
                             break;
                         }
+                        let act = crate::env::Action {
+                            q: m.q,
+                            r: m.r,
+                            rotation: canonical_rot,
+                        };
                         let _ = env.step(act);
                         if env.is_game_over() {
                             break;
