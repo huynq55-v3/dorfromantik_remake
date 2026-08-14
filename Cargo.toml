@@ -37,6 +37,10 @@ path = "bin/gen_replay.rs"
 name = "fix_replay_buffer"
 path = "bin/fix_replay_buffer.rs"
 
+[[bin]]
+name = "train_offline"
+path = "bin/train_offline.rs"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

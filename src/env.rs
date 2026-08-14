@@ -30,7 +30,7 @@ pub mod action_feat {
     pub const MATCHING_COUNT: usize = 0;
     pub const MISMATCHING_COUNT: usize = 1;
     pub const CURR_REMAINING: usize = 2;
-    pub const ALL_MATCH: usize = 3;
+    pub const NEIGHBOR_COUNT: usize = 3;
     pub const QUEST_ADJ: usize = 4;
     pub const CURR_EQUALITY_MORE: usize = 5;
     pub const IS_QUEST_TILE: usize = 6;
@@ -598,7 +598,7 @@ impl DorfromantikEnv {
                 feat[action_feat::MATCHING_COUNT] = matching_count as f32 / 6.0;
                 feat[action_feat::MISMATCHING_COUNT] = mismatching_count as f32 / 6.0;
                 feat[action_feat::CURR_REMAINING] = curr_remaining;
-                feat[action_feat::ALL_MATCH] = if matching_count > 0 && mismatching_count == 0 { 1.0 } else { 0.0 };
+                feat[action_feat::NEIGHBOR_COUNT] = (matching_count + mismatching_count) as f32 / 6.0;
                 feat[action_feat::QUEST_ADJ] = quest_adj;
                 feat[action_feat::CURR_EQUALITY_MORE] = curr_equality_more;
                 feat[action_feat::IS_QUEST_TILE] = is_quest_tile;

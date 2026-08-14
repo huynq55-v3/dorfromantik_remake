@@ -246,6 +246,7 @@ fn main() {
                 if merged > 0 {
                     println!("[Buffer] Đã gộp và chuẩn hóa {} actions đẳng cấu (đối xứng xoay) trong buffer cũ!", merged);
                 }
+                pipeline.replay_buffer.migrate_action_features();
             }
             Err(e) => {
                 println!("[Buffer] CẢNH BÁO: Không nạp được buffer cũ ({:?})", e);

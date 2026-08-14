@@ -304,6 +304,18 @@ impl AlphaZeroReplayBuffer {
         total_merged_actions
     }
 
+    /// Cập nhật lại kênh NEIGHBOR_COUNT (kênh 3) cho tất cả action_features trong buffer
+    /// (được tính bằng matching_count + mismatching_count).
+    pub fn migrate_action_features(&mut self) {
+        for sample in self.buffer.iter_mut() {
+            for feat in sample.obs.action_features.iter_mut() {
+                let matching = feat[crate::env::action_feat::MATCHING_COUNT];
+                let mismatching = feat[crate::env::action_feat::MISMATCHING_COUNT];
+                feat[crate::env::action_feat::NEIGHBOR_COUNT] = matching + mismatching;
+            }
+        }
+    }
+
     /// Làm mềm (un-sharpen) lại phân phối target_pi của tất cả sample trong buffer bằng cách
     /// áp dụng hàm lũy thừa ngược pi'_i = (pi_i)^factor rồi chuẩn hóa lại.
     /// Giúp khôi phục các buffer cũ từng bị nhọn hóa bởi sampling temperature (ví dụ factor=0.2 - 0.5).
