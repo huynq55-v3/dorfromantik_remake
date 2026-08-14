@@ -48,6 +48,7 @@ fn load_monthly_game_config() -> (i32, usize, usize) {
 fn main() {
     // arg1 = số simulations (mặc định 400)
     // arg2 = batch_size lá cho mỗi vòng GPU eval (mặc định 128)
+    // arg3 = model path (mặc định: models/alphazero_best.bin nếu có, fallback alphazero_latest.bin)
     let args: Vec<String> = std::env::args().collect();
     let n_simulations = if args.len() > 1 {
         args[1].parse::<usize>().unwrap_or(400)
@@ -60,13 +61,20 @@ fn main() {
         128
     };
 
-    let model_path = "models/alphazero_latest.bin";
-    if !Path::new(model_path).exists() {
+    let model_path = if args.len() > 3 {
+        args[3].clone()
+    } else if Path::new("models/alphazero_best.bin").exists() {
+        "models/alphazero_best.bin".to_string()
+    } else {
+        "models/alphazero_latest.bin".to_string()
+    };
+
+    if !Path::new(&model_path).exists() {
         eprintln!("Lỗi: không tìm thấy model `{}`", model_path);
         std::process::exit(1);
     }
 
-    let model = match HexGNNModel::load_from_file(model_path) {
+    let model = match HexGNNModel::load_from_file(&model_path) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("Lỗi đọc model: {:?}", e);
@@ -96,8 +104,8 @@ fn main() {
         c_puct: 1.5,
         gamma: 0.995,
         n_simulations,
-        dirichlet_alpha: 0.5,
-        dirichlet_eps: 0.4,
+        dirichlet_alpha: 0.3,
+        dirichlet_eps: 0.25,
         explore_by_entropy: false,
         temp_high: 1.0,
         temp_low: 0.2,
@@ -115,13 +123,18 @@ fn main() {
             break;
         }
 
+        // Temperature schedule:
+        // - Ở 15 nước đầu: T = 0.2 (mềm dẻo, tránh kẹt hướng đi chết người)
+        // - Sau nước 15: T = 0.0 (Greedy thuần túy khai thác tối đa điểm)
+        let temp = if move_count < 15 { 0.2 } else { 0.0 };
+
         let turn_start = Instant::now();
         let (_, _, chosen_action, _) = mcts.search_virtual_loss_batch(
             &env,
             &model,
             gpu_executor.as_ref(),
             false,   // greedy eval, không dirichlet noise
-            0.0,     // temperature = 0 => chọn max visit
+            temp,
             batch_size,
         );
         let turn_ms = turn_start.elapsed().as_millis();
@@ -141,7 +154,7 @@ fn main() {
         });
         move_count += 1;
 
-        println!("  [Move {}] q={} r={} rot={} score+{} t={}ms", move_count, chosen_action.q, chosen_action.r, chosen_action.rotation, score_gained, turn_ms);
+        println!("  [Move {}] q={} r={} rot={} score+{} (Total: {}) t={}ms", move_count, chosen_action.q, chosen_action.r, chosen_action.rotation, score_gained, env.score_manager.total_score, turn_ms);
 
         if res.done {
             break;
