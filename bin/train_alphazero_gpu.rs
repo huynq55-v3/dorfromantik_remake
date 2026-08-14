@@ -371,7 +371,7 @@ fn main() {
 
         // C. Train model với Adam Optimizer
         let train_start = Instant::now();
-        let (pi_loss, val_loss, total_loss) = pipeline.train_step();
+        let (total_loss, pi_loss, val_loss) = pipeline.train_step();
         let train_dur = train_start.elapsed();
 
         println!(

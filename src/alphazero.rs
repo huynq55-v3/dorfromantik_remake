@@ -632,25 +632,22 @@ impl AlphaZeroPipeline {
         // Moves gốc của state để replay về đúng board khi from-state envs tự chơi tiếp.
         let mut env_source_moves: Vec<Vec<GameMoveRecord>> = vec![Vec::new(); n_envs];
         if !self.max_score_states.is_empty() {
+            let mut rng = rand::thread_rng();
             let count = ((n_envs as f32) * 0.80) as usize;
-            // Dùng 1 RNG đơn giản để chọn ngẫu nhiên các env nào từ state (không phụ thuộc ngoài)
-            let mut chosen = std::collections::HashSet::new();
-            let seed_rng = base_seed as u64;
-            for k in 0..count {
-                let idx = ((seed_rng.wrapping_add((k * 2654435761) as u64) % (n_envs as u64))
-                    as usize)
-                    .max(0);
-                chosen.insert(idx);
-            }
-            for idx in 0..n_envs {
-                from_state[idx] = chosen.contains(&idx);
+            let mut all_indices: Vec<usize> = (0..n_envs).collect();
+            all_indices.shuffle(&mut rng);
+            for &idx in &all_indices[..count] {
+                from_state[idx] = true;
             }
         }
+        let mut rng = rand::thread_rng();
         for idx in 0..n_envs {
             let mut env = DorfromantikEnv::new(base_seed, initial_stack, tile_limit);
             if from_state[idx] {
-                // Chọn 1 board state Q-value cao (danh sách đã sort giảm dần).
-                if let Some(state) = self.max_score_states.get(idx % self.max_score_states.len()) {
+                // Chọn ngẫu nhiên có trọng số (ưu tiên top Q-value cao nhất ở đầu danh sách)
+                let r_bias = rng.gen::<f32>().powi(2); // quadratic bias towards 0 (top Q)
+                let state_idx = (r_bias * self.max_score_states.len() as f32) as usize;
+                if let Some(state) = self.max_score_states.get(state_idx) {
                     // Replay moves để đạt board state (depth = moves.len()).
                     let mut replay_ok = true;
                     for m in state.moves.iter() {
