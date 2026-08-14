@@ -116,13 +116,13 @@ fn main() {
         .filter(|&e| e > 0)
         .unwrap_or(4);
 
-    // Đọc số moves giữ exploration (temp=1 + Dirichlet) từ tham số dòng lệnh thứ 5 (optional).
-    // Mặc định 12. Giá trị phải > 0; nếu không hợp lệ sẽ fallback về 12.
-    let temp_threshold_moves = args
+    // Cờ bật quyết định exploration theo entropy TRONG TỪNG TURN (tự tin → explore, bối rối → exploit).
+    // Mặc định 1 (BẬT). Truyền 0 để tắt.
+    let explore_by_entropy = args
         .get(5)
         .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&t| t > 0)
-        .unwrap_or(12);
+        .unwrap_or(1)
+        != 0;
 
     let lr = 0.0003;
 
@@ -138,8 +138,10 @@ fn main() {
             n_simulations,
             dirichlet_alpha: 0.5,
             dirichlet_eps: 0.4,
+            explore_by_entropy,
+            temp_high: 1.0,
+            temp_low: 0.2,
         },
-        temp_threshold_moves,
         num_parallel_envs: parallel_envs,
         target_seed,
         initial_stack,
@@ -280,9 +282,9 @@ fn main() {
     let buffer_capacity = config.replay_buffer_capacity.unwrap_or(200_000);
     println!(" - Replay Buffer Capacity: {} samples", buffer_capacity);
     println!(" - Warm-up (train sau ≥ 20%): ≥ {} samples", ((buffer_capacity as f32) * 0.20) as usize);
-    println!(" - Temp Threshold (exploration moves): {}", config.temp_threshold_moves);
     println!(" - Dirichlet Alpha: {} | Dirichlet Eps: {}", config.mcts_config.dirichlet_alpha, config.mcts_config.dirichlet_eps);
     println!(" - Learning Rate: {}", config.lr);
+    println!(" - Exploration theo entropy từng turn: {}", if config.mcts_config.explore_by_entropy { "BẬT" } else { "TẮT" });
     if iter_max != usize::MAX {
         println!(" - Iteration Max: {}", iter_max);
     }

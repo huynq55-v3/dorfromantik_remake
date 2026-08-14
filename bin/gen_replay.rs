@@ -98,6 +98,9 @@ fn main() {
         n_simulations,
         dirichlet_alpha: 0.5,
         dirichlet_eps: 0.4,
+        explore_by_entropy: false,
+        temp_high: 1.0,
+        temp_low: 0.2,
     };
     let mcts = MCTSSearch::new(mcts_config.clone());
 

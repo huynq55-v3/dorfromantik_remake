@@ -1,13 +1,13 @@
 use rand::prelude::*;
 use rayon::prelude::*;
-use std::collections::VecDeque;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 
 use crate::env::{DorfromantikEnv, GraphObservation};
+use crate::gpu_nn::GpuNNExecutor;
 use crate::mcts::{MCTSConfig, MCTSSearch};
 use crate::nn::HexGNNModel;
-use crate::gpu_nn::GpuNNExecutor;
 
 /// Mẫu dữ liệu huấn luyện AlphaZero (State Observation, Target Policy Distribution từ MCTS, Target Value từ Game Return)
 #[derive(Debug, Clone)]
@@ -68,9 +68,7 @@ impl AlphaZeroReplayBuffer {
         if len == 0 {
             return Vec::new();
         }
-        (0..batch_size)
-            .map(|_| rng.gen_range(0..len))
-            .collect()
+        (0..batch_size).map(|_| rng.gen_range(0..len)).collect()
     }
 
     /// Lấy `count` indices ngẫu nhiên KHÔNG TRÙNG từ buffer và trộn ngẫu nhiên (subset để train).
@@ -205,7 +203,10 @@ impl AlphaZeroReplayBuffer {
         let mut magic = [0u8; 11];
         reader.read_exact(&mut magic)?;
         if &magic != b"DORF_BUF_V1" {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid buffer format"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid buffer format",
+            ));
         }
 
         let mut buf8 = [0u8; 8];
@@ -315,7 +316,6 @@ pub struct AlphaZeroTrainerConfig {
     pub batch_size: usize,
     pub train_epochs_per_iter: usize,
     pub mcts_config: MCTSConfig,
-    pub temp_threshold_moves: usize,
     pub num_parallel_envs: usize,
     pub target_seed: i32,
     pub initial_stack: usize,
@@ -338,8 +338,10 @@ impl Default for AlphaZeroTrainerConfig {
                 n_simulations: 200,
                 dirichlet_alpha: 0.5,
                 dirichlet_eps: 0.4,
+                explore_by_entropy: true,
+                temp_high: 1.0,
+                temp_low: 0.2,
             },
-            temp_threshold_moves: 12,
             num_parallel_envs: 16,
             target_seed: -2093096630,
             initial_stack: 10,
@@ -390,7 +392,6 @@ pub fn run_self_play_episode(
     tile_limit: usize,
     model: &HexGNNModel,
     mcts_config: &MCTSConfig,
-    temp_threshold: usize,
 ) -> (Vec<AlphaZeroSample>, GameMatchRecord) {
     let mut env = DorfromantikEnv::new(seed, initial_stack, tile_limit);
     let mcts = MCTSSearch::new(mcts_config.clone());
@@ -405,15 +406,10 @@ pub fn run_self_play_episode(
             break;
         }
 
-        // Trong các nước đi đầu: nhiệt độ tau = 1.0 + dirichlet noise để khám phá chiến thuật đa dạng
-        // Sau đó: nhiệt độ tau = 0.2 để tập trung vào các nhánh xuất sắc nhất
-        let (temperature, add_dirichlet) = if move_count < temp_threshold {
-            (1.0f32, true)
-        } else {
-            (0.2f32, false)
-        };
-
-        let (pi_probs, _, chosen_action, _) = mcts.search(&mut env, model, add_dirichlet, temperature);
+        // Nếu MCTSConfig.explore_by_entropy bật, MCTS tự quyết định chen noise + nhiệt độ
+        // từng turn từ prior entropy (tự tin → explore mạnh, bối rối → exploit).
+        // Các tham số truyền vào đây chỉ là fallback khi tắt explore_by_entropy.
+        let (pi_probs, _, chosen_action, _) = mcts.search(&mut env, model, true, 1.0);
         let prev_score = env.score_manager.total_score;
         let res = env.step(chosen_action);
         let score_gained = env.score_manager.total_score.saturating_sub(prev_score);
@@ -546,12 +542,20 @@ impl AlphaZeroPipeline {
 
     /// Thêm 1 board state có Q-value cao vào danh sách (top 2000 state Q tốt nhất).
     /// Q = total_score + target_val * 100.
-    pub fn add_high_q_state(&mut self, q_value: f32, remaining_tiles: usize, moves: &[GameMoveRecord]) {
+    pub fn add_high_q_state(
+        &mut self,
+        q_value: f32,
+        remaining_tiles: usize,
+        moves: &[GameMoveRecord],
+    ) {
         // Tìm state trùng chuỗi moves (cùng board config qua dãy nước đi).
         let mut found = None;
         for (i, s) in self.max_score_states.iter().enumerate() {
             if s.moves.len() == moves.len()
-                && s.moves.iter().zip(moves.iter()).all(|(a, b)| a.q == b.q && a.r == b.r && a.rotation == b.rotation)
+                && s.moves
+                    .iter()
+                    .zip(moves.iter())
+                    .all(|(a, b)| a.q == b.q && a.r == b.r && a.rotation == b.rotation)
             {
                 found = Some(i);
                 break;
@@ -573,7 +577,11 @@ impl AlphaZeroPipeline {
         }
         // Sắp xếp giảm dần theo Q-value, giữ tối đa 2000 state.
         // State bị ghi đè bằng Q thấp sẽ bị đẩy ra ngoài top 2000 và bị loại bỏ.
-        self.max_score_states.sort_by(|a, b| b.q_value.partial_cmp(&a.q_value).unwrap_or(std::cmp::Ordering::Equal));
+        self.max_score_states.sort_by(|a, b| {
+            b.q_value
+                .partial_cmp(&a.q_value)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         if self.max_score_states.len() > 2000 {
             self.max_score_states.truncate(2000);
         }
@@ -607,7 +615,11 @@ impl AlphaZeroPipeline {
             let mut env = DorfromantikEnv::new(base_seed, initial_stack, tile_limit);
             let mut ok = true;
             for m in &st.moves {
-                let act = crate::env::Action { q: m.q, r: m.r, rotation: m.rotation };
+                let act = crate::env::Action {
+                    q: m.q,
+                    r: m.r,
+                    rotation: m.rotation,
+                };
                 if !env.get_valid_actions().contains(&act) {
                     ok = false;
                     break;
@@ -629,12 +641,11 @@ impl AlphaZeroPipeline {
         if b_count == 0 {
             return 0;
         }
-        eprintln!("[DEBUG refresh] BƯỚC 1 replay done: {} valid envs. Starting MCTS...", b_count);
 
         // BƯỚC 2: sau khi đã make move, chạy MCTS 800 sim batch (temp 0.2, KHÔNG dirichlet).
         let active: Vec<usize> = (0..b_count).collect();
-        let results = mcts.search_batch_indexed(&valid_envs, &active, &self.model, gpu_exec, false, 0.2);
-        eprintln!("[DEBUG refresh] MCTS search done: {} results", results.len());
+        let results =
+            mcts.search_batch_indexed(&valid_envs, &active, &self.model, gpu_exec, false, 0.2);
 
         // BƯỚC 3: ghi đè Q value: total_score + root_value * 100.
         for (k, &st_idx) in orig_idx.iter().enumerate() {
@@ -643,7 +654,11 @@ impl AlphaZeroPipeline {
         }
 
         // BƯỚC 4: sort giảm dần, giữ top 2000 (giống add_high_q_state).
-        self.max_score_states.sort_by(|a, b| b.q_value.partial_cmp(&a.q_value).unwrap_or(std::cmp::Ordering::Equal));
+        self.max_score_states.sort_by(|a, b| {
+            b.q_value
+                .partial_cmp(&a.q_value)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         if self.max_score_states.len() > 2000 {
             self.max_score_states.truncate(2000);
         }
@@ -653,14 +668,16 @@ impl AlphaZeroPipeline {
 
     /// Thu thập dữ liệu tự chơi bằng Vectorized Batch MCTS (Không channel, không lock-step stall)
     /// Khi có gpu_exec: dùng GPU inference cho neural network evaluation.
-    pub fn collect_self_play_data_batch(&mut self, gpu_exec: Option<&GpuNNExecutor>) -> (f32, usize, usize, Option<GameMatchRecord>) {
+    pub fn collect_self_play_data_batch(
+        &mut self,
+        gpu_exec: Option<&GpuNNExecutor>,
+    ) -> (f32, usize, usize, Option<GameMatchRecord>) {
         self.last_new_samples = 0;
         let n_envs = self.config.num_parallel_envs;
         let base_seed = self.config.target_seed;
         let initial_stack = self.config.initial_stack;
         let tile_limit = self.config.tile_limit;
         let mcts_cfg = self.config.mcts_config.clone();
-        let temp_thresh = self.config.temp_threshold_moves;
         let mcts = MCTSSearch::new(mcts_cfg.clone());
 
         // Xác định trước 80% envs sẽ khởi động từ board state max-score (nếu có sẵn).
@@ -677,7 +694,9 @@ impl AlphaZeroPipeline {
             let mut chosen = std::collections::HashSet::new();
             let seed_rng = base_seed as u64;
             for k in 0..count {
-                let idx = ((seed_rng.wrapping_add((k * 2654435761) as u64) % (n_envs as u64)) as usize).max(0);
+                let idx = ((seed_rng.wrapping_add((k * 2654435761) as u64) % (n_envs as u64))
+                    as usize)
+                    .max(0);
                 chosen.insert(idx);
             }
             for idx in 0..n_envs {
@@ -693,13 +712,19 @@ impl AlphaZeroPipeline {
                     let mut replay_ok = true;
                     for m in state.moves.iter() {
                         let valid = env.get_valid_actions();
-                        let act = crate::env::Action { q: m.q, r: m.r, rotation: m.rotation };
+                        let act = crate::env::Action {
+                            q: m.q,
+                            r: m.r,
+                            rotation: m.rotation,
+                        };
                         if !valid.contains(&act) {
                             replay_ok = false;
                             break;
                         }
                         let _ = env.step(act);
-                        if env.is_game_over() { break; }
+                        if env.is_game_over() {
+                            break;
+                        }
                     }
                     if replay_ok && env.placed_count == state.moves.len() {
                         move_counts[idx] = state.moves.len();
@@ -732,10 +757,16 @@ impl AlphaZeroPipeline {
             }
 
             turn_counter += 1;
-            let add_dirichlet = move_counts[active_indices[0]] < temp_thresh;
-            let temp = if move_counts[active_indices[0]] < temp_thresh { 1.0f32 } else { 0.2f32 };
-
-            let batch_results = mcts.search_batch_indexed(&envs, &active_indices, &self.model, gpu_exec, add_dirichlet, temp);
+            // Bat_note: Khi MCTSConfig.explore_by_entropy bật, MCTS tự quyết nhiệt độ/noise
+            // từng turn theo prior entropy (tự tin → explore, bối rối → exploit).
+            let batch_results = mcts.search_batch_indexed(
+                &envs,
+                &active_indices,
+                &self.model,
+                gpu_exec,
+                true,
+                1.0,
+            );
 
             for (k, &idx) in active_indices.iter().enumerate() {
                 let (pi_probs, _, chosen_action, _, obs) = &batch_results[k];
@@ -749,7 +780,10 @@ impl AlphaZeroPipeline {
 
                 let prev_score = envs[idx].score_manager.total_score;
                 let res = envs[idx].step(*chosen_action);
-                let score_gained = envs[idx].score_manager.total_score.saturating_sub(prev_score);
+                let score_gained = envs[idx]
+                    .score_manager
+                    .total_score
+                    .saturating_sub(prev_score);
                 let scaled_r = res.reward * 0.01;
 
                 move_records[idx].push(GameMoveRecord {
@@ -776,11 +810,20 @@ impl AlphaZeroPipeline {
             // In đúng 1 dấu chấm nhịp nhàng sau mỗi lượt đi hoàn thành (giống Wisdom engine)
             print!(".");
             if turn_counter % 25 == 0 {
-                print!(" [Turn {} | Active: {}/{} | {} moves]\n[Self-Play Progress] ", turn_counter, active_indices.len(), n_envs, total_moves);
+                print!(
+                    " [Turn {} | Active: {}/{} | {} moves]\n[Self-Play Progress] ",
+                    turn_counter,
+                    active_indices.len(),
+                    n_envs,
+                    total_moves
+                );
             }
             let _ = std::io::stdout().flush();
         }
-        println!("\n[Self-Play Done] Hoàn thành {} turns, tổng cộng {} nước đi.", turn_counter, total_moves);
+        println!(
+            "\n[Self-Play Done] Hoàn thành {} turns, tổng cộng {} nước đi.",
+            turn_counter, total_moves
+        );
 
         let mut total_score = 0;
         let mut max_score = 0;
@@ -845,7 +888,6 @@ impl AlphaZeroPipeline {
         let initial_stack = self.config.initial_stack;
         let tile_limit = self.config.tile_limit;
         let mcts_cfg = self.config.mcts_config.clone();
-        let temp_thresh = self.config.temp_threshold_moves;
         let model_ref = &self.model;
 
         // 100% tất cả luồng chạy trên cùng target_seed của file monthly
@@ -854,7 +896,15 @@ impl AlphaZeroPipeline {
         // Chạy đa luồng song song các ván đấu MCTS
         let results: Vec<(Vec<AlphaZeroSample>, GameMatchRecord)> = seeds
             .into_par_iter()
-            .map(|s| run_self_play_episode(s, initial_stack, tile_limit, model_ref, &mcts_cfg, temp_thresh))
+            .map(|s| {
+                run_self_play_episode(
+                    s,
+                    initial_stack,
+                    tile_limit,
+                    model_ref,
+                    &mcts_cfg,
+                )
+            })
             .collect();
 
         let mut total_score = 0;
@@ -884,7 +934,11 @@ impl AlphaZeroPipeline {
         // Lọc bỏ các state trùng lặp trước khi train để tránh overfit
         let removed = self.replay_buffer.deduplicate();
         if removed > 0 {
-            println!("[Train] Đã lọc {} sample trùng lặp khỏi replay buffer (còn {}).", removed, self.replay_buffer.len());
+            println!(
+                "[Train] Đã lọc {} sample trùng lặp khỏi replay buffer (còn {}).",
+                removed,
+                self.replay_buffer.len()
+            );
         }
         let buf_len = self.replay_buffer.len();
         if buf_len < self.config.batch_size {
@@ -923,7 +977,9 @@ impl AlphaZeroPipeline {
             let epoch_batches = if epoch_indices.is_empty() {
                 0
             } else {
-                (epoch_indices.len() / self.config.batch_size).min(num_batches).max(1)
+                (epoch_indices.len() / self.config.batch_size)
+                    .min(num_batches)
+                    .max(1)
             };
             use std::io::Write;
             print!("[Train Epoch {}/{}] ", epoch + 1, total_epochs);
@@ -958,8 +1014,12 @@ impl AlphaZeroPipeline {
                         }
 
                         // 1. Policy Loss: Cross Entropy -sum(pi_target * ln(p_model))
-                        let max_l = action_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                        let exps: Vec<f32> = action_logits.iter().map(|l| (l - max_l).exp()).collect();
+                        let max_l = action_logits
+                            .iter()
+                            .cloned()
+                            .fold(f32::NEG_INFINITY, f32::max);
+                        let exps: Vec<f32> =
+                            action_logits.iter().map(|l| (l - max_l).exp()).collect();
                         let sum_exp: f32 = exps.iter().sum::<f32>().max(1e-8);
                         let probs: Vec<f32> = exps.iter().map(|e| e / sum_exp).collect();
 
@@ -1007,7 +1067,8 @@ impl AlphaZeroPipeline {
                 scaled_grads.clip_grad_norm(1.0);
 
                 // Cập nhật trọng số mạng bằng Adam Optimizer
-                self.model.update_weights_adam(&scaled_grads, self.config.lr);
+                self.model
+                    .update_weights_adam(&scaled_grads, self.config.lr);
 
                 if (batch + 1) % 4 == 0 || batch + 1 == epoch_batches {
                     print!("{}/{} ", batch + 1, epoch_batches);
@@ -1022,8 +1083,16 @@ impl AlphaZeroPipeline {
             println!("({:.1}s)", elapsed.as_secs_f32());
         }
 
-        let avg_pi_loss = if step_count > 0 { total_policy_loss / step_count as f32 } else { 0.0 };
-        let avg_val_loss = if step_count > 0 { total_value_loss / step_count as f32 } else { 0.0 };
+        let avg_pi_loss = if step_count > 0 {
+            total_policy_loss / step_count as f32
+        } else {
+            0.0
+        };
+        let avg_val_loss = if step_count > 0 {
+            total_value_loss / step_count as f32
+        } else {
+            0.0
+        };
         let total_loss = avg_pi_loss + self.config.value_loss_coeff * avg_val_loss;
 
         (total_loss, avg_pi_loss, avg_val_loss)
@@ -1047,7 +1116,13 @@ impl AlphaZeroPipeline {
             let _ = self.replay_buffer.load_from_file(buffer_path)?;
             // Tự động chuẩn hóa target_val nếu dữ liệu cũ đang ở scale 0.05 (target_val > 20.0)
             let avg_val: f32 = if !self.replay_buffer.is_empty() {
-                self.replay_buffer.buffer.iter().take(100).map(|s| s.target_val).sum::<f32>() / 100.0f32.min(self.replay_buffer.len() as f32)
+                self.replay_buffer
+                    .buffer
+                    .iter()
+                    .take(100)
+                    .map(|s| s.target_val)
+                    .sum::<f32>()
+                    / 100.0f32.min(self.replay_buffer.len() as f32)
             } else {
                 0.0
             };
@@ -1115,7 +1190,15 @@ mod tests {
     #[test]
     fn test_add_high_q_state_keeps_top_n_sorted() {
         let mut pipe = AlphaZeroPipeline::new(AlphaZeroTrainerConfig::default());
-        let mk = |q: i32| GameMoveRecord { step: 0, q, r: 0, rotation: 0, score_gained: 0, total_score: q as usize, remaining_tiles: 50 };
+        let mk = |q: i32| GameMoveRecord {
+            step: 0,
+            q,
+            r: 0,
+            rotation: 0,
+            score_gained: 0,
+            total_score: q as usize,
+            remaining_tiles: 50,
+        };
 
         // Thêm 2 state với Q khác nhau => giữ 2, sort Q giảm dần.
         pipe.add_high_q_state(50.0, 50, &[mk(1)]);
@@ -1135,7 +1218,15 @@ mod tests {
         let mut pipe = AlphaZeroPipeline::new(AlphaZeroTrainerConfig::default());
         // Thêm hơn 2000 state Q khác nhau.
         for i in 0..2200 {
-            let m = GameMoveRecord { step: 0, q: i as i32, r: 0, rotation: 0, score_gained: 0, total_score: i, remaining_tiles: 50 };
+            let m = GameMoveRecord {
+                step: 0,
+                q: i as i32,
+                r: 0,
+                rotation: 0,
+                score_gained: 0,
+                total_score: i,
+                remaining_tiles: 50,
+            };
             pipe.add_high_q_state(i as f32, 50, &[m]);
         }
         assert_eq!(pipe.max_score_states.len(), 2000);
@@ -1152,21 +1243,44 @@ mod tests_overwrite {
     #[test]
     fn test_high_q_state_overwrites_lower_q() {
         let mut pipe = AlphaZeroPipeline::new(AlphaZeroTrainerConfig::default());
-        let mk = |tag: i32| GameMoveRecord { step: 0, q: tag, r: 0, rotation: 0, score_gained: 0, total_score: tag as usize, remaining_tiles: 50 };
+        let mk = |tag: i32| GameMoveRecord {
+            step: 0,
+            q: tag,
+            r: 0,
+            rotation: 0,
+            score_gained: 0,
+            total_score: tag as usize,
+            remaining_tiles: 50,
+        };
 
         // State cùng moves (cùng tag=5): đầu Q=90, sau ghi đè bằng Q=40 (thấp hơn).
         pipe.add_high_q_state(90.0, 40, &[mk(5)]);
         assert_eq!(pipe.max_score_states.len(), 1);
         pipe.add_high_q_state(40.0, 30, &[mk(5)]);
-        assert_eq!(pipe.max_score_states.len(), 1, "trùng moves phải ghi đè, không thêm mới");
-        assert_eq!(pipe.max_score_states[0].q_value, 40.0, "Q mới thấp hơn vẫn phải ghi đè");
+        assert_eq!(
+            pipe.max_score_states.len(),
+            1,
+            "trùng moves phải ghi đè, không thêm mới"
+        );
+        assert_eq!(
+            pipe.max_score_states[0].q_value, 40.0,
+            "Q mới thấp hơn vẫn phải ghi đè"
+        );
         assert_eq!(pipe.max_score_states[0].remaining_tiles, 30);
     }
 
     #[test]
     fn test_high_q_state_overwrite_sorts_out_of_top() {
         let mut pipe = AlphaZeroPipeline::new(AlphaZeroTrainerConfig::default());
-        let mk = |tag: i32| GameMoveRecord { step: 0, q: tag, r: 0, rotation: 0, score_gained: 0, total_score: tag as usize, remaining_tiles: 50 };
+        let mk = |tag: i32| GameMoveRecord {
+            step: 0,
+            q: tag,
+            r: 0,
+            rotation: 0,
+            score_gained: 0,
+            total_score: tag as usize,
+            remaining_tiles: 50,
+        };
 
         // Tạo 2001 state khác nhau Q từ 0..2000.
         for i in 0..2001 {
@@ -1174,7 +1288,10 @@ mod tests_overwrite {
         }
         assert_eq!(pipe.max_score_states.len(), 2000, "chỉ giữ top 2000");
         // State có tag=0 (Q thấp nhất) bị loại khỏi top.
-        assert!(pipe.max_score_states.iter().all(|s| s.q_value > 0.0), "state Q thấp nhất bị loại");
+        assert!(
+            pipe.max_score_states.iter().all(|s| s.q_value > 0.0),
+            "state Q thấp nhất bị loại"
+        );
         // State Q=2000 (top) hiện nằm trong danh sách.
         assert!(pipe.max_score_states.iter().any(|s| s.q_value == 2000.0));
 
@@ -1182,12 +1299,18 @@ mod tests_overwrite {
         // nên -5 trở thành mức Q thấp nhất đang hiện diện trong top.
         pipe.add_high_q_state(-5.0, 40, &[mk(2000)]);
         assert_eq!(pipe.max_score_states.len(), 2000);
-        assert!(pipe.max_score_states.iter().any(|s| s.q_value == -5.0), "ghi đè thấp vẫn trong top vì không làm tăng số lượng");
+        assert!(
+            pipe.max_score_states.iter().any(|s| s.q_value == -5.0),
+            "ghi đè thấp vẫn trong top vì không làm tăng số lượng"
+        );
 
         // Push thêm 1 state mới (Q=1999) -> vượt 2001 -> cắt xuống 2000,
         // state có Q thấp nhất (=-5) bị loại khỏi top.
         pipe.add_high_q_state(1999.0, 40, &[mk(3000)]);
         assert_eq!(pipe.max_score_states.len(), 2000);
-        assert!(pipe.max_score_states.iter().all(|s| s.q_value > -5.0), "state bị ghi đè Q âm đã bị loại khỏi top");
+        assert!(
+            pipe.max_score_states.iter().all(|s| s.q_value > -5.0),
+            "state bị ghi đè Q âm đã bị loại khỏi top"
+        );
     }
 }
