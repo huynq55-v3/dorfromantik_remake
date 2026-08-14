@@ -151,19 +151,27 @@ async fn main() {
                 let m = &record.moves[current_step];
                 let legal_actions = env.get_valid_actions();
                 
-                // Find action index that matches q, r, rotation
-                let mut found_action = None;
-                for action in legal_actions.iter() {
-                    if action.q == m.q && action.r == m.r && action.rotation == m.rotation {
-                        found_action = Some(dorfromantik_remake::env::Action { q: m.q, r: m.r, rotation: m.rotation });
-                        break;
+                // 1. Tìm action khớp chính xác (q, r, rotation)
+                let mut found_action = legal_actions.iter().find(|a| a.q == m.q && a.r == m.r && a.rotation == m.rotation).copied();
+
+                // 2. Nếu không khớp trực tiếp, thử canonical rotation theo chu kỳ đối xứng của tile hiện tại
+                if found_action.is_none() {
+                    if let Some(curr_tile) = env.current_tile() {
+                        let period = curr_tile.rotation_symmetry_period();
+                        let canonical_rot = m.rotation % period;
+                        found_action = legal_actions.iter().find(|a| a.q == m.q && a.r == m.r && a.rotation == canonical_rot).copied();
+                        
+                        // 3. Nếu vẫn không thấy trong get_valid_actions (do ràng buộc nước đầu tiên), kiểm tra can_place_tile trực tiếp
+                        if found_action.is_none() && env.board.can_place_tile(m.q, m.r, curr_tile, canonical_rot) {
+                            found_action = Some(dorfromantik_remake::env::Action { q: m.q, r: m.r, rotation: canonical_rot });
+                        }
                     }
                 }
                 
                 if let Some(action) = found_action {
                     let result = env.step(action);
                     println!("Step {} -> Placed at ({}, {}) Rot: {} | Gained: {} | Score: {} | Done: {}", 
-                        current_step, m.q, m.r, m.rotation, result.reward, env.score_manager.total_score, result.done);
+                        current_step, action.q, action.r, action.rotation, result.reward, env.score_manager.total_score, result.done);
                     current_step += 1;
                 } else {
                     println!("WARNING: Move not legal! Step {} ({}, {}) Rot: {}", current_step, m.q, m.r, m.rotation);
@@ -179,11 +187,19 @@ async fn main() {
                 for s in 0..current_step {
                     let m = &record.moves[s];
                     let legal_actions = env.get_valid_actions();
-                    for action in legal_actions.iter() {
-                        if action.q == m.q && action.r == m.r && action.rotation == m.rotation {
-                            env.step(*action);
-                            break;
+                    let mut found_action = legal_actions.iter().find(|a| a.q == m.q && a.r == m.r && a.rotation == m.rotation).copied();
+                    if found_action.is_none() {
+                        if let Some(curr_tile) = env.current_tile() {
+                            let period = curr_tile.rotation_symmetry_period();
+                            let canonical_rot = m.rotation % period;
+                            found_action = legal_actions.iter().find(|a| a.q == m.q && a.r == m.r && a.rotation == canonical_rot).copied();
+                            if found_action.is_none() && env.board.can_place_tile(m.q, m.r, curr_tile, canonical_rot) {
+                                found_action = Some(dorfromantik_remake::env::Action { q: m.q, r: m.r, rotation: canonical_rot });
+                            }
                         }
+                    }
+                    if let Some(action) = found_action {
+                        env.step(action);
                     }
                 }
                 println!("Step Backward -> Step {}", current_step);
