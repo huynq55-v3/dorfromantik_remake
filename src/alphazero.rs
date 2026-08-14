@@ -1027,7 +1027,7 @@ impl AlphaZeroPipeline {
         let total_epochs = self.config.train_epochs_per_iter;
         let train_start = std::time::Instant::now();
         println!(
-            "[Train] Bắt đầu: {} epochs × {} batches (batch_size={}) | train trên {} sample mới (buffer {}/{}) CPU...",
+            "[Train] Bắt đầu: {} epochs × {} batches (batch_size={}) | train trên {} samples (buffer {}/{}) với PER...",
             total_epochs, num_batches, self.config.batch_size, m, buf_len, self.replay_buffer.capacity
         );
         let mut total_policy_loss = 0.0f32;
