@@ -163,16 +163,17 @@ impl DorfromantikEnv {
         self.tile_queue.front()
     }
 
-    /// Trả về danh sách tất cả các Action hợp lệ tại lượt hiện tại
+    /// Trả về danh sách tất cả các Action hợp lệ tại lượt hiện tại (loại bỏ các góc xoay đẳng cấu)
     pub fn get_valid_actions(&self) -> Vec<Action> {
         let mut valid = Vec::new();
         let Some(current_tile) = self.current_tile() else {
             return valid;
         };
 
+        let period = current_tile.rotation_symmetry_period();
         let candidates = self.board.get_candidate_placements();
         for (q, r) in candidates {
-            for rotation in 0..6 {
+            for rotation in 0..period {
                 if self.board.can_place_tile(q, r, current_tile, rotation) {
                     valid.push(Action { q, r, rotation });
                 }
@@ -206,9 +207,10 @@ impl DorfromantikEnv {
         let Some(current_tile) = self.current_tile() else {
             return false;
         };
+        let period = current_tile.rotation_symmetry_period();
         let candidates = self.board.get_candidate_placements();
         for (q, r) in candidates {
-            for rotation in 0..6 {
+            for rotation in 0..period {
                 if self.board.can_place_tile(q, r, current_tile, rotation) {
                     return true;
                 }

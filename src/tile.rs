@@ -430,6 +430,23 @@ impl GeneratedTile {
         }
     }
 
+    /// Trả về chu kỳ đối xứng quay tối thiểu (1, 2, 3 hoặc 6) của Tile.
+    /// Ví dụ:
+    /// - 6 cạnh đồng nhất (toàn Plain/Water/Station): period = 1 (chỉ cần rotation 0).
+    /// - Dạng A-B-A-B-A-B: period = 2 (chỉ cần rotation 0, 1).
+    /// - Dạng A-B-C-A-B-C: period = 3 (chỉ cần rotation 0, 1, 2).
+    /// - Bất đối xứng: period = 6 (cần cả 6 rotations).
+    pub fn rotation_symmetry_period(&self) -> usize {
+        let cfg = self.to_hex_edge_config();
+        for period in [1, 2, 3] {
+            let is_symmetric = (0..6).all(|i| cfg.edges[i] == cfg.edges[(i + period) % 6]);
+            if is_symmetric {
+                return period;
+            }
+        }
+        6
+    }
+
     /// Chuyển đổi Tile Preset thành cấu hình 6 cạnh hex thật (HexEdgeConfig)
     pub fn to_hex_edge_config(&self) -> HexEdgeConfig {
         let mut edges = [EdgeType::Plain; 6];

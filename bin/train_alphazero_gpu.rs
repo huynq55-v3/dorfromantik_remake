@@ -242,6 +242,10 @@ fn main() {
         match pipeline.replay_buffer.load_from_file(&buffer_path) {
             Ok(count) => {
                 println!("[Buffer] SUCCESS: Đã nạp {} samples từ file buffer!", count);
+                let merged = pipeline.replay_buffer.merge_symmetric_actions();
+                if merged > 0 {
+                    println!("[Buffer] Đã gộp và chuẩn hóa {} actions đẳng cấu (đối xứng xoay) trong buffer cũ!", merged);
+                }
             }
             Err(e) => {
                 println!("[Buffer] CẢNH BÁO: Không nạp được buffer cũ ({:?})", e);

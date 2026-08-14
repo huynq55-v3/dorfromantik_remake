@@ -198,6 +198,112 @@ impl AlphaZeroReplayBuffer {
         removed
     }
 
+    /// Gộp các action đẳng cấu (đối xứng xoay) trong buffer cũ:
+    /// - Nhận diện các action có cùng (q, r) và loại cạnh xoay đồng nhất.
+    /// - Cộng dồn xác suất target_pi của các góc xoay dư thừa vào action đại diện duy nhất (rotation nhỏ nhất).
+    /// - Loại bỏ các action dư thừa khỏi valid_actions, action_features và target_pi.
+    /// Trả về số lượng action dư thừa đã được gộp/lọc bỏ.
+    pub fn merge_symmetric_actions(&mut self) -> usize {
+        let mut total_merged_actions = 0usize;
+
+        for sample in self.buffer.iter_mut() {
+            let n_actions = sample.obs.valid_actions.len();
+            if n_actions <= 1 || sample.target_pi.len() != n_actions {
+                continue;
+            }
+
+            // Gom các action theo (q, r)
+            let mut pos_map: std::collections::HashMap<(i32, i32), Vec<usize>> = std::collections::HashMap::new();
+            for (idx, act) in sample.obs.valid_actions.iter().enumerate() {
+                pos_map.entry((act.q, act.r)).or_default().push(idx);
+            }
+
+            // Với mỗi vị trí, kiểm tra xem có các action có action_features giống hệt nhau không
+            // (khi tile đối xứng xoay, action_features chứa MATCHING_COUNT, MISMATCHING_COUNT, EDGE_TYPES... giống hệt nhau)
+            let mut keep_mask = vec![true; n_actions];
+            let mut canonical_rep = vec![0usize; n_actions];
+            for i in 0..n_actions {
+                canonical_rep[i] = i;
+            }
+
+            let mut merged_in_sample = 0usize;
+            for (_pos, group) in pos_map {
+                if group.len() <= 1 {
+                    continue;
+                }
+                for i in 0..group.len() {
+                    let idx_a = group[i];
+                    if !keep_mask[idx_a] {
+                        continue;
+                    }
+                    let feat_a = &sample.obs.action_features[idx_a];
+                    for j in (i + 1)..group.len() {
+                        let idx_b = group[j];
+                        if !keep_mask[idx_b] {
+                            continue;
+                        }
+                        let feat_b = &sample.obs.action_features[idx_b];
+
+                        // So sánh các feature hình học quan trọng (matching, mismatching, edge types)
+                        // Bỏ qua trường rotation (index 7) và position (14, 15 - đã cùng pos)
+                        let is_identical = (0..crate::env::action_feat::DIM).all(|f| {
+                            if f == crate::env::action_feat::ROTATION {
+                                true
+                            } else {
+                                (feat_a[f] - feat_b[f]).abs() < 1e-5
+                            }
+                        });
+
+                        if is_identical {
+                            // idx_b là góc xoay tương đương của idx_a -> cộng dồn target_pi vào idx_a
+                            canonical_rep[idx_b] = idx_a;
+                            keep_mask[idx_b] = false;
+                            merged_in_sample += 1;
+                        }
+                    }
+                }
+            }
+
+            if merged_in_sample > 0 {
+                total_merged_actions += merged_in_sample;
+
+                // Cộng dồn target_pi
+                let mut new_pi = sample.target_pi.clone();
+                for i in 0..n_actions {
+                    if !keep_mask[i] {
+                        let target_rep = canonical_rep[i];
+                        new_pi[target_rep] += sample.target_pi[i];
+                    }
+                }
+
+                // Lọc giữ lại các action duy nhất
+                let mut new_valid_actions = Vec::new();
+                let mut new_action_features = Vec::new();
+                let mut final_pi = Vec::new();
+
+                for i in 0..n_actions {
+                    if keep_mask[i] {
+                        new_valid_actions.push(sample.obs.valid_actions[i]);
+                        new_action_features.push(sample.obs.action_features[i]);
+                        final_pi.push(new_pi[i]);
+                    }
+                }
+
+                // Chuẩn hóa lại tổng target_pi = 1.0
+                let sum_pi: f32 = final_pi.iter().sum::<f32>().max(1e-8);
+                for p in final_pi.iter_mut() {
+                    *p /= sum_pi;
+                }
+
+                sample.obs.valid_actions = new_valid_actions;
+                sample.obs.action_features = new_action_features;
+                sample.target_pi = final_pi;
+            }
+        }
+
+        total_merged_actions
+    }
+
     /// Làm mềm (un-sharpen) lại phân phối target_pi của tất cả sample trong buffer bằng cách
     /// áp dụng hàm lũy thừa ngược pi'_i = (pi_i)^factor rồi chuẩn hóa lại.
     /// Giúp khôi phục các buffer cũ từng bị nhọn hóa bởi sampling temperature (ví dụ factor=0.2 - 0.5).
@@ -913,11 +1019,10 @@ impl AlphaZeroPipeline {
             return (0.0, 0.0, 0.0);
         }
 
-        // Train đúng bằng số sample MỚI thực sự giữ lại trong iteration này (số push, lọc trùng)
-        let mut m = self.last_new_samples;
-        if m < self.config.batch_size {
-            m = self.config.batch_size.min(buf_len);
-        }
+        // Quy mô mẫu huấn luyện mỗi iteration:
+        // Lấy kết hợp mẫu mới sinh ra và các mẫu chất lượng cao trong quá khứ qua PER
+        let target_samples = (self.last_new_samples * 3).max(25_000);
+        let m = target_samples.min(buf_len);
         let num_batches = (m / self.config.batch_size).max(1);
         let total_epochs = self.config.train_epochs_per_iter;
         let train_start = std::time::Instant::now();
@@ -1295,5 +1400,40 @@ mod tests_overwrite {
             assert!(idx < 50);
             assert!(seen.insert(idx), "Indices must be unique");
         }
+    }
+
+    #[test]
+    fn test_merge_symmetric_actions() {
+        let mut buffer = AlphaZeroReplayBuffer::new(10);
+        // Tạo 1 sample có 6 actions ở cùng (0, 0) nhưng là các góc xoay đối xứng
+        let dummy_action_feat = [0.0f32; crate::env::action_feat::DIM];
+        let mut feats = Vec::new();
+        let mut acts = Vec::new();
+        let mut pi = Vec::new();
+        for r in 0..6 {
+            let mut f = dummy_action_feat;
+            f[crate::env::action_feat::ROTATION] = r as f32;
+            feats.push(f);
+            acts.push(crate::env::Action { q: 0, r: 0, rotation: r });
+            pi.push(1.0 / 6.0);
+        }
+
+        buffer.push(AlphaZeroSample {
+            obs: GraphObservation {
+                node_positions: vec![(0, 0)],
+                node_features: vec![[0.0; crate::env::node_feat::DIM]],
+                edge_index: Vec::new(),
+                valid_actions: acts,
+                action_features: feats,
+            },
+            target_pi: pi,
+            target_val: 100.0,
+        });
+
+        let merged = buffer.merge_symmetric_actions();
+        assert_eq!(merged, 5, "5 góc xoay dư thừa phải được gộp");
+        assert_eq!(buffer.buffer[0].obs.valid_actions.len(), 1);
+        assert_eq!(buffer.buffer[0].target_pi.len(), 1);
+        assert!((buffer.buffer[0].target_pi[0] - 1.0).abs() < 1e-4, "target_pi gộp lại phải = 1.0");
     }
 }
