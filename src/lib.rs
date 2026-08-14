@@ -2,7 +2,6 @@ pub mod board;
 pub mod env;
 pub mod game_config;
 pub mod nn;
-pub mod ppo;
 pub mod mcts;
 pub mod alphazero;
 pub mod generator;

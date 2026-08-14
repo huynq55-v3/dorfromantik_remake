@@ -403,82 +403,7 @@ pub struct MaxScoreStateRecord {
     pub moves: Vec<GameMoveRecord>,
 }
 
-/// Thu thập dữ liệu 1 ván tự chơi (Self-Play Episode) sử dụng MCTS (200 simulations)
-pub fn run_self_play_episode(
-    seed: i32,
-    initial_stack: usize,
-    tile_limit: usize,
-    model: &HexGNNModel,
-    mcts_config: &MCTSConfig,
-) -> (Vec<AlphaZeroSample>, GameMatchRecord) {
-    let mut env = DorfromantikEnv::new(seed, initial_stack, tile_limit);
-    let mcts = MCTSSearch::new(mcts_config.clone());
 
-    let mut raw_steps: Vec<(GraphObservation, Vec<f32>, f32)> = Vec::new();
-    let mut move_records: Vec<GameMoveRecord> = Vec::new();
-    let mut move_count = 0;
-
-    loop {
-        let obs = env.extract_graph_observation();
-        if obs.valid_actions.is_empty() {
-            break;
-        }
-
-        // Nếu MCTSConfig.explore_by_entropy bật, MCTS tự quyết định chen noise + nhiệt độ
-        // từng turn từ prior entropy (tự tin → explore mạnh, bối rối → exploit).
-        // Các tham số truyền vào đây chỉ là fallback khi tắt explore_by_entropy.
-        let (pi_probs, _, chosen_action, _) = mcts.search(&mut env, model, true, 1.0);
-        let prev_score = env.score_manager.total_score;
-        let res = env.step(chosen_action);
-        let score_gained = env.score_manager.total_score.saturating_sub(prev_score);
-        let scaled_r = res.reward * 0.01;
-
-        move_records.push(GameMoveRecord {
-            step: move_count,
-            q: chosen_action.q,
-            r: chosen_action.r,
-            rotation: chosen_action.rotation,
-            score_gained,
-            total_score: env.score_manager.total_score,
-            remaining_tiles: env.score_manager.remaining_tiles,
-        });
-
-        raw_steps.push((obs, pi_probs, scaled_r));
-        move_count += 1;
-
-        if res.done {
-            break;
-        }
-    }
-
-    let final_score = env.score_manager.total_score;
-    let placed_count = env.placed_count;
-
-    // Tính toán Discounted Return $z_t = \sum_{k} \gamma^k r_{t+k+1}$ cho từng bước
-    let total_steps = raw_steps.len();
-    let mut samples = Vec::with_capacity(total_steps);
-    let mut g = 0.0f32;
-
-    for t in (0..total_steps).rev() {
-        let (obs, pi, r) = raw_steps[t].clone();
-        g = r + mcts_config.gamma * g;
-        samples.push(AlphaZeroSample {
-            obs,
-            target_pi: pi,
-            target_val: g,
-        });
-    }
-
-    samples.reverse();
-    let record = GameMatchRecord {
-        seed,
-        total_score: final_score,
-        total_placed: placed_count,
-        is_eval: false,
-        moves: move_records,
-    };
-    (samples, record)
-}
 
 /// Đánh giá sức mạnh của Model hiện tại với MCTS Greedy (Nhiệt độ = 0.0) trên Seed mục tiêu
 
@@ -898,54 +823,7 @@ impl AlphaZeroPipeline {
         (avg_score, max_score, avg_placed, best_record)
     }
 
-    /// Thu thập dữ liệu tự chơi qua Rayon đa luồng (Parallel Self-Play CPU)
 
-    pub fn collect_self_play_data(&mut self) -> (f32, usize, usize, Option<GameMatchRecord>) {
-        let n_envs = self.config.num_parallel_envs;
-        let base_seed = self.config.target_seed;
-        let initial_stack = self.config.initial_stack;
-        let tile_limit = self.config.tile_limit;
-        let mcts_cfg = self.config.mcts_config.clone();
-        let model_ref = &self.model;
-
-        // 100% tất cả luồng chạy trên cùng target_seed của file monthly
-        let seeds: Vec<i32> = vec![base_seed; n_envs];
-
-        // Chạy đa luồng song song các ván đấu MCTS
-        let results: Vec<(Vec<AlphaZeroSample>, GameMatchRecord)> = seeds
-            .into_par_iter()
-            .map(|s| {
-                run_self_play_episode(
-                    s,
-                    initial_stack,
-                    tile_limit,
-                    model_ref,
-                    &mcts_cfg,
-                )
-            })
-            .collect();
-
-        let mut total_score = 0;
-        let mut max_score = 0;
-        let mut total_placed = 0;
-        let mut best_record: Option<GameMatchRecord> = None;
-
-        for (samples, record) in results {
-            let score = record.total_score;
-            let placed = record.total_placed;
-            total_score += score;
-            if score >= max_score {
-                max_score = score;
-                best_record = Some(record);
-            }
-            total_placed += placed;
-            self.replay_buffer.push_batch(samples);
-        }
-
-        let avg_score = total_score as f32 / n_envs as f32;
-        let avg_placed = total_placed / n_envs;
-        (avg_score, max_score, avg_placed, best_record)
-    }
 
     /// Huấn luyện mạng GNN trên mini-batches từ Replay Buffer bằng Adam Optimizer (Zero-Copy Sampling)
     pub fn train_step(&mut self) -> (f32, f32, f32) {

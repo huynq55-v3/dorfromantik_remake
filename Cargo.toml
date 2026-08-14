@@ -26,24 +26,8 @@ name = "replay"
 path = "bin/replay.rs"
 
 [[bin]]
-name = "rl_benchmark"
-path = "bin/rl_benchmark.rs"
-
-[[bin]]
-name = "train"
-path = "bin/train.rs"
-
-[[bin]]
-name = "train_alphazero"
-path = "bin/train_alphazero.rs"
-
-[[bin]]
 name = "train_alphazero_gpu"
 path = "bin/train_alphazero_gpu.rs"
-
-[[bin]]
-name = "debug_seed"
-path = "bin/debug_seed.rs"
 
 [[bin]]
 name = "gen_replay"

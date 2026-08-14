@@ -48,6 +48,7 @@ fn get_edge_color(edge_type: EdgeType) -> Color {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct ReplayMove {
     step: usize,
@@ -59,6 +60,7 @@ struct ReplayMove {
     remaining_tiles: usize,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct GameRecord {
     seed: i32,
