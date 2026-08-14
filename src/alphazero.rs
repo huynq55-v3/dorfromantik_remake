@@ -304,14 +304,15 @@ impl AlphaZeroReplayBuffer {
         total_merged_actions
     }
 
-    /// Cập nhật lại kênh NEIGHBOR_COUNT (kênh 3) cho tất cả action_features trong buffer
-    /// (được tính bằng matching_count + mismatching_count).
+    /// Cập nhật lại kênh NEIGHBOR_COUNT (kênh 3) và zero-out POS_Q / POS_R cho tất cả action_features trong buffer
     pub fn migrate_action_features(&mut self) {
         for sample in self.buffer.iter_mut() {
             for feat in sample.obs.action_features.iter_mut() {
                 let matching = feat[crate::env::action_feat::MATCHING_COUNT];
                 let mismatching = feat[crate::env::action_feat::MISMATCHING_COUNT];
                 feat[crate::env::action_feat::NEIGHBOR_COUNT] = matching + mismatching;
+                feat[crate::env::action_feat::POS_Q] = 0.0;
+                feat[crate::env::action_feat::POS_R] = 0.0;
             }
         }
     }

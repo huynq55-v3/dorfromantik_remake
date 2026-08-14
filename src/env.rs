@@ -603,8 +603,8 @@ impl DorfromantikEnv {
                 feat[action_feat::CURR_EQUALITY_MORE] = curr_equality_more;
                 feat[action_feat::IS_QUEST_TILE] = is_quest_tile;
                 feat[action_feat::ROTATION] = act.rotation as f32 / 6.0;
-                feat[action_feat::POS_Q] = (act.q as f32 / 30.0).clamp(-1.0, 1.0);
-                feat[action_feat::POS_R] = (act.r as f32 / 30.0).clamp(-1.0, 1.0);
+                feat[action_feat::POS_Q] = 0.0; // Bỏ tọa độ tuyệt đối để giữ tính bất biến tịnh tiến
+                feat[action_feat::POS_R] = 0.0;
 
                 action_features.push(feat);
             }
