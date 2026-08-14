@@ -72,17 +72,29 @@ struct GameRecord {
 
 #[macroquad::main("Dorfromantik Replay Visualizer")]
 async fn main() {
-    // Tham số 1: tên file game replay (vd "best_game_record.json" hoặc "test_replay.json").
-    // Mặc định "models/best_game_record.json".
+    // Tham số 1: tên file game replay (vd "test_replay.json" hoặc "models/best_game_record.json").
+    // Nếu không truyền, ưu tiên "test_replay.json" nếu có, ngược lại fallback về "models/best_game_record.json".
     let args: Vec<String> = std::env::args().collect();
-    let game_file = args.get(1).map(|s| s.as_str()).unwrap_or("models/best_game_record.json");
+    let game_file = if args.len() > 1 {
+        args[1].clone()
+    } else if std::path::Path::new("test_replay.json").exists() {
+        "test_replay.json".to_string()
+    } else {
+        "models/best_game_record.json".to_string()
+    };
 
-    let file_content = fs::read_to_string(game_file)
+    if !std::path::Path::new(&game_file).exists() {
+        eprintln!("Lỗi: không tìm thấy file replay `{}`!", game_file);
+        eprintln!("Cách dùng: cargo run --bin replay [path/to/replay.json]");
+        std::process::exit(1);
+    }
+
+    let file_content = fs::read_to_string(&game_file)
         .unwrap_or_else(|e| panic!("Failed to read {}: {}", game_file, e));
     let record: GameRecord = serde_json::from_str(&file_content)
-        .expect("Failed to parse JSON");
+        .unwrap_or_else(|e| panic!("Failed to parse JSON {}: {}", game_file, e));
 
-    println!("Loaded Replay | Seed: {} | Total Score: {} | Moves: {}", record.seed, record.total_score, record.moves.len());
+    println!(">>> Loaded Replay `{}` | Seed: {} | Total Score: {} | Moves: {} <<<", game_file, record.seed, record.total_score, record.moves.len());
 
     let mut stack_height = 10;
     if let Ok(content) = fs::read_to_string("monthly_game_info.txt") {
