@@ -80,7 +80,6 @@ impl AlphaZeroReplayBuffer {
             return Vec::new();
         }
         let mut rng = rand::thread_rng();
-        // Khởi tạo danh sách index 0..len và thực hiện Fisher-Yates partial (chỉ count phần đầu)
         let mut indices: Vec<usize> = (0..len).collect();
         for i in 0..count {
             let j = i + rng.gen_range(0..(len - i));
@@ -88,6 +87,72 @@ impl AlphaZeroReplayBuffer {
         }
         indices.truncate(count);
         indices
+    }
+
+    /// Lấy `count` indices từ buffer với cơ chế Prioritized Experience Replay (PER):
+    /// - 50% samples được ưu tiên lấy từ các mẫu có target_val cao nhất (Top trajectory positions)
+    /// - 50% samples được lấy ngẫu nhiên đều từ toàn bộ buffer để duy trì tính đa dạng
+    pub fn sample_prioritized_unique_indices(&self, count: usize) -> Vec<usize> {
+        let len = self.buffer.len();
+        let count = count.min(len);
+        if count == 0 {
+            return Vec::new();
+        }
+
+        let mut rng = rand::thread_rng();
+        let top_target = count / 2;
+
+        let mut indices_val: Vec<(usize, f32)> = self
+            .buffer
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (i, s.target_val))
+            .collect();
+
+        // Sắp xếp giảm dần theo target_val
+        indices_val.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let top_pool_len = ((len as f32) * 0.35).ceil() as usize;
+        let top_pool_len = top_pool_len.max(top_target).min(len);
+
+        let mut selected: HashSet<usize> = HashSet::with_capacity(count);
+        let mut result: Vec<usize> = Vec::with_capacity(count);
+
+        // 1. Lấy mẫu từ top_pool (những nước đi dẫn đến ván chơi/hậu kỳ điểm cao)
+        let mut attempts = 0;
+        while result.len() < top_target && attempts < count * 2 {
+            attempts += 1;
+            let pick = rng.gen_range(0..top_pool_len);
+            let idx = indices_val[pick].0;
+            if selected.insert(idx) {
+                result.push(idx);
+            }
+        }
+
+        // 2. Lấy mẫu ngẫu nhiên từ toàn bộ buffer cho phần còn lại
+        attempts = 0;
+        while result.len() < count && attempts < count * 3 {
+            attempts += 1;
+            let idx = rng.gen_range(0..len);
+            if selected.insert(idx) {
+                result.push(idx);
+            }
+        }
+
+        // 3. Fallback lấp đầy nếu chưa đủ count
+        if result.len() < count {
+            for i in 0..len {
+                if result.len() >= count {
+                    break;
+                }
+                if selected.insert(i) {
+                    result.push(i);
+                }
+            }
+        }
+
+        result.shuffle(&mut rng);
+        result
     }
 
     pub fn sample_batch(&self, batch_size: usize) -> Vec<AlphaZeroSample> {
@@ -346,13 +411,13 @@ impl Default for AlphaZeroTrainerConfig {
     fn default() -> Self {
         Self {
             lr: 0.0003,
-            gamma: 0.99,
+            gamma: 0.995,
             value_loss_coeff: 0.5,
             batch_size: 128,
             train_epochs_per_iter: 4,
             mcts_config: MCTSConfig {
                 c_puct: 1.5,
-                gamma: 0.99,
+                gamma: 0.995,
                 n_simulations: 200,
                 dirichlet_alpha: 0.3,
                 dirichlet_eps: 0.25,
@@ -865,8 +930,8 @@ impl AlphaZeroPipeline {
         let mut step_count = 0;
 
         for epoch in 0..total_epochs {
-            // Bốc ngẫu nhiên M indices (trộn) từ buffer để train cho epoch này
-            let epoch_indices = self.replay_buffer.sample_unique_indices(m);
+            // Bốc ngẫu nhiên M indices (trộn) từ buffer theo PER (50% top-value, 50% uniform) để train
+            let epoch_indices = self.replay_buffer.sample_prioritized_unique_indices(m);
             let epoch_batches = if epoch_indices.is_empty() {
                 0
             } else {
@@ -1205,5 +1270,30 @@ mod tests_overwrite {
             pipe.max_score_states.iter().all(|s| s.q_value > -5.0),
             "state bị ghi đè Q âm đã bị loại khỏi top"
         );
+    }
+
+    #[test]
+    fn test_sample_prioritized_unique_indices() {
+        let mut buffer = AlphaZeroReplayBuffer::new(100);
+        for i in 0..50 {
+            buffer.push(AlphaZeroSample {
+                obs: GraphObservation {
+                    node_positions: vec![(0, 0)],
+                    node_features: vec![[0.0; crate::env::node_feat::DIM]],
+                    edge_index: Vec::new(),
+                    valid_actions: Vec::new(),
+                    action_features: Vec::new(),
+                },
+                target_pi: vec![1.0],
+                target_val: (i as f32) * 10.0,
+            });
+        }
+        let sample = buffer.sample_prioritized_unique_indices(20);
+        assert_eq!(sample.len(), 20);
+        let mut seen = std::collections::HashSet::new();
+        for &idx in &sample {
+            assert!(idx < 50);
+            assert!(seen.insert(idx), "Indices must be unique");
+        }
     }
 }

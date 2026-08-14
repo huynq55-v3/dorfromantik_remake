@@ -94,7 +94,7 @@ fn main() {
 
     let mcts_config = MCTSConfig {
         c_puct: 1.5,
-        gamma: 0.99,
+        gamma: 0.995,
         n_simulations,
         dirichlet_alpha: 0.5,
         dirichlet_eps: 0.4,

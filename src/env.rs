@@ -252,6 +252,7 @@ impl DorfromantikEnv {
 
         self.placed_count += 1;
 
+        let prev_remaining = self.score_manager.remaining_tiles;
         // Cập nhật điểm số và số lượng tile trong stack qua ScoreManager
         let _breakdown = self.score_manager.on_tile_placed(
             &self.board,
@@ -262,7 +263,19 @@ impl DorfromantikEnv {
         );
 
         let step_score_delta = self.score_manager.total_score - prev_score;
-        let reward = step_score_delta as f32;
+        let new_remaining = self.score_manager.remaining_tiles;
+
+        // Tile Economy Bonus: Khuyến khích duy trì và tích lũy cọc bài (sinh mệnh của ván đấu)
+        let tile_delta = (new_remaining as f32) - (prev_remaining.saturating_sub(1) as f32);
+        let tile_economy_bonus = if tile_delta > 0.0 {
+            tile_delta * 12.0 // +12 điểm tiềm năng cho mỗi tile kiếm thêm được (từ Quest hoặc Perfect)
+        } else if new_remaining <= 3 {
+            -15.0 // Cảnh báo nguy hiểm khi cọc bài sắp hết (tránh game over sớm)
+        } else {
+            0.0
+        };
+
+        let reward = step_score_delta as f32 + tile_economy_bonus;
 
         // Thêm tile mới vào cuối tile_queue (KHÔNG activate quest ngay — chỉ khi lên front)
         let active_count = self.quest_manager.pop_next_active_quest_count();

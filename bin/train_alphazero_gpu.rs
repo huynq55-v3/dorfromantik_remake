@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 use dorfromantik_remake::alphazero::{
-    evaluate_alphazero_agent, AlphaZeroPipeline, AlphaZeroTrainerConfig, GameMatchRecord, MaxScoreStateRecord,
+    AlphaZeroPipeline, AlphaZeroTrainerConfig, GameMatchRecord, MaxScoreStateRecord,
 };
 use dorfromantik_remake::gpu_engine::GpuEngine;
 use dorfromantik_remake::gpu_nn::GpuNNExecutor;
@@ -128,13 +128,13 @@ fn main() {
 
     let config = AlphaZeroTrainerConfig {
         lr,
-        gamma: 0.99,
+        gamma: 0.995,
         value_loss_coeff: 0.5,
         batch_size: 1024,
         train_epochs_per_iter: train_epochs,
         mcts_config: MCTSConfig {
             c_puct: 1.5,
-            gamma: 0.99,
+            gamma: 0.995,
             n_simulations,
             dirichlet_alpha: 0.3,
             dirichlet_eps: 0.25,
@@ -160,7 +160,6 @@ fn main() {
 
     let mut pipeline = AlphaZeroPipeline::new(config.clone());
     let mut start_iter = 0;
-    let mut best_eval_score = 0;
     let mut all_time_best_match_score = 0;
 
     // 2. Tìm checkpoint iteration lớn nhất hiện có (alphazero_iter_<n>.bin).
@@ -250,7 +249,7 @@ fn main() {
         }
     }
 
-    // 5. Khôi phục Metadata (Iteration, Best Eval Score)
+    // 5. Khôi phục Metadata (Iteration, All-time Best Match Score)
     if Path::new(&meta_path).exists() {
         if let Ok(content) = fs::read_to_string(&meta_path) {
             for line in content.lines() {
@@ -259,15 +258,17 @@ fn main() {
                         // Khi có file alphazero_iter_<n>.bin thì ưu tiên số đó (đã gán ở trên).
                         // Meta chỉ giúp khi chưa dùng file iteration (fallback alphazero_latest/best).
                         "iteration" if start_iter == 0 => start_iter = v.trim().parse::<usize>().unwrap_or(0),
-                        "best_eval_score" => best_eval_score = v.trim().parse::<usize>().unwrap_or(0),
+                        "all_time_best_match_score" if all_time_best_match_score == 0 => {
+                            all_time_best_match_score = v.trim().parse::<usize>().unwrap_or(0)
+                        }
                         _ => {}
                     }
                 }
             }
             println!(
-                "[Meta] Tiếp tục từ Iteration #{}, Best Eval Score = {}",
+                "[Meta] Tiếp tục từ Iteration #{}, Kỷ Lục Hiện Tại = {} điểm",
                 start_iter + 1,
-                best_eval_score
+                all_time_best_match_score
             );
         }
     }
@@ -360,12 +361,13 @@ fn main() {
             if record.total_score > all_time_best_match_score {
                 all_time_best_match_score = record.total_score;
                 println!(
-                    "🔥 KHÔI PHỤC/TẠO KỶ LỤC MỚI TRONG SELF-PLAY: {} ĐIỂM (Placed {} tiles)! Đang lưu json...",
+                    "🔥 KHÔI PHỤC/TẠO KỶ LỤC MỚI TRONG SELF-PLAY: {} ĐIỂM (Placed {} tiles)! Đang lưu json & best model...",
                     all_time_best_match_score, record.total_placed
                 );
                 if let Ok(json_str) = serde_json::to_string_pretty(&record) {
                     let _ = fs::write(&best_game_path, json_str);
                 }
+                let _ = pipeline.model.save_to_file(&best_model_path);
             }
         }
 
@@ -399,61 +401,19 @@ fn main() {
             println!("[Save Error] Không thể lưu replay buffer: {:?}", e);
         }
 
-        // Lưu danh sách max-score states (20% envs khởi động lại từ vị thế tốt ở iter sau)
+        // Lưu danh sách max-score states (80% envs khởi động lại từ vị thế tốt ở iter sau)
         if let Ok(json_str) = serde_json::to_string_pretty(&pipeline.max_score_states) {
             if let Err(e) = fs::write(&max_score_states_path, json_str) {
                 println!("[Save Error] Không thể lưu max_score_states: {:?}", e);
             }
         }
 
-        // E. Đánh giá (Evaluation) mỗi 5 iterations
-        if iteration % 5 == 0 {
-            let eval_start = Instant::now();
-            println!("[Eval] Đang chạy đánh giá Greedy Agent trên target seed {}...", target_seed);
-            let (eval_score, eval_placed, eval_record) = evaluate_alphazero_agent(
-                target_seed,
-                initial_stack,
-                tile_limit,
-                &pipeline.model,
-                &config.mcts_config,
-            );
-            let eval_dur = eval_start.elapsed();
-
-
-            println!(
-                "[Eval Result] Score: {} | Placed: {} tiles | Thời gian: {:.2}s",
-                eval_score,
-                eval_placed,
-                eval_dur.as_secs_f32()
-            );
-
-            if eval_score > best_eval_score {
-                println!(
-                    "🏆 KỶ LỤC DỰ ĐOÁN MỚI (Best Eval Score): {} -> {}! Đang lưu best model...",
-                    best_eval_score, eval_score
-                );
-                best_eval_score = eval_score;
-                let _ = pipeline.model.save_to_file(&best_model_path);
-            }
-
-            if eval_score > all_time_best_match_score {
-                all_time_best_match_score = eval_score;
-                println!(
-                    "🔥 KỶ LỤC MỚI TRONG EVALUATION: {} ĐIỂM! Đang lưu json...",
-                    all_time_best_match_score
-                );
-                if let Ok(json_str) = serde_json::to_string_pretty(&eval_record) {
-                    let _ = fs::write(&best_game_path, json_str);
-                }
-            }
-
-            // Ghi metadata file
-            let meta_content = format!(
-                "iteration={}\nbest_eval_score={}\nall_time_best_match_score={}\n",
-                iteration, best_eval_score, all_time_best_match_score
-            );
-            let _ = fs::write(&meta_path, meta_content);
-        }
+        // Ghi metadata file (iteration, kỷ lục)
+        let meta_content = format!(
+            "iteration={}\nall_time_best_match_score={}\n",
+            iteration, all_time_best_match_score
+        );
+        let _ = fs::write(&meta_path, meta_content);
 
         let total_iter_dur = iter_start.elapsed();
         println!(

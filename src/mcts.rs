@@ -80,7 +80,7 @@ impl Default for MCTSConfig {
     fn default() -> Self {
         Self {
             c_puct: 1.5,
-            gamma: 0.99,
+            gamma: 0.995,
             n_simulations: 200,
             dirichlet_alpha: 0.3,
             dirichlet_eps: 0.25,
