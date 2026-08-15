@@ -77,6 +77,8 @@ enum AppState {
         move_history: Vec<GameMoveRecord>,
         raw_steps: Vec<(dorfromantik_remake::env::GraphObservation, f32)>, // obs, reward
         initial_moves_len: usize,
+        is_recording: bool,
+        record_start_idx: usize,
     },
     GameOver {
         final_score: usize,
@@ -170,6 +172,8 @@ async fn main() {
                         move_history: Vec::new(),
                         raw_steps: Vec::new(),
                         initial_moves_len: 0,
+                        is_recording: true,
+                        record_start_idx: 0,
                     });
                 }
 
@@ -207,11 +211,59 @@ async fn main() {
                         move_history: replay_history,
                         raw_steps: Vec::new(),
                         initial_moves_len: st.moves.len(),
+                        is_recording: true,
+                        record_start_idx: st.moves.len(),
                     });
                 }
             }
 
-            AppState::Playing { env, move_history, raw_steps, initial_moves_len } => {
+            AppState::Playing { env, move_history, raw_steps, initial_moves_len, is_recording, record_start_idx } => {
+                // Toggle Record [T]
+                if is_key_pressed(KeyCode::T) {
+                    *is_recording = !*is_recording;
+                    if *is_recording {
+                        *record_start_idx = move_history.len();
+                        raw_steps.clear();
+                        println!("🔴 [RECORD ON] Bắt đầu ghi nhận thế cờ từ Move #{} trở đi!", move_history.len());
+                    } else {
+                        println!("⚪ [RECORD PAUSED] Tạm dừng ghi nhận thế cờ.");
+                    }
+                }
+
+                // Handle Undo [U] / [Z]
+                if (is_key_pressed(KeyCode::U) || is_key_pressed(KeyCode::Z)) && !move_history.is_empty() {
+                    move_history.pop();
+                    if !raw_steps.is_empty() {
+                        raw_steps.pop();
+                    }
+
+                    // Tái thiết lập env bằng cách replay lại từ Turn 0 đến move_history.len()
+                    let mut fresh_env = DorfromantikEnv::new(seed, initial_stack, tile_limit);
+                    let mut fresh_history = Vec::new();
+                    for m in move_history.iter() {
+                        let curr_tile = fresh_env.current_tile().cloned().unwrap();
+                        let canonical_rot = m.rotation % curr_tile.rotation_symmetry_period();
+                        let prev_sc = fresh_env.score_manager.total_score;
+                        fresh_env.step(Action { q: m.q, r: m.r, rotation: canonical_rot });
+                        let gained = fresh_env.score_manager.total_score.saturating_sub(prev_sc);
+                        fresh_history.push(GameMoveRecord {
+                            step: fresh_history.len(),
+                            q: m.q,
+                            r: m.r,
+                            rotation: canonical_rot,
+                            score_gained: gained,
+                            total_score: fresh_env.score_manager.total_score,
+                            remaining_tiles: fresh_env.score_manager.remaining_tiles,
+                        });
+                    }
+                    *env = fresh_env;
+                    *move_history = fresh_history;
+                    if *record_start_idx > move_history.len() {
+                        *record_start_idx = move_history.len();
+                    }
+                    println!("↩️ [UNDO] Đã lùi lại 1 nước! Hiện tại: Placed = {}, Score = {}", env.placed_count, env.score_manager.total_score);
+                }
+
                 // Controls camera
                 if is_mouse_button_down(MouseButton::Right) && total_drag_dist > 4.0 {
                     camera_pos.x -= mouse_delta.x / zoom;
@@ -305,10 +357,33 @@ async fn main() {
                 );
                 draw_rectangle(0.0, 0.0, screen_w, 40.0, Color::from_rgba(15, 20, 28, 220));
                 draw_text(&header, 20.0, 28.0, 22.0, GOLD);
-                draw_text("Chuột Trái: Đặt tile | Chuột Phải / Space: Xoay | Giữ Chuột Phải: Kéo map | [ESC]: Kết thúc & Thẩm định", 20.0, screen_h - 15.0, 16.0, LIGHTGRAY);
+
+                // Record Indicator Button
+                let (rec_text, rec_bg, rec_color) = if *is_recording {
+                    (format!("🔴 REC ON (Từ Move #{})", *record_start_idx + 1), Color::from_rgba(180, 40, 40, 240), WHITE)
+                } else {
+                    ("⚪ REC PAUSED [Bấm T]".to_string(), Color::from_rgba(70, 70, 70, 240), LIGHTGRAY)
+                };
+                let btn_w = 210.0;
+                let btn_x = screen_w - btn_w - 20.0;
+                draw_rectangle(btn_x, 6.0, btn_w, 28.0, rec_bg);
+                draw_text(&rec_text, btn_x + 15.0, 26.0, 16.0, rec_color);
+
+                // Click button toggle REC
+                if is_mouse_button_released(MouseButton::Left) && current_mouse_pos.0 >= btn_x && current_mouse_pos.0 <= btn_x + btn_w && current_mouse_pos.1 >= 6.0 && current_mouse_pos.1 <= 34.0 {
+                    *is_recording = !*is_recording;
+                    if *is_recording {
+                        *record_start_idx = move_history.len();
+                        raw_steps.clear();
+                        println!("🔴 [RECORD ON] Bắt đầu ghi nhận thế cờ từ Move #{} trở đi!", move_history.len());
+                    }
+                }
+
+                let bottom_hud = "[Chuột Trái]: Đặt | [Phím R / Chuột Phải / Space]: Xoay | [U/Z]: Undo | [T]: Bật/Tắt Record | [ESC]: Kết thúc";
+                draw_text(bottom_hud, 20.0, screen_h - 15.0, 16.0, LIGHTGRAY);
 
                 // Handle Place Tile
-                let lmb_clicked = is_mouse_button_released(MouseButton::Left) && total_drag_dist <= 6.0;
+                let lmb_clicked = is_mouse_button_released(MouseButton::Left) && total_drag_dist <= 6.0 && current_mouse_pos.1 > 40.0;
                 if can_place && lmb_clicked {
                     let obs = env.extract_graph_observation();
                     let prev_score = env.score_manager.total_score;
@@ -325,11 +400,14 @@ async fn main() {
                         total_score: env.score_manager.total_score,
                         remaining_tiles: env.score_manager.remaining_tiles,
                     });
-                    raw_steps.push((obs, res.reward * 0.01));
+                    if *is_recording {
+                        raw_steps.push((obs, res.reward * 0.01));
+                    }
 
                     println!(
-                        "   [HUMAN MOVE #{}] ({}, {}) rot:{} -> +{} pts (Total: {}) | Stack: {}",
-                        move_history.len(), act.q, act.r, act.rotation, gained, env.score_manager.total_score, env.score_manager.remaining_tiles
+                        "   [HUMAN MOVE #{}] ({}, {}) rot:{} -> +{} pts (Total: {}) | Stack: {} {}",
+                        move_history.len(), act.q, act.r, act.rotation, gained, env.score_manager.total_score, env.score_manager.remaining_tiles,
+                        if *is_recording { "🔴" } else { "⚪" }
                     );
 
                     current_rotation = 0;
@@ -339,10 +417,10 @@ async fn main() {
                 if env.is_game_over() || is_key_pressed(KeyCode::Escape) {
                     println!("\n=======================================================");
                     println!(">>> KẾT THÚC VÁN ĐẤU CON NGƯỜI: {} ĐIỂM (Placed {} tiles) <<<", env.score_manager.total_score, env.placed_count);
-                    println!("Đang dùng mạng GNN thẩm định và cập nhật vào `{}`...", max_score_states_path);
+                    println!("Đang dùng mạng GNN thẩm định từ điểm Record #{} và cập nhật vào `{}`...", *record_start_idx + 1, max_score_states_path);
                     println!("=======================================================");
 
-                    // Compute Discounted G for human steps
+                    // Compute Discounted G for recorded steps
                     let total_steps = raw_steps.len();
                     let mut g_vals = vec![0.0f32; total_steps];
                     let mut running_g = 0.0f32;
@@ -363,12 +441,11 @@ async fn main() {
 
                     let mut qualified = 0usize;
                     for t in 0..total_steps {
-                        let real_idx = *initial_moves_len + t;
+                        let real_idx = *record_start_idx + t;
                         if real_idx < move_history.len() {
                             let m = &move_history[real_idx];
                             if m.remaining_tiles >= 10 {
                                 let q = m.total_score as f32 + g_vals[t] * 100.0;
-                                let old_len = pipeline.max_score_states.len();
                                 pipeline.add_high_q_state(q, m.remaining_tiles, &move_history[..=real_idx]);
                                 
                                 println!(
