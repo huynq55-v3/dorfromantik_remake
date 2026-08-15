@@ -658,6 +658,7 @@ async fn main() {
                         replay_buffer_capacity: Some(200_000),
                     };
                     let mut pipeline = AlphaZeroPipeline::new(config);
+                    pipeline.model = model.clone();
                     pipeline.max_score_states = human_pipeline_states;
 
                     let mut qualified = 0usize;
