@@ -71,9 +71,7 @@ fn load_game_config() -> (i32, usize, usize) {
 
 #[derive(Clone)]
 enum AppState {
-    SelectState {
-        page: usize,
-    },
+    SelectMode,
     Playing {
         env: DorfromantikEnv,
         move_history: Vec<GameMoveRecord>,
@@ -117,7 +115,7 @@ async fn main() {
     }
     println!(">>> Đã nạp {} max-score states từ `{}` <<<", states_list.len(), max_score_states_path);
 
-    let mut app_state = AppState::SelectState { page: 0 };
+    let mut app_state = AppState::SelectMode;
     let mut camera_pos = Vec2::ZERO;
     let mut zoom: f32 = 1.0;
     let mut last_mouse_pos = mouse_position();
@@ -141,15 +139,31 @@ async fn main() {
         let mut next_app_state = None;
 
         match &mut app_state {
-            AppState::SelectState { page } => {
-                draw_text("CHỌN THẾ CỜ ĐỂ BẮT ĐẦU CHƠI TAY", 40.0, 50.0, 30.0, GOLD);
-                draw_text("Bấm [0] để chơi từ đầu (Turn 0), hoặc bấm phím số [1..9] để nạp thế cờ:", 40.0, 85.0, 20.0, LIGHTGRAY);
+            AppState::SelectMode => {
+                let box_w = 640.0;
+                let box_h = 320.0;
+                let bx = screen_w * 0.5 - box_w * 0.5;
+                let by = screen_h * 0.5 - box_h * 0.5;
 
-                // Option 0
-                draw_rectangle(40.0, 110.0, screen_w - 80.0, 45.0, Color::from_rgba(35, 45, 60, 255));
-                draw_text("[0] Bắt đầu VÁN MỚI từ Turn 0 (Trống)", 60.0, 140.0, 22.0, GREEN);
+                draw_rectangle(bx, by, box_w, box_h, Color::from_rgba(25, 32, 45, 250));
+                draw_poly_lines(screen_w * 0.5, screen_h * 0.5, 4, 300.0, 45.0, 2.0, GOLD);
 
-                if is_key_pressed(KeyCode::Key0) || is_key_pressed(KeyCode::Kp0) {
+                draw_text("CHỌN CHẾ ĐỘ CHƠI TAY EXPERT", bx + 80.0, by + 50.0, 30.0, GOLD);
+
+                // Option 1: New Game
+                draw_rectangle(bx + 40.0, by + 90.0, box_w - 80.0, 75.0, Color::from_rgba(35, 55, 40, 255));
+                draw_text("[1] BẮT ĐẦU VÁN MỚI (Từ Turn 0 / Trống)", bx + 60.0, by + 125.0, 22.0, GREEN);
+                draw_text("Xây dựng bàn cờ từ đầu, thử nghiệm các hướng mở cờ mới.", bx + 60.0, by + 150.0, 16.0, LIGHTGRAY);
+
+                // Option 2: Random Max Score State
+                let count_str = format!("(Ngẫu nhiên trong {} thế cờ điểm cao có sẵn)", states_list.len());
+                draw_rectangle(bx + 40.0, by + 185.0, box_w - 80.0, 75.0, Color::from_rgba(40, 50, 75, 255));
+                draw_text("[2] CHƠI TIẾP TỪ THẾ CỜ ĐỈNH CAO", bx + 60.0, by + 220.0, 22.0, SKYBLUE);
+                draw_text(&count_str, bx + 60.0, by + 245.0, 16.0, LIGHTGRAY);
+
+                draw_text("Bấm phím [1] hoặc [2] để bắt đầu chơi ngay", bx + 140.0, by + 295.0, 18.0, YELLOW);
+
+                if is_key_pressed(KeyCode::Key1) || is_key_pressed(KeyCode::Kp1) {
                     let env = DorfromantikEnv::new(seed, initial_stack, tile_limit);
                     next_app_state = Some(AppState::Playing {
                         env,
@@ -159,65 +173,41 @@ async fn main() {
                     });
                 }
 
-                let items_per_page = 8;
-                let start_idx = *page * items_per_page;
-                let end_idx = (start_idx + items_per_page).min(states_list.len());
+                if (is_key_pressed(KeyCode::Key2) || is_key_pressed(KeyCode::Kp2)) && !states_list.is_empty() {
+                    use ::rand::Rng;
+                    let mut rng = ::rand::thread_rng();
+                    let r_bias = rng.gen::<f32>().powi(2); // Quadratic bias ưu tiên top Q cao nhất
+                    let pick_idx = (r_bias * states_list.len() as f32) as usize;
+                    let st = &states_list[pick_idx];
 
-                for (slot, idx) in (start_idx..end_idx).enumerate() {
-                    let st = &states_list[idx];
-                    let y = 170.0 + slot as f32 * 55.0;
-                    draw_rectangle(40.0, y, screen_w - 80.0, 48.0, Color::from_rgba(30, 38, 50, 255));
-                    
-                    let key_num = slot + 1;
-                    let last_score = st.moves.last().map(|m| m.total_score).unwrap_or(0);
-                    let info_text = format!(
-                        "[{}] State #{} | Q-Value: {:.1} | Score: {} | Placed: {} tiles | Remaining: {} tiles",
-                        key_num, idx + 1, st.q_value, last_score, st.moves.len(), st.remaining_tiles
-                    );
-                    draw_text(&info_text, 60.0, y + 30.0, 20.0, WHITE);
-
-                    let key_code = match key_num {
-                        1 => KeyCode::Key1, 2 => KeyCode::Key2, 3 => KeyCode::Key3,
-                        4 => KeyCode::Key4, 5 => KeyCode::Key5, 6 => KeyCode::Key6,
-                        7 => KeyCode::Key7, 8 => KeyCode::Key8, _ => KeyCode::Key9,
-                    };
-
-                    if is_key_pressed(key_code) {
-                        let mut env = DorfromantikEnv::new(seed, initial_stack, tile_limit);
-                        let mut replay_history = Vec::new();
-                        for m in &st.moves {
-                            let curr_tile = env.current_tile().cloned().unwrap();
-                            let canonical_rot = m.rotation % curr_tile.rotation_symmetry_period();
-                            let prev_sc = env.score_manager.total_score;
-                            env.step(Action { q: m.q, r: m.r, rotation: canonical_rot });
-                            let gained = env.score_manager.total_score.saturating_sub(prev_sc);
-                            replay_history.push(GameMoveRecord {
-                                step: replay_history.len(),
-                                q: m.q,
-                                r: m.r,
-                                rotation: canonical_rot,
-                                score_gained: gained,
-                                total_score: env.score_manager.total_score,
-                                remaining_tiles: env.score_manager.remaining_tiles,
-                            });
-                        }
-                        println!("\n>>> Đã nạp thành công State #{} (Score: {}, Placed: {} tiles) <<<", idx + 1, env.score_manager.total_score, env.placed_count);
-                        next_app_state = Some(AppState::Playing {
-                            env,
-                            move_history: replay_history,
-                            raw_steps: Vec::new(),
-                            initial_moves_len: st.moves.len(),
+                    let mut env = DorfromantikEnv::new(seed, initial_stack, tile_limit);
+                    let mut replay_history = Vec::new();
+                    for m in &st.moves {
+                        let curr_tile = env.current_tile().cloned().unwrap();
+                        let canonical_rot = m.rotation % curr_tile.rotation_symmetry_period();
+                        let prev_sc = env.score_manager.total_score;
+                        env.step(Action { q: m.q, r: m.r, rotation: canonical_rot });
+                        let gained = env.score_manager.total_score.saturating_sub(prev_sc);
+                        replay_history.push(GameMoveRecord {
+                            step: replay_history.len(),
+                            q: m.q,
+                            r: m.r,
+                            rotation: canonical_rot,
+                            score_gained: gained,
+                            total_score: env.score_manager.total_score,
+                            remaining_tiles: env.score_manager.remaining_tiles,
                         });
-                        break;
                     }
-                }
-
-                draw_text("Phím [<-] / [->]: Chuyển trang danh sách", 40.0, screen_h - 40.0, 18.0, GRAY);
-                if is_key_pressed(KeyCode::Right) && (*page + 1) * items_per_page < states_list.len() {
-                    *page += 1;
-                }
-                if is_key_pressed(KeyCode::Left) && *page > 0 {
-                    *page -= 1;
+                    println!(
+                        "\n>>> Đã nạp thành công ngẫu nhiên State #{}/{} (Score: {}, Placed: {} tiles, Stack: {} tiles, Q-Value: {:.1}) <<<",
+                        pick_idx + 1, states_list.len(), env.score_manager.total_score, env.placed_count, env.score_manager.remaining_tiles, st.q_value
+                    );
+                    next_app_state = Some(AppState::Playing {
+                        env,
+                        move_history: replay_history,
+                        raw_steps: Vec::new(),
+                        initial_moves_len: st.moves.len(),
+                    });
                 }
             }
 
@@ -432,7 +422,7 @@ async fn main() {
                             }
                         }
                     }
-                    next_app_state = Some(AppState::SelectState { page: 0 });
+                    next_app_state = Some(AppState::SelectMode);
                 }
             }
         }
