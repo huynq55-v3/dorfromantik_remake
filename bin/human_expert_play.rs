@@ -284,8 +284,8 @@ async fn main() {
                     println!("↩️ [UNDO] Reverted 1 move! Placed = {}, Score = {}", env.placed_count, env.score_manager.total_score);
                 }
 
-                // Camera Controls
-                if is_mouse_button_down(MouseButton::Right) && total_drag_dist > 4.0 {
+                // Camera Dragging Controls (LMB / RMB / MMB drag on empty space or anywhere)
+                if (is_mouse_button_down(MouseButton::Left) || is_mouse_button_down(MouseButton::Right) || is_mouse_button_down(MouseButton::Middle)) && total_drag_dist > 4.0 {
                     camera_pos.x -= mouse_delta.x / zoom;
                     camera_pos.y -= mouse_delta.y / zoom;
                 }
@@ -295,21 +295,21 @@ async fn main() {
                 if is_key_down(KeyCode::A) || is_key_down(KeyCode::Left) { camera_pos.x -= speed * delta; }
                 if is_key_down(KeyCode::D) || is_key_down(KeyCode::Right) { camera_pos.x += speed * delta; }
 
+                // Mouse Wheel: Zoom in / Zoom out smoothly
                 let wheel = mouse_wheel().1;
-                if is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl) {
-                    if wheel > 0.0 { zoom *= 1.12; }
-                    if wheel < 0.0 { zoom *= 0.88; }
-                } else if wheel != 0.0 {
-                    if let Some(curr) = env.current_tile() {
-                        let forward = wheel < 0.0;
-                        current_rotation = env.board.get_next_valid_rotation(screen_to_hex((Vec2::new(current_mouse_pos.0, current_mouse_pos.1) - Vec2::new(screen_w * 0.5, screen_h * 0.5)) / zoom + camera_pos, HEX_RADIUS).q, screen_to_hex((Vec2::new(current_mouse_pos.0, current_mouse_pos.1) - Vec2::new(screen_w * 0.5, screen_h * 0.5)) / zoom + camera_pos, HEX_RADIUS).r, curr, current_rotation, forward);
-                    } else {
-                        if wheel < 0.0 { current_rotation = (current_rotation + 1) % 6; }
-                        else { current_rotation = (current_rotation + 5) % 6; }
-                    }
+                if wheel > 0.0 { zoom *= 1.12; }
+                if wheel < 0.0 { zoom *= 0.88; }
+                if is_key_pressed(KeyCode::Equal) || is_key_pressed(KeyCode::Key1) { zoom *= 1.15; }
+                if is_key_pressed(KeyCode::Minus) || is_key_pressed(KeyCode::Key2) { zoom *= 0.85; }
+                if is_key_pressed(KeyCode::C) || is_key_pressed(KeyCode::Home) {
+                    camera_pos = Vec2::ZERO;
+                    zoom = 1.0;
                 }
+                zoom = zoom.clamp(0.15, 4.0);
 
-                if is_key_pressed(KeyCode::R) || is_key_pressed(KeyCode::Space) {
+                // Rotate Tile: Right Click, Space, or Key R
+                let rmb_clicked = is_mouse_button_released(MouseButton::Right) && total_drag_dist <= 6.0;
+                if rmb_clicked || is_mouse_button_pressed(MouseButton::Middle) || is_key_pressed(KeyCode::R) || is_key_pressed(KeyCode::Space) {
                     if let Some(curr) = env.current_tile() {
                         let hex = screen_to_hex((Vec2::new(current_mouse_pos.0, current_mouse_pos.1) - Vec2::new(screen_w * 0.5, screen_h * 0.5)) / zoom + camera_pos, HEX_RADIUS);
                         current_rotation = env.board.get_next_valid_rotation(hex.q, hex.r, curr, current_rotation, true);
@@ -317,7 +317,14 @@ async fn main() {
                         current_rotation = (current_rotation + 1) % 6;
                     }
                 }
-                zoom = zoom.clamp(0.2, 4.0);
+                if is_key_pressed(KeyCode::Q) {
+                    if let Some(curr) = env.current_tile() {
+                        let hex = screen_to_hex((Vec2::new(current_mouse_pos.0, current_mouse_pos.1) - Vec2::new(screen_w * 0.5, screen_h * 0.5)) / zoom + camera_pos, HEX_RADIUS);
+                        current_rotation = env.board.get_next_valid_rotation(hex.q, hex.r, curr, current_rotation, false);
+                    } else {
+                        current_rotation = (current_rotation + 5) % 6;
+                    }
+                }
 
                 let center_vec = Vec2::new(screen_w * 0.5, screen_h * 0.5);
                 let mouse_vec = Vec2::new(current_mouse_pos.0, current_mouse_pos.1);
@@ -492,7 +499,7 @@ async fn main() {
                 }
 
                 // ── Bottom Navigation HUD ──
-                let bottom_hud = "LMB: Place | RMB Drag / WASD: Pan | Wheel / Space / R: Rotate | U / Z: Undo | T: Toggle Rec | ESC: Finish";
+                let bottom_hud = "LMB: Place | Drag (LMB/RMB): Pan Map | Wheel: Zoom In/Out | RMB / Space / R: Rotate | U/Z: Undo | T: Rec | ESC: Finish";
                 draw_text(bottom_hud, 20.0, screen_h - 15.0, 15.0, LIGHTGRAY);
 
                 // Handle Place Tile
