@@ -857,7 +857,6 @@ impl Board {
                         } else {
                             println!("   [MAIN QUEST GROUP CONNECTED] GID={}", n_gid);
                             if let Some(group) = self.groups.get(&n_gid) {
-                                println!("      -> MAIN GROUP GID={} DETAILS: TotalElements={}", n_gid, group.total_element_count);
                                 for &(mq, mr) in &group.member_tiles {
                                     if let Some(pt) = self.placed_tiles.get(&(mq, mr)) {
                                         let elem_cnt = self.get_tile_element_count(&pt.tile, group_type);
@@ -874,6 +873,48 @@ impl Board {
                 }
 
                 preview_results.insert(pos, (remaining_target, preview_status));
+            } else {
+                // TRƯỜNG HỢP HOVER_TILE KHÔNG KẾT NỐI VÀO QUEST:
+                // Nhưng việc đặt hover_tile có thể BÍT KÍN cạnh hở cuối cùng của Quest đó!
+                let mut member_tiles = HashSet::new();
+                for gid in &gids {
+                    if let Some(group) = self.groups.get(gid) {
+                        member_tiles.extend(group.member_tiles.iter().copied());
+                    }
+                }
+                if member_tiles.is_empty() {
+                    member_tiles.insert(pos);
+                }
+
+                // Kiểm tra số cạnh mở còn lại của Quest nếu ô hover_pos bị lấp đầy
+                let simulated_open_edges = self.count_open_edges_for_tiles(&member_tiles, group_type, Some((hover_pos, &preview_cfg)));
+                let remaining_target = target_count.saturating_sub(current_external);
+
+                let preview_status = match equality {
+                    EqualityComparison::MoreThan => {
+                        if current_external >= target_count {
+                            FulfillmentStatus::Success
+                        } else if simulated_open_edges == 0 {
+                            FulfillmentStatus::Failed // BỊ BÍT KÍN ĐƯỜNG RA -> HIỆN DẤU ĐỎ "X"!
+                        } else {
+                            FulfillmentStatus::Incomplete
+                        }
+                    }
+                    EqualityComparison::Exactly => {
+                        if current_external == target_count {
+                            FulfillmentStatus::Success
+                        } else if current_external > target_count || simulated_open_edges == 0 {
+                            FulfillmentStatus::Failed // BỊ BÍT KÍN HOẶC VƯỢT QUÁ -> HIỆN DẤU ĐỎ "X"!
+                        } else {
+                            FulfillmentStatus::Incomplete
+                        }
+                    }
+                };
+
+                // Chỉ ghi đè preview nếu trạng thái thay đổi (ví dụ chuyển sang Failed)
+                if preview_status != FulfillmentStatus::Incomplete {
+                    preview_results.insert(pos, (remaining_target, preview_status));
+                }
             }
         }
 
