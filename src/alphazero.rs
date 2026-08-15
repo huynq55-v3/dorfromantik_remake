@@ -717,10 +717,14 @@ impl AlphaZeroPipeline {
     /// Mỗi state: replay moves trong file để dựng board, rồi chạy MCTS `n_simulations` sim
     /// (temp thấp, không dirichlet) lấy root value; Q mới = total_score hiện tại + root_value * 100.
     /// State không replay được sẽ GIỮ NGUYÊN (không cập nhật, không xóa). Trả về số state đã cập nhật.
+    /// Cập nhật lại toàn bộ Q-value của max_score_states bằng Model Value Head trực tiếp (siêu nhanh, không cần MCTS).
+    /// Mỗi state: replay moves trong file để trích xuất GraphObservation, chạy model.forward lấy v_pred;
+    /// Q mới = total_score hiện tại + v_pred * 100.
+    /// State không replay được sẽ GIỮ NGUYÊN (không cập nhật, không xóa). Trả về số state đã cập nhật.
     pub fn refresh_max_score_state_q_values(
         &mut self,
-        gpu_exec: Option<&GpuNNExecutor>,
-        n_simulations: usize,
+        _gpu_exec: Option<&GpuNNExecutor>,
+        _n_simulations: usize,
     ) -> usize {
         let base_seed = self.config.target_seed;
         let initial_stack = self.config.initial_stack;
@@ -730,14 +734,8 @@ impl AlphaZeroPipeline {
             return 0;
         }
 
-        let mut mcts_cfg = self.config.mcts_config.clone();
-        mcts_cfg.n_simulations = n_simulations;
-        let mcts = MCTSSearch::new(mcts_cfg.clone());
-
-        // BƯỚC 1: replay từng moves trong file để dựng lại board state (kiểm tra hợp lệ).
-        let mut valid_envs: Vec<DorfromantikEnv> = Vec::with_capacity(n);
-        let mut orig_idx: Vec<usize> = Vec::with_capacity(n);
-        let mut base_scores: Vec<usize> = Vec::with_capacity(n);
+        // BƯỚC 1: replay từng moves trong file để dựng lại board state và trích xuất GraphObservation
+        let mut valid_obs: Vec<(usize, usize, GraphObservation)> = Vec::with_capacity(n);
         for (i, st) in self.max_score_states.iter().enumerate() {
             let mut env = DorfromantikEnv::new(base_seed, initial_stack, tile_limit);
             let mut ok = true;
@@ -763,28 +761,29 @@ impl AlphaZeroPipeline {
                 }
             }
             if ok && env.placed_count == st.moves.len() {
-                base_scores.push(env.score_manager.total_score);
-                valid_envs.push(env);
-                orig_idx.push(i);
+                let obs = env.extract_graph_observation();
+                valid_obs.push((i, env.score_manager.total_score, obs));
             }
         }
-        let b_count = valid_envs.len();
+
+        let b_count = valid_obs.len();
         if b_count == 0 {
             return 0;
         }
 
-        // BƯỚC 2: sau khi đã make move, chạy MCTS 800 sim batch (temp 0.2, KHÔNG dirichlet).
-        let active: Vec<usize> = (0..b_count).collect();
-        let results =
-            mcts.search_batch_indexed(&valid_envs, &active, &self.model, gpu_exec, false, 0.2);
-
-        // BƯỚC 3: ghi đè Q value: total_score + root_value * 100.
-        for (k, &st_idx) in orig_idx.iter().enumerate() {
-            let root_val = results[k].3;
-            self.max_score_states[st_idx].q_value = base_scores[k] as f32 + root_val * 100.0;
+        // BƯỚC 2: Chạy trực tiếp qua Model Value Head (V_model)
+        for (st_idx, base_score, obs) in valid_obs {
+            let (_, v_pred) = self.model.forward(
+                &obs.node_positions,
+                &obs.node_features,
+                &obs.edge_index,
+                &obs.valid_actions,
+                &obs.action_features,
+            );
+            self.max_score_states[st_idx].q_value = base_score as f32 + v_pred * 100.0;
         }
 
-        // BƯỚC 4: sort giảm dần, giữ top 2000 (giống add_high_q_state).
+        // BƯỚC 3: sort giảm dần, giữ top 2000
         self.max_score_states.sort_by(|a, b| {
             b.q_value
                 .partial_cmp(&a.q_value)
@@ -986,23 +985,31 @@ impl AlphaZeroPipeline {
             for t in (0..total_steps).rev() {
                 let (obs, pi, r) = raw_steps[i][t].clone();
                 g = r + mcts_cfg.gamma * g;
-                samples.push(AlphaZeroSample {
-                    obs,
-                    target_pi: pi,
-                    target_val: g,
-                });
 
-                // Thu thập board state có Q-value cao (điểm hiện tại + tiềm năng tương lai).
+                // Thu thập board state có Q-value cao đánh giá trực tiếp qua Model Value Head V_model (tiềm năng thế trận).
                 // Chỉ giữ khi còn >= 10 tile chưa đặt.
                 let off = hist_offset[i];
                 if t < move_records[i].len() - off {
                     let real = off + t;
                     let m = &move_records[i][real];
                     if m.remaining_tiles >= 10 {
-                        let q = m.total_score as f32 + g * 100.0;
+                        let (_, v_pred) = self.model.forward(
+                            &obs.node_positions,
+                            &obs.node_features,
+                            &obs.edge_index,
+                            &obs.valid_actions,
+                            &obs.action_features,
+                        );
+                        let q = m.total_score as f32 + v_pred * 100.0;
                         self.add_high_q_state(q, m.remaining_tiles, &move_records[i][..=real]);
                     }
                 }
+
+                samples.push(AlphaZeroSample {
+                    obs,
+                    target_pi: pi,
+                    target_val: g,
+                });
             }
             samples.reverse();
             self.last_new_samples += self.replay_buffer.push_batch(samples);

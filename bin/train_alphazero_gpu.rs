@@ -356,12 +356,12 @@ fn main() {
             exec.sync_weights(&pipeline.model);
         }
 
-        // A.5. Refresh Q-value của toàn bộ max-score states bằng MCTS 800 sim (song song batch)
+        // A.5. Refresh Q-value của toàn bộ max-score states bằng Model Value Head (V_model) trực tiếp
         let refresh_start = Instant::now();
-        let n_refreshed = pipeline.refresh_max_score_state_q_values(gpu_executor.as_ref(), 800);
+        let n_refreshed = pipeline.refresh_max_score_state_q_values(gpu_executor.as_ref(), 0);
         let refresh_dur = refresh_start.elapsed();
         println!(
-            "[Refresh Q] Cập nhật Q-value {}/{} states với 800 sim trong {:.2}s",
+            "[Refresh Q] Cập nhật Q-value {}/{} states qua Model Value Head trong {:.2}s",
             n_refreshed,
             pipeline.max_score_states.len(),
             refresh_dur.as_secs_f32()
