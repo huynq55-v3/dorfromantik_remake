@@ -627,30 +627,21 @@ async fn main() {
                     println!(">>> FINISHED EXPERT GAME: {} POINTS (Placed {} tiles) <<<", env.score_manager.total_score, env.placed_count);
                     let start_eval_idx = (*record_start_idx).min(move_history.len());
                     let total_eval_steps = move_history.len().saturating_sub(start_eval_idx);
-                    println!("Accurately replaying and evaluating {} human moves (from Move #{} to #{}) into `{}`...", 
-                        total_eval_steps, start_eval_idx + 1, move_history.len(), human_expert_states_path);
+                    println!("Evaluating {} states with HexGNN Model Value Head (V_model) into `{}`...", 
+                        total_eval_steps, human_expert_states_path);
                     println!("=======================================================");
 
-                    // 1. Replay cleanly from seed to extract 100% exact rewards for all steps in the final history
+                    // 1. Replay cleanly from seed to extract exact GraphObservation for each step
                     let mut replay_env = DorfromantikEnv::new(seed, initial_stack, tile_limit);
-                    let mut all_rewards: Vec<f32> = Vec::with_capacity(move_history.len());
+                    let mut all_obs: Vec<GraphObservation> = Vec::with_capacity(move_history.len());
 
                     for m in move_history.iter() {
-                        let prev_sc = replay_env.score_manager.total_score;
-                        let res = replay_env.step(Action { q: m.q, r: m.r, rotation: m.rotation });
-                        let _gained = replay_env.score_manager.total_score.saturating_sub(prev_sc);
-                        all_rewards.push(res.reward * 0.01);
+                        let obs = replay_env.extract_graph_observation();
+                        all_obs.push(obs);
+                        replay_env.step(Action { q: m.q, r: m.r, rotation: m.rotation });
                     }
 
-                    // 2. Compute Discounted Return G for moves from start_eval_idx to end
-                    let mut g_vals = vec![0.0f32; move_history.len()];
-                    let mut running_g = 0.0f32;
-                    for t in (0..move_history.len()).rev() {
-                        running_g = all_rewards[t] + 0.995 * running_g;
-                        g_vals[t] = running_g;
-                    }
-
-                    // 3. Nạp danh sách human_expert_states.json hiện tại (tối đa 1000 states)
+                    // 2. Nạp danh sách human_expert_states.json hiện tại (tối đa 1000 states)
                     let mut human_pipeline_states: Vec<MaxScoreStateRecord> = Vec::new();
                     if Path::new(human_expert_states_path).exists() {
                         if let Ok(content) = fs::read_to_string(human_expert_states_path) {
@@ -673,12 +664,21 @@ async fn main() {
                     for real_idx in start_eval_idx..move_history.len() {
                         let m = &move_history[real_idx];
                         if m.remaining_tiles >= 10 {
-                            let q = m.total_score as f32 + g_vals[real_idx] * 100.0;
+                            let obs = &all_obs[real_idx];
+                            // Forward trực tiếp qua HexGNN Model để lấy V_model(s)
+                            let (_, v_pred) = model.forward(
+                                &obs.node_positions,
+                                &obs.node_features,
+                                &obs.edge_index,
+                                &obs.valid_actions,
+                                &obs.action_features,
+                            );
+                            let q = m.total_score as f32 + v_pred * 100.0;
                             pipeline.add_high_q_state(q, m.remaining_tiles, &move_history[..=real_idx]);
                             
                             println!(
-                                "   [State Accepted] Move #{:02} | Pos: ({:2}, {:2}) | Score: {:4} | Stack: {:2} | Q-Value: {:6.1} -> QUALIFIED!",
-                                real_idx + 1, m.q, m.r, m.total_score, m.remaining_tiles, q
+                                "   [State Accepted] Move #{:02} | Pos: ({:2}, {:2}) | Score: {:4} | Stack: {:2} | V_model: {:+5.2} | Q-Value: {:6.1} -> QUALIFIED!",
+                                real_idx + 1, m.q, m.r, m.total_score, m.remaining_tiles, v_pred, q
                             );
                             qualified += 1;
                         } else {
@@ -697,7 +697,7 @@ async fn main() {
 
                     if let Ok(json) = serde_json::to_string_pretty(&pipeline.max_score_states) {
                         let _ = fs::write(human_expert_states_path, json);
-                        println!("\n✅ SAVED {} HUMAN EXPERT STATES (Top 1000) TO `{}`!", pipeline.max_score_states.len(), human_expert_states_path);
+                        println!("\n✅ SAVED {} HUMAN EXPERT STATES (Top 1000 by V_model) TO `{}`!", pipeline.max_score_states.len(), human_expert_states_path);
                     }
 
                     next_app_state = Some(AppState::GameOver {
