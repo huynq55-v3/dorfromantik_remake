@@ -57,6 +57,7 @@ pub struct StepResult {
     pub total_score: usize,
     pub placed_count: usize,
     pub stack_height: usize,
+    pub breakdown: crate::score_manager::PlacementScoreBreakdown,
 }
 
 /// Trạng thái Đồ thị cho GNN Feature Extraction
@@ -230,6 +231,7 @@ impl DorfromantikEnv {
                 total_score: self.score_manager.total_score,
                 placed_count: self.placed_count,
                 stack_height: self.score_manager.remaining_tiles,
+                breakdown: crate::score_manager::PlacementScoreBreakdown::default(),
             };
         };
 
@@ -249,6 +251,7 @@ impl DorfromantikEnv {
                 total_score: self.score_manager.total_score,
                 placed_count: self.placed_count,
                 stack_height: self.score_manager.remaining_tiles,
+                breakdown: crate::score_manager::PlacementScoreBreakdown::default(),
             };
         }
 
@@ -256,7 +259,7 @@ impl DorfromantikEnv {
 
         let prev_remaining = self.score_manager.remaining_tiles;
         // Cập nhật điểm số và số lượng tile trong stack qua ScoreManager
-        let _breakdown = self.score_manager.on_tile_placed(
+        let breakdown = self.score_manager.on_tile_placed(
             &self.board,
             action.q,
             action.r,
@@ -313,6 +316,7 @@ impl DorfromantikEnv {
             total_score: self.score_manager.total_score,
             placed_count: self.placed_count,
             stack_height: self.score_manager.remaining_tiles,
+            breakdown,
         }
     }
 

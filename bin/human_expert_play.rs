@@ -575,24 +575,27 @@ async fn main() {
 
                     let place_screen_pos = (hovered_hex.to_screen(HEX_RADIUS) - camera_pos) * zoom + center_vec;
 
-                    // Add Toast
-                    if gained > 100 {
+                    // Add Toast based on exact breakdown
+                    if res.breakdown.bubble_quests_completed > 0 || res.breakdown.flag_quests_completed > 0 {
+                        let q_score = res.breakdown.bubble_quest_score + res.breakdown.flag_quest_score;
                         floating_toasts.push(FloatingToast {
-                            text: format!("+{} QUEST COMPLETED!", gained),
+                            text: format!("+{} QUEST COMPLETED!", q_score),
                             pos: place_screen_pos + Vec2::new(0.0, -25.0),
                             color: Color::from_rgba(80, 240, 120, 255),
                             timer: 2.2,
                         });
-                    } else if gained >= 60 {
+                    }
+                    if res.breakdown.perfect_count > 0 {
                         floating_toasts.push(FloatingToast {
-                            text: format!("+{} PERFECT!", gained),
-                            pos: place_screen_pos + Vec2::new(0.0, -35.0),
+                            text: format!("+{} PERFECT!", res.breakdown.perfect_score),
+                            pos: place_screen_pos + Vec2::new(0.0, -45.0),
                             color: GOLD,
-                            timer: 2.0,
+                            timer: 2.2,
                         });
-                    } else if gained > 0 {
+                    }
+                    if res.breakdown.fit_score > 0 && res.breakdown.perfect_count == 0 && res.breakdown.bubble_quests_completed == 0 && res.breakdown.flag_quests_completed == 0 {
                         floating_toasts.push(FloatingToast {
-                            text: format!("+{} Fit", gained),
+                            text: format!("+{} Fit", res.breakdown.fit_score),
                             pos: place_screen_pos,
                             color: WHITE,
                             timer: 1.5,
