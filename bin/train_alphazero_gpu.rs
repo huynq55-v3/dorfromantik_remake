@@ -433,6 +433,17 @@ fn main() {
             }
         }
 
+        // Tự động load lại và merge với human_expert_states.json nếu có file mới được người chơi tạo ra
+        if Path::new(&human_states_path).exists() {
+            if let Ok(content) = fs::read_to_string(&human_states_path) {
+                if let Ok(human_states) = serde_json::from_str::<Vec<MaxScoreStateRecord>>(&content) {
+                    for h_st in human_states {
+                        pipeline.add_high_q_state(h_st.q_value, h_st.remaining_tiles, &h_st.moves);
+                    }
+                }
+            }
+        }
+
         // Ghi metadata file (iteration, kỷ lục)
         let meta_content = format!(
             "iteration={}\nall_time_best_match_score={}\n",
