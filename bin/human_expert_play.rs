@@ -689,6 +689,9 @@ async fn main() {
                         }
                     }
 
+                    // Refresh toàn bộ các state cũ trong human_expert_states với weights của Model mới nhất
+                    pipeline.refresh_max_score_state_q_values(None, 0);
+
                     // Cắt lấy đúng top 1000 states của Human Expert
                     pipeline.max_score_states.sort_unstable_by(|a, b| b.q_value.partial_cmp(&a.q_value).unwrap_or(std::cmp::Ordering::Equal));
                     if pipeline.max_score_states.len() > 1000 {
@@ -697,7 +700,7 @@ async fn main() {
 
                     if let Ok(json) = serde_json::to_string_pretty(&pipeline.max_score_states) {
                         let _ = fs::write(human_expert_states_path, json);
-                        println!("\n✅ SAVED {} HUMAN EXPERT STATES (Top 1000 by V_model) TO `{}`!", pipeline.max_score_states.len(), human_expert_states_path);
+                        println!("\n✅ REFRESHED & SAVED {} HUMAN EXPERT STATES (Top 1000 by latest V_model) TO `{}`!", pipeline.max_score_states.len(), human_expert_states_path);
                     }
 
                     next_app_state = Some(AppState::GameOver {

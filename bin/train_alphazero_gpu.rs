@@ -356,6 +356,17 @@ fn main() {
             exec.sync_weights(&pipeline.model);
         }
 
+        // Tự động load và gộp human_expert_states.json vào pool trước khi Refresh Q
+        if Path::new(&human_states_path).exists() {
+            if let Ok(content) = fs::read_to_string(&human_states_path) {
+                if let Ok(human_states) = serde_json::from_str::<Vec<MaxScoreStateRecord>>(&content) {
+                    for h_st in human_states {
+                        pipeline.add_high_q_state(h_st.q_value, h_st.remaining_tiles, &h_st.moves);
+                    }
+                }
+            }
+        }
+
         // A.5. Refresh Q-value của toàn bộ max-score states bằng Model Value Head (V_model) trực tiếp
         let refresh_start = Instant::now();
         let n_refreshed = pipeline.refresh_max_score_state_q_values(gpu_executor.as_ref(), 0);
@@ -430,17 +441,6 @@ fn main() {
         if let Ok(json_str) = serde_json::to_string_pretty(&pipeline.max_score_states) {
             if let Err(e) = fs::write(&max_score_states_path, json_str) {
                 println!("[Save Error] Không thể lưu max_score_states: {:?}", e);
-            }
-        }
-
-        // Tự động load lại và merge với human_expert_states.json nếu có file mới được người chơi tạo ra
-        if Path::new(&human_states_path).exists() {
-            if let Ok(content) = fs::read_to_string(&human_states_path) {
-                if let Ok(human_states) = serde_json::from_str::<Vec<MaxScoreStateRecord>>(&content) {
-                    for h_st in human_states {
-                        pipeline.add_high_q_state(h_st.q_value, h_st.remaining_tiles, &h_st.moves);
-                    }
-                }
             }
         }
 
