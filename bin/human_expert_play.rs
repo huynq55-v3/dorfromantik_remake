@@ -84,6 +84,7 @@ enum AppState {
     Playing {
         env: DorfromantikEnv,
         move_history: Vec<GameMoveRecord>,
+        redo_history: Vec<GameMoveRecord>,
         raw_steps: Vec<(GraphObservation, f32)>, // obs, reward
         is_recording: bool,
         record_start_idx: usize,
@@ -192,6 +193,7 @@ async fn main() {
                     next_app_state = Some(AppState::Playing {
                         env,
                         move_history: Vec::new(),
+                        redo_history: Vec::new(),
                         raw_steps: Vec::new(),
                         is_recording: true,
                         record_start_idx: 0,
@@ -230,6 +232,7 @@ async fn main() {
                     next_app_state = Some(AppState::Playing {
                         env,
                         move_history: replay_history,
+                        redo_history: Vec::new(),
                         raw_steps: Vec::new(),
                         is_recording: true,
                         record_start_idx: st.moves.len(),
@@ -237,7 +240,7 @@ async fn main() {
                 }
             }
 
-            AppState::Playing { env, move_history, raw_steps, is_recording, record_start_idx } => {
+            AppState::Playing { env, move_history, redo_history, raw_steps, is_recording, record_start_idx } => {
                 // Toggle Record [T]
                 if is_key_pressed(KeyCode::T) {
                     *is_recording = !*is_recording;
@@ -251,8 +254,9 @@ async fn main() {
                 }
 
                 // Handle Undo [U] / [Z]
-                if (is_key_pressed(KeyCode::U) || is_key_pressed(KeyCode::Z)) && !move_history.is_empty() {
-                    move_history.pop();
+                if (is_key_pressed(KeyCode::U) || (is_key_down(KeyCode::LeftControl) && is_key_pressed(KeyCode::Z)) || is_key_pressed(KeyCode::Z)) && !move_history.is_empty() {
+                    let popped = move_history.pop().unwrap();
+                    redo_history.push(popped);
                     if !raw_steps.is_empty() {
                         raw_steps.pop();
                     }
@@ -281,7 +285,32 @@ async fn main() {
                     if *record_start_idx > move_history.len() {
                         *record_start_idx = move_history.len();
                     }
-                    println!("↩️ [UNDO] Reverted 1 move! Placed = {}, Score = {}", env.placed_count, env.score_manager.total_score);
+                    println!("↩️ [UNDO] Reverted 1 move! Placed = {}, Score = {} (Redo stack: {})", env.placed_count, env.score_manager.total_score, redo_history.len());
+                }
+
+                // Handle Redo [Y] / [Ctrl+Y]
+                let is_redo_key = is_key_pressed(KeyCode::Y) || (is_key_down(KeyCode::LeftControl) && is_key_pressed(KeyCode::Y)) || (is_key_down(KeyCode::LeftControl) && is_key_down(KeyCode::LeftShift) && is_key_pressed(KeyCode::Z));
+                if is_redo_key && !redo_history.is_empty() {
+                    let next_m = redo_history.pop().unwrap();
+                    let obs = env.extract_graph_observation();
+                    let prev_sc = env.score_manager.total_score;
+                    let act = Action { q: next_m.q, r: next_m.r, rotation: next_m.rotation };
+                    let res = env.step(act);
+                    let gained = env.score_manager.total_score.saturating_sub(prev_sc);
+
+                    move_history.push(GameMoveRecord {
+                        step: move_history.len(),
+                        q: act.q,
+                        r: act.r,
+                        rotation: act.rotation,
+                        score_gained: gained,
+                        total_score: env.score_manager.total_score,
+                        remaining_tiles: env.score_manager.remaining_tiles,
+                    });
+                    if *is_recording {
+                        raw_steps.push((obs, res.reward * 0.01));
+                    }
+                    println!("↪️ [REDO] Re-applied move #{:02} ({}, {}) rot:{} -> Score: {}", move_history.len(), act.q, act.r, act.rotation, env.score_manager.total_score);
                 }
 
                 // Camera Dragging Controls (LMB / RMB / MMB drag on empty space or anywhere)
@@ -295,35 +324,11 @@ async fn main() {
                 if is_key_down(KeyCode::A) || is_key_down(KeyCode::Left) { camera_pos.x -= speed * delta; }
                 if is_key_down(KeyCode::D) || is_key_down(KeyCode::Right) { camera_pos.x += speed * delta; }
 
-                // Mouse Wheel: Zoom in / Zoom out smoothly
-                let wheel = mouse_wheel().1;
-                if wheel > 0.0 { zoom *= 1.12; }
-                if wheel < 0.0 { zoom *= 0.88; }
                 if is_key_pressed(KeyCode::Equal) || is_key_pressed(KeyCode::Key1) { zoom *= 1.15; }
                 if is_key_pressed(KeyCode::Minus) || is_key_pressed(KeyCode::Key2) { zoom *= 0.85; }
                 if is_key_pressed(KeyCode::C) || is_key_pressed(KeyCode::Home) {
                     camera_pos = Vec2::ZERO;
                     zoom = 1.0;
-                }
-                zoom = zoom.clamp(0.15, 4.0);
-
-                // Rotate Tile: Right Click, Space, or Key R
-                let rmb_clicked = is_mouse_button_released(MouseButton::Right) && total_drag_dist <= 6.0;
-                if rmb_clicked || is_mouse_button_pressed(MouseButton::Middle) || is_key_pressed(KeyCode::R) || is_key_pressed(KeyCode::Space) {
-                    if let Some(curr) = env.current_tile() {
-                        let hex = screen_to_hex((Vec2::new(current_mouse_pos.0, current_mouse_pos.1) - Vec2::new(screen_w * 0.5, screen_h * 0.5)) / zoom + camera_pos, HEX_RADIUS);
-                        current_rotation = env.board.get_next_valid_rotation(hex.q, hex.r, curr, current_rotation, true);
-                    } else {
-                        current_rotation = (current_rotation + 1) % 6;
-                    }
-                }
-                if is_key_pressed(KeyCode::Q) {
-                    if let Some(curr) = env.current_tile() {
-                        let hex = screen_to_hex((Vec2::new(current_mouse_pos.0, current_mouse_pos.1) - Vec2::new(screen_w * 0.5, screen_h * 0.5)) / zoom + camera_pos, HEX_RADIUS);
-                        current_rotation = env.board.get_next_valid_rotation(hex.q, hex.r, curr, current_rotation, false);
-                    } else {
-                        current_rotation = (current_rotation + 5) % 6;
-                    }
                 }
 
                 let center_vec = Vec2::new(screen_w * 0.5, screen_h * 0.5);
@@ -331,8 +336,52 @@ async fn main() {
                 let mouse_world = (mouse_vec - center_vec) / zoom + camera_pos;
                 let hovered_hex = screen_to_hex(mouse_world, HEX_RADIUS);
 
-                // Auto-snap rotation to valid slot
                 let active_tile_opt = env.current_tile();
+                let is_hovering_slot = if let Some(curr) = active_tile_opt {
+                    let available_slots = env.board.get_available_placement_slots(curr);
+                    available_slots.iter().any(|&((sq, sr), _)| sq == hovered_hex.q && sr == hovered_hex.r)
+                } else {
+                    false
+                };
+
+                // Mouse Wheel Behavior:
+                // If hovering over a valid/available candidate placement slot -> Rotate Tile!
+                // If hovering over empty background / elsewhere -> Zoom In / Zoom Out!
+                let wheel = mouse_wheel().1;
+                if wheel != 0.0 {
+                    if is_hovering_slot {
+                        if let Some(curr) = env.current_tile() {
+                            let forward = wheel < 0.0;
+                            current_rotation = env.board.get_next_valid_rotation(hovered_hex.q, hovered_hex.r, curr, current_rotation, forward);
+                        } else {
+                            if wheel < 0.0 { current_rotation = (current_rotation + 1) % 6; }
+                            else { current_rotation = (current_rotation + 5) % 6; }
+                        }
+                    } else {
+                        if wheel > 0.0 { zoom *= 1.12; }
+                        if wheel < 0.0 { zoom *= 0.88; }
+                    }
+                }
+                zoom = zoom.clamp(0.15, 4.0);
+
+                // Rotate Tile: Right Click, Space, or Key R
+                let rmb_clicked = is_mouse_button_released(MouseButton::Right) && total_drag_dist <= 6.0;
+                if rmb_clicked || is_mouse_button_pressed(MouseButton::Middle) || is_key_pressed(KeyCode::R) || is_key_pressed(KeyCode::Space) {
+                    if let Some(curr) = env.current_tile() {
+                        current_rotation = env.board.get_next_valid_rotation(hovered_hex.q, hovered_hex.r, curr, current_rotation, true);
+                    } else {
+                        current_rotation = (current_rotation + 1) % 6;
+                    }
+                }
+                if is_key_pressed(KeyCode::Q) {
+                    if let Some(curr) = env.current_tile() {
+                        current_rotation = env.board.get_next_valid_rotation(hovered_hex.q, hovered_hex.r, curr, current_rotation, false);
+                    } else {
+                        current_rotation = (current_rotation + 5) % 6;
+                    }
+                }
+
+                // Auto-snap rotation to valid slot
                 if let Some(curr) = active_tile_opt {
                     if !env.board.can_place_tile(hovered_hex.q, hovered_hex.r, curr, current_rotation) {
                         let valid_rots: Vec<usize> = (0..6)
@@ -499,8 +548,8 @@ async fn main() {
                 }
 
                 // ── Bottom Navigation HUD ──
-                let bottom_hud = "LMB: Place | Drag (LMB/RMB): Pan Map | Wheel: Zoom In/Out | RMB / Space / R: Rotate | U/Z: Undo | T: Rec | ESC: Finish";
-                draw_text(bottom_hud, 20.0, screen_h - 15.0, 15.0, LIGHTGRAY);
+                let bottom_hud = "LMB: Place | Drag: Pan | Hover Slot + Wheel: Rotate | Space/RMB/R: Rotate | U/Z: Undo | Y: Redo | T: Rec | ESC: Finish";
+                draw_text(bottom_hud, 20.0, screen_h - 15.0, 14.5, LIGHTGRAY);
 
                 // Handle Place Tile
                 let lmb_clicked = is_mouse_button_released(MouseButton::Left) && total_drag_dist <= 6.0 && current_mouse_pos.1 > 40.0 && current_mouse_pos.0 < panel_x;
