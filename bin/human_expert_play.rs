@@ -101,6 +101,7 @@ enum AppState {
 async fn main() {
     let (seed, initial_stack, tile_limit) = load_game_config();
     let max_score_states_path = "models/max_score_states.json";
+    let human_expert_states_path = "models/human_expert_states.json";
     let model_path = if Path::new("models/alphazero_best.bin").exists() {
         "models/alphazero_best.bin"
     } else {
@@ -120,11 +121,23 @@ async fn main() {
     if Path::new(max_score_states_path).exists() {
         if let Ok(content) = fs::read_to_string(max_score_states_path) {
             if let Ok(st) = serde_json::from_str::<Vec<MaxScoreStateRecord>>(&content) {
-                states_list = st;
+                states_list.extend(st);
             }
         }
     }
-    println!(">>> Loaded {} max-score states from `{}` <<<", states_list.len(), max_score_states_path);
+    if Path::new(human_expert_states_path).exists() {
+        if let Ok(content) = fs::read_to_string(human_expert_states_path) {
+            if let Ok(st) = serde_json::from_str::<Vec<MaxScoreStateRecord>>(&content) {
+                println!(">>> Loaded {} human expert states from `{}` <<<", st.len(), human_expert_states_path);
+                states_list.extend(st);
+            }
+        }
+    }
+    states_list.sort_unstable_by(|a, b| b.q_value.partial_cmp(&a.q_value).unwrap_or(std::cmp::Ordering::Equal));
+    if states_list.len() > 2000 {
+        states_list.truncate(2000);
+    }
+    println!(">>> Active Combined Pool: {} max-score states (AI + Human, Top 2000) <<<", states_list.len());
 
     let mut app_state = AppState::SelectMode;
     let mut camera_pos = Vec2::ZERO;
@@ -612,15 +625,39 @@ async fn main() {
                 if env.is_game_over() || is_key_pressed(KeyCode::Escape) {
                     println!("\n=======================================================");
                     println!(">>> FINISHED EXPERT GAME: {} POINTS (Placed {} tiles) <<<", env.score_manager.total_score, env.placed_count);
-                    println!("Evaluating with HexGNN from Record index #{} into `{}`...", *record_start_idx + 1, max_score_states_path);
+                    let start_eval_idx = (*record_start_idx).min(move_history.len());
+                    let total_eval_steps = move_history.len().saturating_sub(start_eval_idx);
+                    println!("Accurately replaying and evaluating {} human moves (from Move #{} to #{}) into `{}`...", 
+                        total_eval_steps, start_eval_idx + 1, move_history.len(), human_expert_states_path);
                     println!("=======================================================");
 
-                    let total_steps = raw_steps.len();
-                    let mut g_vals = vec![0.0f32; total_steps];
+                    // 1. Replay cleanly from seed to extract 100% exact rewards for all steps in the final history
+                    let mut replay_env = DorfromantikEnv::new(seed, initial_stack, tile_limit);
+                    let mut all_rewards: Vec<f32> = Vec::with_capacity(move_history.len());
+
+                    for m in move_history.iter() {
+                        let prev_sc = replay_env.score_manager.total_score;
+                        let res = replay_env.step(Action { q: m.q, r: m.r, rotation: m.rotation });
+                        let _gained = replay_env.score_manager.total_score.saturating_sub(prev_sc);
+                        all_rewards.push(res.reward * 0.01);
+                    }
+
+                    // 2. Compute Discounted Return G for moves from start_eval_idx to end
+                    let mut g_vals = vec![0.0f32; move_history.len()];
                     let mut running_g = 0.0f32;
-                    for t in (0..total_steps).rev() {
-                        running_g = raw_steps[t].1 + 0.995 * running_g;
+                    for t in (0..move_history.len()).rev() {
+                        running_g = all_rewards[t] + 0.995 * running_g;
                         g_vals[t] = running_g;
+                    }
+
+                    // 3. Nạp danh sách human_expert_states.json hiện tại (tối đa 1000 states)
+                    let mut human_pipeline_states: Vec<MaxScoreStateRecord> = Vec::new();
+                    if Path::new(human_expert_states_path).exists() {
+                        if let Ok(content) = fs::read_to_string(human_expert_states_path) {
+                            if let Ok(st) = serde_json::from_str::<Vec<MaxScoreStateRecord>>(&content) {
+                                human_pipeline_states = st;
+                            }
+                        }
                     }
 
                     let config = AlphaZeroTrainerConfig {
@@ -630,40 +667,43 @@ async fn main() {
                         replay_buffer_capacity: Some(200_000),
                     };
                     let mut pipeline = AlphaZeroPipeline::new(config);
-                    pipeline.max_score_states = states_list.clone();
+                    pipeline.max_score_states = human_pipeline_states;
 
                     let mut qualified = 0usize;
-                    for t in 0..total_steps {
-                        let real_idx = *record_start_idx + t;
-                        if real_idx < move_history.len() {
-                            let m = &move_history[real_idx];
-                            if m.remaining_tiles >= 10 {
-                                let q = m.total_score as f32 + g_vals[t] * 100.0;
-                                pipeline.add_high_q_state(q, m.remaining_tiles, &move_history[..=real_idx]);
-                                
-                                println!(
-                                    "   [State Accepted] Move #{:02} | Pos: ({:2}, {:2}) | Score: {:4} | Stack: {:2} | Q-Value: {:6.1} -> QUALIFIED!",
-                                    real_idx + 1, m.q, m.r, m.total_score, m.remaining_tiles, q
-                                );
-                                qualified += 1;
-                            } else {
-                                println!(
-                                    "   [State Skipped]  Move #{:02} | Score: {:4} | Stack: {:2} (< 10 tiles)",
-                                    real_idx + 1, m.total_score, m.remaining_tiles
-                                );
-                            }
+                    for real_idx in start_eval_idx..move_history.len() {
+                        let m = &move_history[real_idx];
+                        if m.remaining_tiles >= 10 {
+                            let q = m.total_score as f32 + g_vals[real_idx] * 100.0;
+                            pipeline.add_high_q_state(q, m.remaining_tiles, &move_history[..=real_idx]);
+                            
+                            println!(
+                                "   [State Accepted] Move #{:02} | Pos: ({:2}, {:2}) | Score: {:4} | Stack: {:2} | Q-Value: {:6.1} -> QUALIFIED!",
+                                real_idx + 1, m.q, m.r, m.total_score, m.remaining_tiles, q
+                            );
+                            qualified += 1;
+                        } else {
+                            println!(
+                                "   [State Skipped]  Move #{:02} | Score: {:4} | Stack: {:2} (< 10 tiles)",
+                                real_idx + 1, m.total_score, m.remaining_tiles
+                            );
                         }
                     }
 
+                    // Cắt lấy đúng top 1000 states của Human Expert
+                    pipeline.max_score_states.sort_unstable_by(|a, b| b.q_value.partial_cmp(&a.q_value).unwrap_or(std::cmp::Ordering::Equal));
+                    if pipeline.max_score_states.len() > 1000 {
+                        pipeline.max_score_states.truncate(1000);
+                    }
+
                     if let Ok(json) = serde_json::to_string_pretty(&pipeline.max_score_states) {
-                        let _ = fs::write(max_score_states_path, json);
-                        println!("\n✅ SAVED {} MAX-SCORE STATES TO `{}`!", pipeline.max_score_states.len(), max_score_states_path);
+                        let _ = fs::write(human_expert_states_path, json);
+                        println!("\n✅ SAVED {} HUMAN EXPERT STATES (Top 1000) TO `{}`!", pipeline.max_score_states.len(), human_expert_states_path);
                     }
 
                     next_app_state = Some(AppState::GameOver {
                         final_score: env.score_manager.total_score,
                         final_placed: env.placed_count,
-                        evaluated_states_count: total_steps,
+                        evaluated_states_count: total_eval_steps,
                         qualified_states_count: qualified,
                     });
                 }

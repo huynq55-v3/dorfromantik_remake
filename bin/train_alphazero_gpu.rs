@@ -223,17 +223,37 @@ fn main() {
         }
     }
 
-    // 3.5. Khôi phục danh sách max-score states (để khởi động lại 20% envs từ vị thế tốt)
+    // 3.5. Khôi phục và gộp danh sách max-score states (AI: max 2000, Human: max 1000 -> lấy top 2000)
+    let human_states_path = format!("{}/human_expert_states.json", model_dir);
+    let mut combined_states: Vec<MaxScoreStateRecord> = Vec::new();
+
     if Path::new(&max_score_states_path).exists() {
         if let Ok(content) = fs::read_to_string(&max_score_states_path) {
             if let Ok(states) = serde_json::from_str::<Vec<MaxScoreStateRecord>>(&content) {
-                pipeline.max_score_states = states;
-                println!(
-                    "[MaxScoreStates] Đã khôi phục {} state max-score từ `{}`.",
-                    pipeline.max_score_states.len(), max_score_states_path
-                );
+                combined_states.extend(states);
             }
         }
+    }
+    if Path::new(&human_states_path).exists() {
+        if let Ok(content) = fs::read_to_string(&human_states_path) {
+            if let Ok(states) = serde_json::from_str::<Vec<MaxScoreStateRecord>>(&content) {
+                println!("[HumanExpertStates] Đã tìm thấy {} states do con người chơi từ `{}`.", states.len(), human_states_path);
+                combined_states.extend(states);
+            }
+        }
+    }
+
+    if !combined_states.is_empty() {
+        // Sắp xếp giảm dần theo Q-value và lấy top 2000
+        combined_states.sort_unstable_by(|a, b| b.q_value.partial_cmp(&a.q_value).unwrap_or(std::cmp::Ordering::Equal));
+        if combined_states.len() > 2000 {
+            combined_states.truncate(2000);
+        }
+        pipeline.max_score_states = combined_states;
+        println!(
+            "[MaxScoreStates] Đã nạp và gộp top {} states xuất phát cho 80% envs (AI + Human).",
+            pipeline.max_score_states.len()
+        );
     }
 
     // 4. Khôi phục Replay Buffer nếu có
