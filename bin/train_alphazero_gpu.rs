@@ -251,7 +251,7 @@ fn main() {
         }
         pipeline.max_score_states = combined_states;
         println!(
-            "[MaxScoreStates] Đã nạp và gộp top {} states xuất phát cho 80% envs (AI + Human).",
+            "[MaxScoreStates] Đã nạp và gộp top {} states xuất phát cho 50% envs (AI + Human).",
             pipeline.max_score_states.len()
         );
     }

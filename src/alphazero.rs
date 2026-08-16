@@ -810,7 +810,7 @@ impl AlphaZeroPipeline {
         let mcts_cfg = self.config.mcts_config.clone();
         let mcts = MCTSSearch::new(mcts_cfg.clone());
 
-        // Xác định trước 80% envs sẽ khởi động từ board state max-score (nếu có sẵn).
+        // Xác định trước 50% envs sẽ khởi động từ board state max-score (nếu có sẵn), 50% từ Turn 0.
         let mut envs: Vec<DorfromantikEnv> = Vec::with_capacity(n_envs);
         let mut from_state = vec![false; n_envs];
         let mut move_counts = vec![0usize; n_envs];
@@ -820,7 +820,7 @@ impl AlphaZeroPipeline {
         let mut env_source_moves: Vec<Vec<GameMoveRecord>> = vec![Vec::new(); n_envs];
         if !self.max_score_states.is_empty() {
             let mut rng = rand::thread_rng();
-            let count = ((n_envs as f32) * 0.80) as usize;
+            let count = ((n_envs as f32) * 0.50) as usize;
             let mut all_indices: Vec<usize> = (0..n_envs).collect();
             all_indices.shuffle(&mut rng);
             for &idx in &all_indices[..count] {
