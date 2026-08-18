@@ -83,43 +83,42 @@ fn main() {
     }
 
     let (target_seed, initial_stack, tile_limit) = load_monthly_game_config();
-    let parallel_envs = 512;
-
-    // Đọc số simulations từ tham số dòng lệnh nếu có (mặc định 400)
     let args: Vec<String> = std::env::args().collect();
-    let n_simulations = if args.len() > 1 {
-        args[1].parse::<usize>().unwrap_or(400)
-    } else {
-        400
-    };
 
-    // Đọc dung lượng replay buffer từ tham số dòng lệnh thứ 2 (optional).
-    // None => tự động tính theo công thức mặc định (envs * tile_limit * 5, tối thiểu 250k).
-    // Giá trị truyền vào phải > 0; nếu không hợp lệ sẽ tự fallback về None.
-    let replay_buffer_capacity = args
+    // 1. Số môi trường song song (parallel_envs) - Mặc định 512
+    let parallel_envs = args
+        .get(1)
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(512);
+
+    // 2. Số MCTS simulations / turn - Mặc định 400
+    let n_simulations = args
         .get(2)
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(400);
+
+    // 3. Dung lượng Replay Buffer (optional, mặc định None -> 200k/300k)
+    let replay_buffer_capacity = args
+        .get(3)
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&c| c > 0);
 
-    // Đọc iteration tối đa (iter_max) từ tham số dòng lệnh thứ 3 (optional).
-    // Mặc định usize::MAX => chạy gần như không giới hạn (không được truyền iter_max).
-    let iter_max = args
-        .get(3)
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(usize::MAX);
-
-    // Đọc số train epochs mỗi iteration từ tham số dòng lệnh thứ 4 (optional).
-    // Mặc định 4. Giá trị phải > 0; nếu không hợp lệ sẽ fallback về 4.
+    // 4. Số train epochs mỗi iteration (mặc định 5)
     let train_epochs = args
         .get(4)
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&e| e > 0)
-        .unwrap_or(4);
+        .unwrap_or(5);
 
-    // Cờ bật quyết định exploration theo entropy TRONG TỪNG TURN (tự tin → explore, bối rối → exploit).
-    // Mặc định 1 (BẬT). Truyền 0 để tắt.
-    let explore_by_entropy = args
+    // 5. Iteration tối đa (iter_max, mặc định usize::MAX)
+    let iter_max = args
         .get(5)
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(usize::MAX);
+
+    // 6. Cờ bật exploration theo entropy (mặc định 1 - BẬT)
+    let explore_by_entropy = args
+        .get(6)
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(1)
         != 0;
