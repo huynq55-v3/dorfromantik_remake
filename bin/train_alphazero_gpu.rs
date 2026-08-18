@@ -2,6 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
+use rayon::prelude::*;
 use dorfromantik_remake::alphazero::{
     AlphaZeroPipeline, AlphaZeroTrainerConfig, GameMatchRecord, MaxScoreStateRecord,
 };
@@ -67,6 +68,111 @@ fn find_latest_iter_model(model_dir: &str) -> Option<(usize, String)> {
     }
 
     best_path.map(|p| (max_iter, p))
+}
+fn fast_train_step(pipeline: &mut AlphaZeroPipeline) -> (f32, f32, f32) {
+    let buf_len = pipeline.replay_buffer.len();
+    let warmup_threshold = (pipeline.replay_buffer.capacity as f32 * 0.20) as usize;
+    if buf_len < warmup_threshold {
+        println!(
+            "[Train GPU] Warm-up: buffer {}/{} sample (cần ≥ {}) — chưa train, tiếp tục self-play tích lũy.",
+            buf_len, pipeline.replay_buffer.capacity, warmup_threshold
+        );
+        return (0.0, 0.0, 0.0);
+    }
+
+    let target_samples = (pipeline.last_new_samples * 3).max(25_000);
+    let m = target_samples.min(buf_len);
+    let num_batches = (m / pipeline.config.batch_size).max(1);
+    let total_epochs = pipeline.config.train_epochs_per_iter;
+    println!(
+        "[Train GPU] Bắt đầu: {} epochs × {} batches (batch_size={}) | train trên {} samples (buffer {}/{}) với Disjoint Batched Backprop...",
+        total_epochs, num_batches, pipeline.config.batch_size, m, buf_len, pipeline.replay_buffer.capacity
+    );
+
+    let mut total_policy_loss = 0.0f32;
+    let mut total_value_loss = 0.0f32;
+    let mut step_count = 0;
+
+    // Kích thước sub-batch cho mỗi luồng tính toán ma trận gộp
+    let chunk_size = 64; 
+
+    for epoch in 0..total_epochs {
+        let epoch_indices = pipeline.replay_buffer.sample_prioritized_unique_indices(m);
+        let epoch_batches = if epoch_indices.is_empty() {
+            0
+        } else {
+            (epoch_indices.len() / pipeline.config.batch_size)
+                .min(num_batches)
+                .max(1)
+        };
+
+        use std::io::Write;
+        print!("[Train GPU Epoch {}/{}] ", epoch + 1, total_epochs);
+        let _ = std::io::stdout().flush();
+
+        for batch in 0..epoch_batches {
+            let start = batch * pipeline.config.batch_size;
+            let end = ((batch + 1) * pipeline.config.batch_size).min(epoch_indices.len());
+            let indices = epoch_indices[start..end].to_vec();
+            if indices.is_empty() {
+                continue;
+            }
+
+            let model_ref = &pipeline.model;
+            let val_coeff = pipeline.config.value_loss_coeff;
+            let buffer_ref = &pipeline.replay_buffer.buffer;
+
+            // Chia batch_size thành các chunk để các luồng Rayon chạy Disjoint Graph Backprop theo khối
+            let chunks: Vec<Vec<usize>> = indices.chunks(chunk_size).map(|c| c.to_vec()).collect();
+
+            let (mb_grads, (mb_pi_loss, mb_val_loss)) = chunks
+                .into_par_iter()
+                .map(|chunk_indices| {
+                    let chunk_samples: Vec<&dorfromantik_remake::alphazero::AlphaZeroSample> =
+                        chunk_indices.iter().map(|&idx| &buffer_ref[idx]).collect();
+
+                    let mut chunk_grad = HexGNNModel::new_zero();
+                    let (pi_l, val_l) = model_ref.backward_accumulate_batch(
+                        &chunk_samples,
+                        val_coeff,
+                        &mut chunk_grad,
+                    );
+                    (chunk_grad, (pi_l, val_l))
+                })
+                .reduce(
+                    || (HexGNNModel::new_zero(), (0.0f32, 0.0f32)),
+                    |(mut g1, (pi1, v1)), (g2, (pi2, v2))| {
+                        g1.add_assign(&g2);
+                        (g1, (pi1 + pi2, v1 + v2))
+                    },
+                );
+
+            let mb_len = pipeline.config.batch_size as f32;
+            let mut scaled_grads = mb_grads;
+            scaled_grads.scale_assign(1.0 / mb_len);
+            scaled_grads.clip_grad_norm(1.0);
+
+            pipeline.model.update_weights_adam(&scaled_grads, pipeline.config.lr);
+
+            total_policy_loss += mb_pi_loss / mb_len;
+            total_value_loss += mb_val_loss / mb_len;
+            step_count += 1;
+
+            if (batch + 1) % 4 == 0 || (batch + 1) == epoch_batches {
+                print!("{}/{} ", batch + 1, epoch_batches);
+                let _ = std::io::stdout().flush();
+            }
+        }
+        println!();
+    }
+
+    if step_count > 0 {
+        let avg_pi = total_policy_loss / step_count as f32;
+        let avg_val = total_value_loss / step_count as f32;
+        (avg_pi + avg_val * pipeline.config.value_loss_coeff, avg_pi, avg_val)
+    } else {
+        (0.0, 0.0, 0.0)
+    }
 }
 
 fn main() {
@@ -406,9 +512,9 @@ fn main() {
             }
         }
 
-        // C. Train model với Adam Optimizer
+        // C. Train model với Disjoint Batched Backpropagation (siêu tốc)
         let train_start = Instant::now();
-        let (total_loss, pi_loss, val_loss) = pipeline.train_step();
+        let (total_loss, pi_loss, val_loss) = fast_train_step(&mut pipeline);
         let train_dur = train_start.elapsed();
 
         println!(
