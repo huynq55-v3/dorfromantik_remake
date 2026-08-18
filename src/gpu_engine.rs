@@ -15,15 +15,19 @@ pub struct GpuEngine {
 impl GpuEngine {
     /// Khởi tạo GPU context. Tìm kiếm GPU rời (Nvidia / AMD / Intel)
     pub fn new() -> Option<Self> {
-        let instance = Instance::default();
+        let instance = Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            ..Default::default()
+        });
 
         // 1. Quét danh sách tất cả các adapter và ưu tiên GPU rời (DiscreteGPU)
-        let adapters = instance.enumerate_adapters(wgpu::Backends::all());
+        let adapters = instance.enumerate_adapters(wgpu::Backends::VULKAN);
         let mut chosen_adapter = None;
 
+        println!("[GPU Diagnostic] Quét các GPU adapters hiện có trên hệ thống:");
         for a in adapters {
             let info = a.get_info();
-            // Bỏ qua llvmpipe (CPU software rendering) nếu có GPU phần cứng
+            println!("  -> Tìm thấy: '{}' | Type: {:?} | Backend: {:?}", info.name, info.device_type, info.backend);
             if info.device_type == wgpu::DeviceType::DiscreteGpu {
                 chosen_adapter = Some(a);
                 break;
