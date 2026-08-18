@@ -526,6 +526,7 @@ fn main() {
         );
 
         // D. Lưu checkpoint model & buffer định kỳ
+        let save_start = Instant::now();
         if let Err(e) = pipeline.model.save_to_file(&latest_model_path) {
             println!("[Save Error] Không thể lưu latest model: {:?}", e);
         }
@@ -540,13 +541,18 @@ fn main() {
 
         if let Err(e) = pipeline.replay_buffer.save_to_file(&buffer_path) {
             println!("[Save Error] Không thể lưu replay buffer: {:?}", e);
+        } else {
+            println!(
+                "[Replay Buffer] Đã dồn RAM và lưu {} samples vào `{}` trong {:.2}s",
+                pipeline.replay_buffer.len(),
+                buffer_path,
+                save_start.elapsed().as_secs_f32()
+            );
         }
 
-        // Lưu danh sách max-score states (80% envs khởi động lại từ vị thế tốt ở iter sau)
+        // Lưu danh sách max-score states
         if let Ok(json_str) = serde_json::to_string_pretty(&pipeline.max_score_states) {
-            if let Err(e) = fs::write(&max_score_states_path, json_str) {
-                println!("[Save Error] Không thể lưu max_score_states: {:?}", e);
-            }
+            let _ = fs::write(&max_score_states_path, json_str);
         }
 
         // Ghi metadata file (iteration, kỷ lục)

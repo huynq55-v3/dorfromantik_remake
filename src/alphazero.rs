@@ -341,7 +341,8 @@ impl AlphaZeroReplayBuffer {
             let _ = std::fs::create_dir_all(parent);
         }
         let file = std::fs::File::create(path)?;
-        let mut writer = std::io::BufWriter::new(file);
+        // Tăng bộ đệm RAM lên 64MB để dồn toàn bộ dữ liệu trong RAM rồi ghi xuống đĩa 1 lần cực nhanh
+        let mut writer = std::io::BufWriter::with_capacity(64 * 1024 * 1024, file);
 
         writer.write_all(b"DORF_BUF_V1")?;
         writer.write_all(&(self.buffer.len() as u64).to_le_bytes())?;
@@ -400,7 +401,7 @@ impl AlphaZeroReplayBuffer {
     pub fn load_from_file(&mut self, path: &str) -> std::io::Result<usize> {
         use std::io::Read;
         let file = std::fs::File::open(path)?;
-        let mut reader = std::io::BufReader::new(file);
+        let mut reader = std::io::BufReader::with_capacity(64 * 1024 * 1024, file);
 
         let mut magic = [0u8; 11];
         reader.read_exact(&mut magic)?;
