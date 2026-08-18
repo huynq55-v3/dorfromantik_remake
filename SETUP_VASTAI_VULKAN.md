@@ -102,16 +102,33 @@ cargo run --release --bin train_alphazero_gpu -- [parallel_envs] [n_simulations]
 - `[train_epochs]`: Số epoch huấn luyện gradient mỗi iteration (Mặc định `5`).
 - `[iter_max]`: Vòng lặp tối đa để dừng lại (Mặc định chạy liên tục không giới hạn).
 
-### 4.2 Cấu Hình Tối Ưu Cho RTX 4090 / 5090 (Cân Bằng CPU & GPU, Công Suất 80-90W+):
+### 4.2 Cấu Hình Tối Ưu Cho RTX 4070Ti / 4080 / 4090 / 5090:
+
+#### Cách 1: Chạy nền với `tmux` (Khuyên dùng - Tiện theo dõi) 🏆
 ```bash
-# Chạy nền bằng tmux để không bị tắt khi rớt mạng:
+# 1. Mở phiên làm việc tmux:
 tmux
 
-# Chạy lệnh train:
+# 2. Chạy lệnh train:
 cargo run --release --bin train_alphazero_gpu -- 512 400 300000 5
 
-# Thoát tmux (tiến trình vẫn chạy ngầm): Nhấn Ctrl+B, thả tay ra rồi bấm phím D.
-# Vào lại xem tiến trình: gõ `tmux attach`
+# 3. Thoát ra an toàn (tiến trình vẫn chạy ngầm): Nhấn Ctrl+B, thả tay ra rồi bấm phím D.
+# 4. Vào lại xem tiến trình bất cứ lúc nào:
+tmux attach
+```
+
+#### Cách 2: Chạy ngầm vĩnh viễn với `nohup` (Tắt SSH / Tắt máy thoải mái) ⚡
+```bash
+# 1. Chạy ngầm và ghi toàn bộ log vào file train.log:
+nohup cargo run --release --bin train_alphazero_gpu -- 512 400 300000 5 > train.log 2>&1 &
+
+# 2. Xem log tiến trình real-time:
+tail -f train.log
+
+# 3. Thoát khỏi xem log (không ảnh hưởng đến train): Nhấn Ctrl + C
+
+# 4. Lệnh dừng/tắt tiến trình train đang chạy ngầm:
+pkill -f train_alphazero_gpu
 ```
 
 ---
@@ -124,4 +141,8 @@ cargo run --release --bin train_alphazero_gpu -- 512 400 300000 5
 - **Theo dõi CPU & RAM:**
   ```bash
   htop
+  ```
+- **Kiểm tra tiến trình train đang chạy:**
+  ```bash
+  ps aux | grep train_alphazero
   ```
