@@ -189,32 +189,34 @@ fn main() {
     }
 
     let (target_seed, initial_stack, tile_limit) = load_monthly_game_config();
-    let parallel_envs = 512;
-
     let args: Vec<String> = std::env::args().collect();
-    let n_simulations = if args.len() > 1 {
-        args[1].parse::<usize>().unwrap_or(400)
-    } else {
-        400
-    };
+    let parallel_envs = args
+        .get(1)
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(512);
+
+    let n_simulations = args
+        .get(2)
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(400);
 
     let replay_buffer_capacity = args
-        .get(2)
+        .get(3)
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&v| v > 0);
 
     let train_epochs = args
-        .get(3)
+        .get(4)
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(5);
 
     let iter_max = args
-        .get(4)
+        .get(5)
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(usize::MAX);
 
     let explore_by_entropy = args
-        .get(5)
+        .get(6)
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(1)
         != 0;

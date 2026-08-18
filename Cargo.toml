@@ -30,6 +30,10 @@ name = "train_alphazero_gpu"
 path = "bin/train_alphazero_gpu.rs"
 
 [[bin]]
+name = "train_alphazero_fast"
+path = "bin/train_alphazero_fast.rs"
+
+[[bin]]
 name = "gen_replay"
 path = "bin/gen_replay.rs"
 
