@@ -963,7 +963,7 @@ impl AlphaZeroPipeline {
         let mut total_placed = 0;
         let mut best_record: Option<GameMatchRecord> = None;
 
-        // Gom các candidate states cần đánh giá Value Head để add vào high_q_states
+        // Gom toàn bộ candidate states và toàn bộ new samples từ tất cả 512 envs
         struct HighQCandidate {
             obs: GraphObservation,
             score_at_step: usize,
@@ -971,6 +971,7 @@ impl AlphaZeroPipeline {
             prefix_moves: Vec<GameMoveRecord>,
         }
         let mut high_q_candidates: Vec<HighQCandidate> = Vec::new();
+        let mut all_new_samples: Vec<AlphaZeroSample> = Vec::new();
 
         for i in 0..n_envs {
             let final_score = envs[i].score_manager.total_score;
@@ -989,7 +990,7 @@ impl AlphaZeroPipeline {
             total_placed += placed_count;
 
             let total_steps = raw_steps[i].len();
-            let mut samples = Vec::with_capacity(total_steps);
+            let mut env_samples = Vec::with_capacity(total_steps);
             let mut g = 0.0f32;
 
             for t in (0..total_steps).rev() {
@@ -1010,20 +1011,26 @@ impl AlphaZeroPipeline {
                     }
                 }
 
-                samples.push(AlphaZeroSample {
+                env_samples.push(AlphaZeroSample {
                     obs,
                     target_pi: pi,
                     target_val: g,
                 });
             }
-            samples.reverse();
-            self.last_new_samples += self.replay_buffer.push_batch(samples);
+            env_samples.reverse();
+            all_new_samples.extend(env_samples);
         }
 
-        // Đánh giá song song toàn bộ candidate states qua GPU / Model Batch thay vì vòng lặp đơn luồng
+        // 1. Đẩy toàn bộ samples từ tất cả envs vào buffer 1 LẦN DUY NHẤT (tránh hash 200k samples x 512 lần)
+        let n_added = self.replay_buffer.push_batch(all_new_samples);
+        self.last_new_samples += n_added;
+
+        // 2. Đánh giá song song toàn bộ candidate states qua GPU / Model Batch
         if !high_q_candidates.is_empty() {
             let obs_refs: Vec<&GraphObservation> = high_q_candidates.iter().map(|c| &c.obs).collect();
             let chunk_size = 1024;
+            let mut evaluated_cands: Vec<(f32, usize, Vec<GameMoveRecord>)> = Vec::with_capacity(high_q_candidates.len());
+
             for (chunk_idx, obs_chunk) in obs_refs.chunks(chunk_size).enumerate() {
                 let evals = if let Some(gpu) = gpu_exec {
                     gpu.forward_batch_gpu(obs_chunk)
@@ -1035,8 +1042,43 @@ impl AlphaZeroPipeline {
                 for (k, (_, v_pred)) in evals.into_iter().enumerate() {
                     let cand = &high_q_candidates[start_idx + k];
                     let q = cand.score_at_step as f32 + v_pred * 100.0;
-                    self.add_high_q_state(q, cand.remaining_tiles, &cand.prefix_moves);
+                    evaluated_cands.push((q, cand.remaining_tiles, cand.prefix_moves.clone()));
                 }
+            }
+
+            // Lọc nhanh: chỉ giữ lại top candidates có Q cao nhất để gộp vào max_score_states
+            evaluated_cands.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            if evaluated_cands.len() > 500 {
+                evaluated_cands.truncate(500);
+            }
+
+            // Gộp vào pool max_score_states
+            for (q, remaining_tiles, moves) in evaluated_cands {
+                // Kiểm tra trùng chuỗi moves nhanh
+                let mut found = false;
+                for s in self.max_score_states.iter_mut() {
+                    if s.moves.len() == moves.len()
+                        && s.moves.iter().zip(moves.iter()).all(|(a, b)| a.q == b.q && a.r == b.r && a.rotation == b.rotation)
+                    {
+                        s.q_value = q;
+                        s.remaining_tiles = remaining_tiles;
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    self.max_score_states.push(MaxScoreStateRecord {
+                        q_value: q,
+                        remaining_tiles,
+                        moves,
+                    });
+                }
+            }
+
+            // Sort toàn bộ max_score_states ĐÚNG 1 LẦN DUY NHẤT
+            self.max_score_states.sort_unstable_by(|a, b| b.q_value.partial_cmp(&a.q_value).unwrap_or(std::cmp::Ordering::Equal));
+            if self.max_score_states.len() > 2000 {
+                self.max_score_states.truncate(2000);
             }
         }
 
