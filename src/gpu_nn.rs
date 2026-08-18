@@ -168,10 +168,10 @@ struct GatherDims { total_actions: u32, hidden_dim: u32, action_dim: u32, _p3: u
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct PoolDims { batch: u32, hidden_dim: u32, _p2: u32, _p3: u32 }
 
-const MAX_NODES: usize = 262_144;
-const MAX_EDGES: usize = 1_572_864;
-const MAX_ACTIONS: usize = 262_144;
-const MAX_BATCH: usize = 4_096;
+const MAX_NODES: usize = 131_072;
+const MAX_EDGES: usize = 1_048_576;
+const MAX_ACTIONS: usize = 131_072;
+const MAX_BATCH: usize = 2_048;
 const ACT_IN_DIM: usize = HIDDEN_DIM + ACTION_FEAT_DIM; // 144
 
 /// Kế hoạch thực thi GPU chưa hoàn tất chờ Readback (Async Non-blocking Handle)

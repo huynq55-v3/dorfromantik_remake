@@ -13,25 +13,41 @@ pub struct GpuEngine {
 }
 
 impl GpuEngine {
-    /// Khởi tạo GPU context. Tìm kiếm Vulkan GPU (Intel Iris Xe)
+    /// Khởi tạo GPU context. Tìm kiếm GPU rời (Nvidia / AMD / Intel)
     pub fn new() -> Option<Self> {
         let instance = Instance::default();
 
-        let adapter = pollster::block_on(async {
-            instance
-                .request_adapter(&wgpu::RequestAdapterOptions {
-                    power_preference: wgpu::PowerPreference::HighPerformance,
-                    compatible_surface: None,
-                    force_fallback_adapter: false,
-                })
-                .await
-        })?;
+        // 1. Quét danh sách tất cả các adapter và ưu tiên GPU rời (DiscreteGPU)
+        let adapters = instance.enumerate_adapters(wgpu::Backends::all());
+        let mut chosen_adapter = None;
+
+        for a in adapters {
+            let info = a.get_info();
+            // Bỏ qua llvmpipe (CPU software rendering) nếu có GPU phần cứng
+            if info.device_type == wgpu::DeviceType::DiscreteGpu {
+                chosen_adapter = Some(a);
+                break;
+            } else if info.device_type == wgpu::DeviceType::IntegratedGpu && chosen_adapter.is_none() {
+                chosen_adapter = Some(a);
+            }
+        }
+
+        let adapter = if let Some(a) = chosen_adapter {
+            a
+        } else {
+            pollster::block_on(async {
+                instance
+                    .request_adapter(&wgpu::RequestAdapterOptions {
+                        power_preference: wgpu::PowerPreference::HighPerformance,
+                        compatible_surface: None,
+                        force_fallback_adapter: false,
+                    })
+                    .await
+            })?
+        };
 
         let info = adapter.get_info();
-        let device_name = format!("{} ({:?})", info.name, info.backend);
-        // Model nâng cấp dùng Hidden Dim = 128, mỗi buffer sơ cấp có thể lên tới
-        // ~134 MB. Mặc định của wgpu giới hạn storage-buffer binding ở 128 MB, nên ta
-        // yêu cầu giới hạn tối đa adapter hỗ trợ để các buffer này dựng được.
+        let device_name = format!("{} ({:?}, {:?})", info.name, info.device_type, info.backend);
         let limits = adapter.limits();
 
         let (device, queue) = pollster::block_on(async {
