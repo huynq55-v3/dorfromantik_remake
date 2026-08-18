@@ -963,6 +963,15 @@ impl AlphaZeroPipeline {
         let mut total_placed = 0;
         let mut best_record: Option<GameMatchRecord> = None;
 
+        // Gom các candidate states cần đánh giá Value Head để add vào high_q_states
+        struct HighQCandidate {
+            obs: GraphObservation,
+            score_at_step: usize,
+            remaining_tiles: usize,
+            prefix_moves: Vec<GameMoveRecord>,
+        }
+        let mut high_q_candidates: Vec<HighQCandidate> = Vec::new();
+
         for i in 0..n_envs {
             let final_score = envs[i].score_manager.total_score;
             let placed_count = envs[i].placed_count;
@@ -987,22 +996,17 @@ impl AlphaZeroPipeline {
                 let (obs, pi, r) = raw_steps[i][t].clone();
                 g = r + mcts_cfg.gamma * g;
 
-                // Thu thập board state có Q-value cao đánh giá trực tiếp qua Model Value Head V_model (tiềm năng thế trận).
-                // Chỉ giữ khi còn >= 10 tile chưa đặt.
                 let off = hist_offset[i];
                 if t < move_records[i].len() - off {
                     let real = off + t;
                     let m = &move_records[i][real];
                     if m.remaining_tiles >= 10 {
-                        let (_, v_pred) = self.model.forward(
-                            &obs.node_positions,
-                            &obs.node_features,
-                            &obs.edge_index,
-                            &obs.valid_actions,
-                            &obs.action_features,
-                        );
-                        let q = m.total_score as f32 + v_pred * 100.0;
-                        self.add_high_q_state(q, m.remaining_tiles, &move_records[i][..=real]);
+                        high_q_candidates.push(HighQCandidate {
+                            obs: obs.clone(),
+                            score_at_step: m.total_score,
+                            remaining_tiles: m.remaining_tiles,
+                            prefix_moves: move_records[i][..=real].to_vec(),
+                        });
                     }
                 }
 
@@ -1014,6 +1018,26 @@ impl AlphaZeroPipeline {
             }
             samples.reverse();
             self.last_new_samples += self.replay_buffer.push_batch(samples);
+        }
+
+        // Đánh giá song song toàn bộ candidate states qua GPU / Model Batch thay vì vòng lặp đơn luồng
+        if !high_q_candidates.is_empty() {
+            let obs_refs: Vec<&GraphObservation> = high_q_candidates.iter().map(|c| &c.obs).collect();
+            let chunk_size = 1024;
+            for (chunk_idx, obs_chunk) in obs_refs.chunks(chunk_size).enumerate() {
+                let evals = if let Some(gpu) = gpu_exec {
+                    gpu.forward_batch_gpu(obs_chunk)
+                } else {
+                    self.model.forward_batch(obs_chunk)
+                };
+
+                let start_idx = chunk_idx * chunk_size;
+                for (k, (_, v_pred)) in evals.into_iter().enumerate() {
+                    let cand = &high_q_candidates[start_idx + k];
+                    let q = cand.score_at_step as f32 + v_pred * 100.0;
+                    self.add_high_q_state(q, cand.remaining_tiles, &cand.prefix_moves);
+                }
+            }
         }
 
         let avg_score = total_score as f32 / n_envs as f32;
