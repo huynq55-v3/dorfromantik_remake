@@ -16,12 +16,12 @@ impl GpuEngine {
     /// Khởi tạo GPU context. Tìm kiếm GPU rời (Nvidia / AMD / Intel)
     pub fn new() -> Option<Self> {
         let instance = Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN,
+            backends: wgpu::Backends::all(),
             ..Default::default()
         });
 
         // 1. Quét danh sách tất cả các adapter và ưu tiên GPU rời (DiscreteGPU)
-        let adapters = instance.enumerate_adapters(wgpu::Backends::VULKAN);
+        let adapters = instance.enumerate_adapters(wgpu::Backends::all());
         let mut chosen_adapter = None;
 
         println!("[GPU Diagnostic] Quét các GPU adapters hiện có trên hệ thống:");
