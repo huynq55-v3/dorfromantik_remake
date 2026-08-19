@@ -676,8 +676,9 @@ impl AlphaZeroPipeline {
         remaining_tiles: usize,
         moves: &[GameMoveRecord],
     ) {
-        // Tìm state trùng chuỗi moves (cùng board config qua dãy nước đi).
-        let mut found = None;
+        // Tìm state trùng cội nguồn (trùng 100% hoặc >= 80% số nước đi ban đầu).
+        let mut exact_match = None;
+        let mut similar_match = None;
         for (i, s) in self.max_score_states.iter().enumerate() {
             if s.moves.len() == moves.len()
                 && s.moves
@@ -685,27 +686,50 @@ impl AlphaZeroPipeline {
                     .zip(moves.iter())
                     .all(|(a, b)| a.q == b.q && a.r == b.r && a.rotation == b.rotation)
             {
-                found = Some(i);
+                exact_match = Some(i);
                 break;
             }
+
+            let min_len = s.moves.len().min(moves.len());
+            if min_len > 0 {
+                let mut match_count = 0usize;
+                for k in 0..min_len {
+                    if s.moves[k].q == moves[k].q
+                        && s.moves[k].r == moves[k].r
+                        && s.moves[k].rotation == moves[k].rotation
+                    {
+                        match_count += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let similarity = (match_count as f32) / (min_len as f32);
+                if similarity >= 0.80 && similar_match.is_none() {
+                    similar_match = Some(i);
+                }
+            }
         }
-        match found {
-            // Luôn ghi đè Q-value và remaining_tiles bằng giá trị mới (kể cả thấp hơn).
-            Some(i) => {
+
+        if let Some(i) = exact_match {
+            // Trùng 100% chuỗi nước đi: luôn ghi đè giá trị Q mới
+            self.max_score_states[i].q_value = q_value;
+            self.max_score_states[i].remaining_tiles = remaining_tiles;
+        } else if let Some(i) = similar_match {
+            // Trùng cội nguồn >= 80%: chỉ ghi đè nếu Q mới cao hơn
+            if q_value > self.max_score_states[i].q_value {
                 self.max_score_states[i].q_value = q_value;
                 self.max_score_states[i].remaining_tiles = remaining_tiles;
+                self.max_score_states[i].moves = moves.to_vec();
             }
-            None => {
-                self.max_score_states.push(MaxScoreStateRecord {
-                    q_value,
-                    remaining_tiles,
-                    moves: moves.to_vec(),
-                });
-            }
+        } else {
+            self.max_score_states.push(MaxScoreStateRecord {
+                q_value,
+                remaining_tiles,
+                moves: moves.to_vec(),
+            });
         }
         // Sắp xếp giảm dần theo Q-value, giữ tối đa 2000 state.
-        // State bị ghi đè bằng Q thấp sẽ bị đẩy ra ngoài top 2000 và bị loại bỏ.
-        self.max_score_states.sort_by(|a, b| {
+        self.max_score_states.sort_unstable_by(|a, b| {
             b.q_value
                 .partial_cmp(&a.q_value)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -1080,20 +1104,42 @@ impl AlphaZeroPipeline {
             }
 
             // Gộp các state tinh hoa nhất từ các ván đấu độc lập vào pool max_score_states
+            // Áp dụng cơ chế kiểm tra Cội Nguồn (Lineage / Prefix Similarity > 80%):
+            // Nếu 2 state có >= 80% số nước đi ban đầu giống hệt nhau -> cùng 1 gốc cây -> chỉ giữ state có Q cao hơn!
             for (_env_id, (q, remaining_tiles, moves)) in best_per_env {
-                // Kiểm tra trùng chuỗi moves nhanh
-                let mut found = false;
+                let mut found_similar = false;
                 for s in self.max_score_states.iter_mut() {
-                    if s.moves.len() == moves.len()
-                        && s.moves.iter().zip(moves.iter()).all(|(a, b)| a.q == b.q && a.r == b.r && a.rotation == b.rotation)
-                    {
-                        s.q_value = q;
-                        s.remaining_tiles = remaining_tiles;
-                        found = true;
+                    let min_len = s.moves.len().min(moves.len());
+                    if min_len == 0 {
+                        continue;
+                    }
+                    let mut match_count = 0usize;
+                    for k in 0..min_len {
+                        if s.moves[k].q == moves[k].q
+                            && s.moves[k].r == moves[k].r
+                            && s.moves[k].rotation == moves[k].rotation
+                        {
+                            match_count += 1;
+                        } else {
+                            break; // Dừng ngay khi rẽ nhánh khác nhau (Prefix Matching)
+                        }
+                    }
+
+                    // Tỷ lệ trùng cội nguồn so với độ dài ngắn hơn
+                    let similarity = (match_count as f32) / (min_len as f32);
+                    if similarity >= 0.80 {
+                        found_similar = true;
+                        // Cùng 1 gốc cây tiến hóa: nếu state mới có Q cao hơn hoặc tiến xa hơn thì cập nhật
+                        if q > s.q_value {
+                            s.q_value = q;
+                            s.remaining_tiles = remaining_tiles;
+                            s.moves = moves.clone();
+                        }
                         break;
                     }
                 }
-                if !found {
+
+                if !found_similar {
                     self.max_score_states.push(MaxScoreStateRecord {
                         q_value: q,
                         remaining_tiles,
