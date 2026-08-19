@@ -784,7 +784,14 @@ impl AlphaZeroPipeline {
             self.max_score_states[st_idx].q_value = base_score as f32 + v_pred * 100.0;
         }
 
-        // BƯỚC 3: sort giảm dần, giữ top 2000
+        // BƯỚC 3: Loại bỏ các state đã hết lượt chơi thực tế (dưới 10 tiles còn lại)
+        self.max_score_states.retain(|st| {
+            let placed = st.moves.len();
+            let tiles_until_limit = tile_limit.saturating_sub(placed);
+            st.remaining_tiles.min(tiles_until_limit) >= 10
+        });
+
+        // BƯỚC 4: sort giảm dần, giữ top 2000
         self.max_score_states.sort_by(|a, b| {
             b.q_value
                 .partial_cmp(&a.q_value)
@@ -1001,11 +1008,17 @@ impl AlphaZeroPipeline {
                 if t < move_records[i].len() - off {
                     let real = off + t;
                     let m = &move_records[i][real];
-                    if m.remaining_tiles >= 10 {
+                    // Số tile thực tế còn được phép chơi tiếp trước khi chạm mốc tile_limit hoặc cạn cọc bài
+                    let step_idx = m.step + 1; // số tile đã đặt tại bước này (1-indexed)
+                    let tiles_until_limit = self.config.tile_limit.saturating_sub(step_idx);
+                    let actual_playable_tiles = m.remaining_tiles.min(tiles_until_limit);
+
+                    // Chỉ lưu vào max_score_states khi còn ít nhất 10 lượt đi THỰC TẾ phía trước
+                    if actual_playable_tiles >= 10 {
                         high_q_candidates.push(HighQCandidate {
                             obs: obs.clone(),
                             score_at_step: m.total_score,
-                            remaining_tiles: m.remaining_tiles,
+                            remaining_tiles: actual_playable_tiles,
                             prefix_moves: move_records[i][..=real].to_vec(),
                         });
                     }
