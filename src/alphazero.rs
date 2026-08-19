@@ -970,8 +970,9 @@ impl AlphaZeroPipeline {
         let mut total_placed = 0;
         let mut best_record: Option<GameMatchRecord> = None;
 
-        // Gom toàn bộ candidate states và toàn bộ new samples từ tất cả 512 envs
+        // Gom candidate states từ tất cả envs (kèm theo env_id để chọn state tốt nhất cho từng ván đấu độc lập)
         struct HighQCandidate {
+            env_id: usize,
             obs: GraphObservation,
             score_at_step: usize,
             remaining_tiles: usize,
@@ -1016,6 +1017,7 @@ impl AlphaZeroPipeline {
                     // Chỉ lưu vào max_score_states khi còn ít nhất 10 lượt đi THỰC TẾ phía trước
                     if actual_playable_tiles >= 10 {
                         high_q_candidates.push(HighQCandidate {
+                            env_id: i,
                             obs: obs.clone(),
                             score_at_step: m.total_score,
                             remaining_tiles: actual_playable_tiles,
@@ -1042,7 +1044,8 @@ impl AlphaZeroPipeline {
         if !high_q_candidates.is_empty() {
             let obs_refs: Vec<&GraphObservation> = high_q_candidates.iter().map(|c| &c.obs).collect();
             let chunk_size = 1024;
-            let mut evaluated_cands: Vec<(f32, usize, Vec<GameMoveRecord>)> = Vec::with_capacity(high_q_candidates.len());
+            // (env_id, q_value, remaining_tiles, moves)
+            let mut evaluated_cands: Vec<(usize, f32, usize, Vec<GameMoveRecord>)> = Vec::with_capacity(high_q_candidates.len());
 
             for (chunk_idx, obs_chunk) in obs_refs.chunks(chunk_size).enumerate() {
                 let evals = if let Some(gpu) = gpu_exec {
@@ -1055,18 +1058,29 @@ impl AlphaZeroPipeline {
                 for (k, (_, v_pred)) in evals.into_iter().enumerate() {
                     let cand = &high_q_candidates[start_idx + k];
                     let q = cand.score_at_step as f32 + v_pred * 100.0;
-                    evaluated_cands.push((q, cand.remaining_tiles, cand.prefix_moves.clone()));
+                    evaluated_cands.push((cand.env_id, q, cand.remaining_tiles, cand.prefix_moves.clone()));
                 }
             }
 
-            // Lọc nhanh: chỉ giữ lại top candidates có Q cao nhất để gộp vào max_score_states
-            evaluated_cands.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-            if evaluated_cands.len() > 500 {
-                evaluated_cands.truncate(500);
+            // LỌC ĐA DẠNG HÓA (DIVERSITY FILTER):
+            // Mỗi ván đấu (env_id) chỉ lấy ĐÚNG 1 state có Q-value cao nhất (tránh 1 ván chiếm hàng chục state liên tiếp)
+            use std::collections::HashMap;
+            let mut best_per_env: HashMap<usize, (f32, usize, Vec<GameMoveRecord>)> = HashMap::new();
+            for (env_id, q, rem, moves) in evaluated_cands {
+                match best_per_env.get_mut(&env_id) {
+                    Some(existing) => {
+                        if q > existing.0 {
+                            *existing = (q, rem, moves);
+                        }
+                    }
+                    None => {
+                        best_per_env.insert(env_id, (q, rem, moves));
+                    }
+                }
             }
 
-            // Gộp vào pool max_score_states
-            for (q, remaining_tiles, moves) in evaluated_cands {
+            // Gộp các state tinh hoa nhất từ các ván đấu độc lập vào pool max_score_states
+            for (_env_id, (q, remaining_tiles, moves)) in best_per_env {
                 // Kiểm tra trùng chuỗi moves nhanh
                 let mut found = false;
                 for s in self.max_score_states.iter_mut() {
@@ -1088,7 +1102,7 @@ impl AlphaZeroPipeline {
                 }
             }
 
-            // Sort toàn bộ max_score_states ĐÚNG 1 LẦN DUY NHẤT
+            // Sort toàn bộ max_score_states ĐÚNG 1 LẦN DUY NHẤT và giữ top 2000
             self.max_score_states.sort_unstable_by(|a, b| b.q_value.partial_cmp(&a.q_value).unwrap_or(std::cmp::Ordering::Equal));
             if self.max_score_states.len() > 2000 {
                 self.max_score_states.truncate(2000);
