@@ -141,6 +141,18 @@ fn main() {
             batch_grads.clip_grad_norm(5.0);
             model.update_weights_adam(&batch_grads, lr);
             total_val_loss += batch_val_loss;
+
+            if (b + 1) % 10 == 0 || (b + 1) == num_batches {
+                use std::io::Write;
+                let elapsed = start_time.elapsed().as_secs_f32();
+                let cur_loss = total_val_loss / ((b + 1) * batch_size) as f32;
+                let speed = ((b + 1) * batch_size) as f32 / elapsed.max(0.001);
+                print!(
+                    "\r⏳ [Epoch {:>2}/{:>2}] Batch {:>3}/{} ({:>3.0}%) | Value Loss: {:.4} | Tốc độ: {:>6.0} mẫu/s | {:.1}s",
+                    epoch, epochs, b + 1, num_batches, ((b + 1) as f32 / num_batches as f32) * 100.0, cur_loss, speed, elapsed
+                );
+                let _ = std::io::stdout().flush();
+            }
         }
 
         let avg_loss = total_val_loss / (num_batches * batch_size) as f32;
@@ -148,7 +160,7 @@ fn main() {
         let speed = (num_batches * batch_size) as f32 / dur.as_secs_f32();
 
         println!(
-            "Epoch [{:>2}/{:>2}] | Value Huber Loss: {:.4} | Tốc độ: {:>6.0} mẫu/s | Thời gian: {:.2}s",
+            "\n✅ [Epoch {:>2}/{:>2} XONG] | Value Huber Loss: {:.4} | Tốc độ TB: {:>6.0} mẫu/s | Tổng: {:.2}s",
             epoch, epochs, avg_loss, speed, dur.as_secs_f32()
         );
     }
