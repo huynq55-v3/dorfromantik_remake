@@ -82,6 +82,7 @@ pub struct BoardUndoState {
     pub groups: FxHashMap<usize, ElementGroup>,
     pub edge_to_group: FxHashMap<((i32, i32), usize), usize>,
     pub next_group_id: usize,
+    pub active_quest_positions: FxHashSet<(i32, i32)>,
 }
 
 /// Board quản lý bàn chơi và thuật toán ghép cụm ElementGroupManager
@@ -91,6 +92,7 @@ pub struct Board {
     pub groups: FxHashMap<usize, ElementGroup>,
     pub edge_to_group: FxHashMap<((i32, i32), usize), usize>,
     pub next_group_id: usize,
+    pub active_quest_positions: FxHashSet<(i32, i32)>,
 }
 
 impl Default for Board {
@@ -106,6 +108,7 @@ impl Board {
             groups: FxHashMap::default(),
             edge_to_group: FxHashMap::default(),
             next_group_id: 1,
+            active_quest_positions: FxHashSet::default(),
         }
     }
 
@@ -116,6 +119,7 @@ impl Board {
             groups: self.groups.clone(),
             edge_to_group: self.edge_to_group.clone(),
             next_group_id: self.next_group_id,
+            active_quest_positions: self.active_quest_positions.clone(),
         }
     }
 
@@ -125,6 +129,7 @@ impl Board {
         self.groups = state.groups;
         self.edge_to_group = state.edge_to_group;
         self.next_group_id = state.next_group_id;
+        self.active_quest_positions = state.active_quest_positions;
     }
 
     /// Lấy danh sách các Group ID duy nhất của ô tile tại vị trí pos tương ứng với group_type
@@ -242,6 +247,9 @@ impl Board {
         };
 
         self.placed_tiles.insert((q, r), placed);
+        if is_quest {
+            self.active_quest_positions.insert((q, r));
+        }
 
         // Hợp nhất cụm địa hình liên thông (ElementGroupManager)
         self.update_element_groups(q, r);
@@ -617,21 +625,25 @@ impl Board {
     /// Đánh giá liên tục tất cả các Quest active trên bàn chơi.
     /// Trả về (số quest được finalize, số quest hoàn thành thành công) trong lượt này.
     pub fn evaluate_all_active_quests(&mut self, mut quest_manager: Option<&mut crate::quest_manager::QuestManager>) -> (usize, usize) {
-        let active_keys: Vec<(i32, i32)> = self.placed_tiles
-            .iter()
-            .filter(|(_, pt)| matches!(pt.tile, GeneratedTile::Quest { .. }) && !pt.quest_finalized)
-            .map(|(&pos, _)| pos)
-            .collect();
+        if self.active_quest_positions.is_empty() {
+            return (0, 0);
+        }
 
+        let active_keys: Vec<(i32, i32)> = self.active_quest_positions.iter().copied().collect();
         let mut resolved_count = 0;
         let mut succeeded_count = 0;
+        let mut finalized_positions = Vec::new();
 
         for pos in active_keys {
             let (target_count, equality, group_type) = {
-                let pt = &self.placed_tiles[&pos];
+                let Some(pt) = self.placed_tiles.get(&pos) else {
+                    finalized_positions.push(pos);
+                    continue;
+                };
                 if let GeneratedTile::Quest { quest_data, .. } = &pt.tile {
                     (quest_data.remaining_display_value(), quest_data.equality, quest_data.primary_group_type())
                 } else {
+                    finalized_positions.push(pos);
                     continue;
                 }
             };
@@ -678,8 +690,13 @@ impl Board {
                         }
                     }
                     pt.quest_finalized = true;
+                    finalized_positions.push(pos);
                 }
             }
+        }
+
+        for f_pos in finalized_positions {
+            self.active_quest_positions.remove(&f_pos);
         }
 
         (resolved_count, succeeded_count)
