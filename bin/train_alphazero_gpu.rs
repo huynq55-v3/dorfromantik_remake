@@ -191,40 +191,46 @@ fn main() {
     let (target_seed, initial_stack, tile_limit) = load_monthly_game_config();
     let args: Vec<String> = std::env::args().collect();
 
-    // 1. Số môi trường song song (parallel_envs) - Mặc định 512
+    // 1. Số môi trường song song tự chơi (parallel_envs) - Mặc định 512
     let parallel_envs = args
         .get(1)
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(512);
 
-    // 2. Số MCTS simulations / turn - Mặc định 400
-    let n_simulations = args
+    // 2. Training Batch Size (batch_size) - Mặc định 1024
+    let batch_size = args
         .get(2)
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(1024);
+
+    // 3. Số MCTS simulations / turn (n_simulations) - Mặc định 400
+    let n_simulations = args
+        .get(3)
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(400);
 
-    // 3. Dung lượng Replay Buffer (optional, mặc định None -> 200k/300k)
+    // 4. Dung lượng Replay Buffer (optional, mặc định None -> 200k/300k)
     let replay_buffer_capacity = args
-        .get(3)
+        .get(4)
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&c| c > 0);
 
-    // 4. Số train epochs mỗi iteration (mặc định 2)
+    // 5. Số train epochs mỗi iteration (mặc định 2)
     let train_epochs = args
-        .get(4)
+        .get(5)
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&e| e > 0)
         .unwrap_or(2);
 
-    // 5. Iteration tối đa (iter_max, mặc định usize::MAX)
+    // 6. Iteration tối đa (iter_max, mặc định usize::MAX)
     let iter_max = args
-        .get(5)
+        .get(6)
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(usize::MAX);
 
-    // 6. Cờ bật exploration theo entropy (mặc định 1 - BẬT)
+    // 7. Cờ bật exploration theo entropy (mặc định 1 - BẬT)
     let explore_by_entropy = args
-        .get(6)
+        .get(7)
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(1)
         != 0;
@@ -235,7 +241,7 @@ fn main() {
         lr,
         gamma: 0.995,
         value_loss_coeff: 0.5,
-        batch_size: 1024,
+        batch_size,
         train_epochs_per_iter: train_epochs,
         mcts_config: MCTSConfig {
             c_puct: 1.5,
