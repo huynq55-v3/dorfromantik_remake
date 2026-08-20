@@ -236,7 +236,7 @@ pub fn train_value_batch_blas(model: &HexGNNModel, batch: &[&ValueGraph]) -> (He
     }
 
     let mut d_val_hidden = vec![0.0f32; b_count * HIDDEN_DIM];
-    for i in 0..b_count * HIDDEN_DIM {
+    for i in 0..b_count {
         d_val_hidden[i] = if val_hidden[i] > 0.0 { d_val_relu[i] } else { 0.0 };
     }
 
@@ -307,9 +307,7 @@ pub fn train_value_batch_blas(model: &HexGNNModel, batch: &[&ValueGraph]) -> (He
             }
         }
 
-        // SGEMM Matrix Multiplication Gradients:
-        // 1. grad_W_self += d_relu^T * h_in  ([out_dim x total_nodes] * [total_nodes x in_dim] -> [out_dim x in_dim])
-        // 2. grad_W_neigh += d_relu^T * neigh ([out_dim x total_nodes] * [total_nodes x in_dim] -> [out_dim x in_dim])
+        // SGEMM Matrix Multiplication Gradients
         unsafe {
             matrixmultiply::sgemm(
                 out_dim, total_nodes, in_dim,
@@ -333,8 +331,6 @@ pub fn train_value_batch_blas(model: &HexGNNModel, batch: &[&ValueGraph]) -> (He
             let mut d_h_prev = d_h_curr;
             let mut d_neigh = vec![0.0f32; total_nodes * out_dim];
 
-            // 3. d_h_prev += d_relu * W_self ([total_nodes x out_dim] * [out_dim x in_dim] -> [total_nodes x in_dim])
-            // 4. d_neigh += d_relu * W_neigh ([total_nodes x out_dim] * [out_dim x in_dim] -> [total_nodes x in_dim])
             unsafe {
                 matrixmultiply::sgemm(
                     total_nodes, out_dim, in_dim,
@@ -387,28 +383,25 @@ fn main() {
     }
 
     println!("============================================================");
-    println!(">>> HUẤN LUYỆN GNN SGEMM BLAS (SIÊU TỐC ĐỘ 2000+ MẪU/S) <<<");
+    println!(">>> HUẤN LUYỆN GNN SGEMM BLAS (STREAMING DISK LOADING) <<<");
     println!(" - Đang nạp dataset từ: {}...", dataset_path);
     println!("============================================================\n");
 
     let file = File::open(dataset_path).unwrap();
     let mut reader = BufReader::new(file);
-    let dataset: Vec<RealScoreSample> = bincode::deserialize_from(&mut reader).unwrap();
-    let n_samples = dataset.len();
-    println!("✅ Đã nạp thành công {} samples độc nhất (100% Unique)!", n_samples);
 
-    println!("[Chuyển Đổi] Tối ưu hóa cấu trúc Pure Value Graph...");
-    let value_graphs: Vec<ValueGraph> = dataset
-        .into_par_iter()
-        .map(|s| {
-            let obs = s.obs.to_graph_observation();
-            ValueGraph {
-                node_features: obs.node_features,
-                edge_index: obs.edge_index,
-                target_val: s.real_score / 100.0,
-            }
-        })
-        .collect();
+    let mut value_graphs = Vec::new();
+    while let Ok(sample) = bincode::deserialize_from::<_, RealScoreSample>(&mut reader) {
+        let obs = sample.obs.to_graph_observation();
+        value_graphs.push(ValueGraph {
+            node_features: obs.node_features,
+            edge_index: obs.edge_index,
+            target_val: sample.real_score / 100.0,
+        });
+    }
+
+    let n_samples = value_graphs.len();
+    println!("✅ Đã nạp thành công {} samples độc nhất (100% Unique)!", n_samples);
 
     let mut model = HexGNNModel::new();
     let lr = 0.0005;
@@ -434,7 +427,7 @@ fn main() {
             let end_idx = start_idx + batch_size;
             let batch_indices = &indices[start_idx..end_idx];
 
-            let chunk_size = 128; // Tăng chunk_size để SGEMM ma trận lớn hơn, tận dụng tối đa AVX2
+            let chunk_size = 128;
             let (mut batch_grads, batch_val_loss) = batch_indices
                 .par_chunks(chunk_size)
                 .map(|chunk| {

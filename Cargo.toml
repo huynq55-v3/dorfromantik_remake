@@ -67,6 +67,10 @@ path = "bin/train_nnue_real_score.rs"
 name = "play_nnue_beam"
 path = "bin/play_nnue_beam.rs"
 
+[[bin]]
+name = "gen_dataset_gnn_selfplay"
+path = "bin/gen_dataset_gnn_selfplay.rs"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

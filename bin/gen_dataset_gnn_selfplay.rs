@@ -1,6 +1,5 @@
 use rayon::prelude::*;
 use rand::Rng;
-use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
@@ -12,9 +11,9 @@ use std::time::Instant;
 
 use dorfromantik_remake::board::{get_neighbor_pos, opposite_direction};
 use dorfromantik_remake::env::{Action, DorfromantikEnv, GraphObservation};
+use dorfromantik_remake::nn::HexGNNModel;
 use dorfromantik_remake::score_manager::is_matching_edge;
 
-/// Dạng Serializable chuẩn cho GraphObservation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SerializableGraphObservation {
     pub node_positions: Vec<(i32, i32)>,
@@ -44,45 +43,12 @@ impl From<GraphObservation> for SerializableGraphObservation {
     }
 }
 
-/// Mẫu dữ liệu huấn luyện NNUE Supervised (SerializableGraphObservation + Điểm Số Thật)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RealScoreSample {
     pub obs: SerializableGraphObservation,
     pub real_score: f32,
     pub remaining_tiles: usize,
     pub placed_count: usize,
-}
-
-/// Vector 10 Trọng Số Heuristic Tinh Hoa
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HeuristicWeights {
-    pub w_fit: f32,
-    pub w_perfect: f32,
-    pub w_quest_completed: f32,
-    pub w_mismatch_penalty: f32,
-    pub w_pocket_created: f32,
-    pub w_quest_progress: f32,
-    pub w_quest_overflow: f32,
-    pub w_open_edges: f32,
-    pub w_stack_health: f32,
-    pub w_preview_match: f32,
-}
-
-impl Default for HeuristicWeights {
-    fn default() -> Self {
-        Self {
-            w_fit: 1.0,
-            w_perfect: 20.0,
-            w_quest_completed: 60.0,
-            w_mismatch_penalty: -2.5,
-            w_pocket_created: 12.0,
-            w_quest_progress: 1.5,
-            w_quest_overflow: -100.0,
-            w_open_edges: 2.0,
-            w_stack_health: 3.0,
-            w_preview_match: 1.5,
-        }
-    }
 }
 
 fn load_game_config() -> (i32, usize, usize) {
@@ -104,61 +70,6 @@ fn load_game_config() -> (i32, usize, usize) {
     (seed, stack, limit)
 }
 
-fn load_best_weights() -> HeuristicWeights {
-    let path = "models/heuristic_best_weights.json";
-    if Path::new(path).exists() {
-        if let Ok(content) = fs::read_to_string(path) {
-            if let Ok(w) = serde_json::from_str::<HeuristicWeights>(&content) {
-                return w;
-            }
-        }
-    }
-    HeuristicWeights::default()
-}
-
-/// Đánh giá nhanh nước đi trực tiếp trên bảng không clone `env` (Siêu Tốc)
-#[inline(always)]
-pub fn evaluate_action_inplace(env: &DorfromantikEnv, act: Action, weights: &HeuristicWeights) -> f32 {
-    let curr_tile = match env.current_tile() {
-        Some(t) => t,
-        None => return 0.0,
-    };
-
-    let mut cfg = curr_tile.to_hex_edge_config();
-    cfg.rotate(act.rotation);
-
-    let mut f_fit = 0.0f32;
-    let mut f_mismatch = 0.0f32;
-    let mut neighbor_count = 0usize;
-    let mut matched_edges = 0usize;
-
-    for dir in 0..6 {
-        let n_pos = get_neighbor_pos(act.q, act.r, dir);
-        if let Some(neighbor) = env.board.placed_tiles.get(&n_pos) {
-            neighbor_count += 1;
-            let my_edge = cfg.edges[dir];
-            let n_edge = neighbor.edge_config.edges[opposite_direction(dir)];
-
-            if is_matching_edge(my_edge, n_edge) {
-                matched_edges += 1;
-                f_fit += 10.0;
-            } else {
-                f_mismatch += 1.0;
-            }
-        }
-    }
-
-    let f_perfect = if neighbor_count == 6 && matched_edges == 6 { 1.0 } else { 0.0 };
-    let f_open_edges = (6.0 - neighbor_count as f32).max(0.0);
-
-    // Tính điểm tổng hợp nhanh
-    weights.w_fit * f_fit
-        + weights.w_perfect * f_perfect
-        + weights.w_mismatch_penalty * f_mismatch
-        + weights.w_open_edges * f_open_edges
-}
-
-/// Tính Hash 64-bit bất biến cho 1 trạng thái bàn cờ (Board State Hash)
 pub fn compute_board_hash(env: &DorfromantikEnv) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -182,33 +93,98 @@ pub fn compute_board_hash(env: &DorfromantikEnv) -> u64 {
     hasher.finish()
 }
 
+fn evaluate_state_gnn(model: &HexGNNModel, env: &DorfromantikEnv) -> f32 {
+    let obs = env.extract_graph_observation();
+    let (_, val) = model.forward(
+        &obs.node_positions,
+        &obs.node_features,
+        &obs.edge_index,
+        &obs.valid_actions,
+        &obs.action_features,
+    );
+    val * 100.0
+}
+
+fn select_action_gnn_fast(model: &HexGNNModel, env: &DorfromantikEnv) -> Action {
+    let valid_actions = env.get_valid_actions();
+    if valid_actions.len() <= 1 {
+        return valid_actions.get(0).copied().unwrap_or(Action { q: 0, r: 0, rotation: 0 });
+    }
+
+    let curr_tile = env.current_tile().unwrap();
+    let curr_cfg = curr_tile.to_hex_edge_config();
+
+    let mut scored_actions: Vec<(f32, Action)> = valid_actions
+        .iter()
+        .map(|&act| {
+            let mut cfg = curr_cfg;
+            cfg.rotate(act.rotation);
+            let mut match_count = 0;
+            for dir in 0..6 {
+                let n_pos = get_neighbor_pos(act.q, act.r, dir);
+                if let Some(neighbor) = env.board.placed_tiles.get(&n_pos) {
+                    let my_edge = cfg.edges[dir];
+                    let n_edge = neighbor.edge_config.edges[opposite_direction(dir)];
+                    if is_matching_edge(my_edge, n_edge) {
+                        match_count += 1;
+                    }
+                }
+            }
+            (match_count as f32, act)
+        })
+        .collect();
+
+    scored_actions.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let top_candidates: Vec<Action> = scored_actions.into_iter().take(6).map(|(_, a)| a).collect();
+
+    let mut best_act = top_candidates[0];
+    let mut best_val = f32::NEG_INFINITY;
+
+    for act in top_candidates {
+        let mut temp = env.clone();
+        let res = temp.step(act);
+        let immediate_score = (res.breakdown.fit_score + res.breakdown.perfect_count * 60) as f32;
+        let gnn_val = evaluate_state_gnn(model, &temp);
+        let total = immediate_score + gnn_val;
+        if total > best_val {
+            best_val = total;
+            best_act = act;
+        }
+    }
+
+    best_act
+}
+
 fn main() {
     let (target_seed, initial_stack, tile_limit) = load_game_config();
-    let base_weights = load_best_weights();
-    let target_unique_samples = 1_000_000usize; // 1 TRIỆU MẪU CHUẨN
+    let model_path = "models/nnue_real_score_model.bin";
+    let target_unique_samples = 300_000usize;
 
     println!("============================================================");
-    println!(">>> BỘ SINH DATASET 1M MẪU SIÊU TỐC & DISK STREAMING (RAM < 200MB) <<<");
-    println!(" - Seed Mục Tiêu : {}", target_seed);
-    println!(" - Mục Tiêu Mẫu  : {} samples độc nhất (100% Unique)", target_unique_samples);
-    println!(" - Bộ Nhớ RAM    : Khóa cứng < 200MB (Stream ghi đĩa liên tục)");
+    println!(">>> BỘ SINH DỮ LIỆU TỰ CHƠI BẰNG GNN (GNN SELF-PLAY FLYWHEEL) <<<");
+    println!(" - Nạp Model GNN : {}", model_path);
+    println!(" - Mục Tiêu Mẫu  : {} samples", target_unique_samples);
     println!("============================================================\n");
 
-    let output_dir = "data";
-    fs::create_dir_all(output_dir).unwrap();
-    let output_file = format!("{}/real_score_dataset_1m.bin", output_dir);
+    let model = if Path::new(model_path).exists() {
+        println!("✅ Đã nạp Model GNN hiện tại!");
+        HexGNNModel::load_from_file(model_path).unwrap()
+    } else {
+        println!("❌ Chưa có model đã train! Hãy train trước.");
+        return;
+    };
 
-    // Xóa file cũ nếu có để ghi mới
-    let _ = fs::remove_file(&output_file);
+    let output_file = "data/real_score_dataset_gnn_selfplay.bin";
+    let _ = fs::remove_file(output_file);
 
     let start_time = Instant::now();
     let seen_hashes = Mutex::new(HashSet::<u64>::with_capacity(target_unique_samples));
     let disk_writer = Mutex::new(BufWriter::new(
-        OpenOptions::new().create(true).append(true).open(&output_file).unwrap()
+        OpenOptions::new().create(true).append(true).open(output_file).unwrap()
     ));
     let total_unique = AtomicUsize::new(0);
 
-    let mini_batch_size = 500;
+    let mini_batch_size = 50;
 
     while total_unique.load(Ordering::Relaxed) < target_unique_samples {
         (0..mini_batch_size).into_par_iter().for_each(|_| {
@@ -217,15 +193,6 @@ fn main() {
             }
 
             let mut rng = rand::thread_rng();
-            let normal = Normal::new(0.0, 0.15).unwrap();
-
-            // Biến thể phong cách chơi
-            let mut game_weights = base_weights.clone();
-            game_weights.w_fit *= 1.0 + normal.sample(&mut rng);
-            game_weights.w_perfect *= 1.0 + normal.sample(&mut rng);
-            game_weights.w_mismatch_penalty *= 1.0 + normal.sample(&mut rng);
-            game_weights.w_open_edges *= 1.0 + normal.sample(&mut rng);
-
             let mut env = DorfromantikEnv::new(target_seed, initial_stack, tile_limit);
             let mut turn = 0;
             let mut local_samples = Vec::with_capacity(tile_limit);
@@ -238,8 +205,6 @@ fn main() {
                 }
 
                 let hash = compute_board_hash(&env);
-
-                // Lọc trùng bằng Hash 64-bit (Chỉ tốn 8 bytes / mẫu)
                 let is_new = {
                     let mut set = seen_hashes.lock().unwrap();
                     if set.len() < target_unique_samples && set.insert(hash) {
@@ -260,25 +225,13 @@ fn main() {
                     local_samples.push(sample);
                 }
 
-                // Chọn nước đi siêu tốc không clone
-                let chosen_action = if turn <= 3 {
+                // 2 nước đầu random mở nhánh, sau đó GNN tự chơi
+                let chosen_action = if turn <= 2 {
+                    valid_actions[rng.gen_range(0..valid_actions.len())]
+                } else if rng.gen::<f32>() < 0.15 {
                     valid_actions[rng.gen_range(0..valid_actions.len())]
                 } else {
-                    let mut scored: Vec<(f32, Action)> = valid_actions
-                        .iter()
-                        .map(|&act| (evaluate_action_inplace(&env, act, &game_weights), act))
-                        .collect();
-
-                    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-                    let top_k = scored.into_iter().take(4).collect::<Vec<_>>();
-
-                    if top_k.is_empty() {
-                        valid_actions[0]
-                    } else if rng.gen::<f32>() < 0.70 {
-                        top_k[0].1
-                    } else {
-                        top_k[rng.gen_range(0..top_k.len())].1
-                    }
+                    select_action_gnn_fast(&model, &env)
                 };
 
                 let res = env.step(chosen_action);
@@ -287,7 +240,6 @@ fn main() {
                 }
             }
 
-            // Ghi trực tiếp xuống đĩa rồi xả RAM ngay lập tức!
             if !local_samples.is_empty() {
                 let n_saved = local_samples.len();
                 let count = total_unique.fetch_add(n_saved, Ordering::Relaxed) + n_saved;
@@ -300,11 +252,11 @@ fn main() {
                     let _ = writer.flush();
                 }
 
-                if count % 20_000 < n_saved || count >= target_unique_samples {
+                if count % 5_000 < n_saved || count >= target_unique_samples {
                     let elapsed = start_time.elapsed().as_secs_f32();
                     let speed = count as f32 / elapsed.max(0.001);
                     println!(
-                        "⏳ [Tiến Độ] Đã lưu {:>7}/{} mẫu UNIQUE ({:>3.0}%) | Tốc độ: {:>6.0} mẫu/s | RAM: <150MB | {:.1}s",
+                        "⏳ [GNN Flywheel] Đã lưu {:>6}/{} mẫu UNIQUE ({:>3.0}%) | Tốc độ: {:>5.0} mẫu/s | {:.1}s",
                         count, target_unique_samples, (count as f32 / target_unique_samples as f32) * 100.0, speed, elapsed
                     );
                 }
@@ -313,6 +265,6 @@ fn main() {
     }
 
     let dur = start_time.elapsed();
-    println!("\n✅ Hoàn tất! Sinh xong {} MẪU UNIQUE trong {:.2}s!", target_unique_samples, dur.as_secs_f32());
-    println!("🎉 File dataset lưu tại: {} (RAM sử dụng luôn < 150MB)", output_file);
+    println!("\n✅ Hoàn tất GNN Self-Play Flywheel trong {:.2}s!", dur.as_secs_f32());
+    println!("🎉 File dataset lưu tại: {}", output_file);
 }
