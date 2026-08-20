@@ -850,15 +850,16 @@ impl AlphaZeroPipeline {
         let mut hist_offset = vec![0usize; n_envs];
         // Moves gốc của state để replay về đúng board khi from-state envs tự chơi tiếp.
         let mut env_source_moves: Vec<Vec<GameMoveRecord>> = vec![Vec::new(); n_envs];
-        if !self.max_score_states.is_empty() {
-            let mut rng = rand::thread_rng();
-            let count = ((n_envs as f32) * 0.50) as usize;
-            let mut all_indices: Vec<usize> = (0..n_envs).collect();
-            all_indices.shuffle(&mut rng);
-            for &idx in &all_indices[..count] {
-                from_state[idx] = true;
-            }
-        }
+        // TẠM THỜI TẮT RESTART TỪ MAX SCORE STATES (100% ENVS CHẠY TỪ ĐẦU TURN 0):
+        // if !self.max_score_states.is_empty() {
+        //     let mut rng = rand::thread_rng();
+        //     let count = ((n_envs as f32) * 0.50) as usize;
+        //     let mut all_indices: Vec<usize> = (0..n_envs).collect();
+        //     all_indices.shuffle(&mut rng);
+        //     for &idx in &all_indices[..count] {
+        //         from_state[idx] = true;
+        //     }
+        // }
         let mut rng = rand::thread_rng();
         for idx in 0..n_envs {
             let mut env = DorfromantikEnv::new(base_seed, initial_stack, tile_limit);
