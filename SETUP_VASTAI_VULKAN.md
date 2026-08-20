@@ -99,7 +99,7 @@ cargo run --release --bin train_alphazero_gpu -- [parallel_envs] [n_simulations]
 - `[parallel_envs]`: Số môi trường game chạy song song (Mặc định `512`).
 - `[n_simulations]`: Số bước duyệt MCTS mỗi lượt (Mặc định `400`).
 - `[buffer_capacity]`: Sức chứa Replay Buffer (Mặc định `300000`).
-- `[train_epochs]`: Số epoch huấn luyện gradient mỗi iteration (Mặc định `5`).
+- `[train_epochs]`: Số epoch huấn luyện gradient mỗi iteration (Mặc định `2`).
 - `[iter_max]`: Vòng lặp tối đa để dừng lại (Mặc định chạy liên tục không giới hạn).
 
 ### 4.2 Cấu Hình Tối Ưu Cho RTX 4070Ti / 4080 / 4090 / 5090:
@@ -109,8 +109,8 @@ cargo run --release --bin train_alphazero_gpu -- [parallel_envs] [n_simulations]
 # 1. Mở phiên làm việc tmux:
 tmux
 
-# 2. Chạy lệnh train:
-cargo run --release --bin train_alphazero_gpu -- 512 400 300000 5
+# 2. Chạy lệnh train (512 envs, 400 hoặc 800 sims, 300k buffer, 2 epochs):
+cargo run --release --bin train_alphazero_gpu -- 512 400 300000 2
 
 # 3. Thoát ra an toàn (tiến trình vẫn chạy ngầm): Nhấn Ctrl+B, thả tay ra rồi bấm phím D.
 # 4. Vào lại xem tiến trình bất cứ lúc nào:
@@ -120,7 +120,7 @@ tmux attach
 #### Cách 2: Chạy ngầm vĩnh viễn với `nohup` (Tắt SSH / Tắt máy thoải mái) ⚡
 ```bash
 # 1. Chạy ngầm và ghi toàn bộ log vào file train.log:
-nohup cargo run --release --bin train_alphazero_gpu -- 512 400 300000 5 > train.log 2>&1 &
+nohup cargo run --release --bin train_alphazero_gpu -- 512 400 300000 2 > train.log 2>&1 &
 
 # 2. Xem log tiến trình real-time:
 tail -f train.log

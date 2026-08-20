@@ -80,7 +80,7 @@ fn fast_train_step(pipeline: &mut AlphaZeroPipeline) -> (f32, f32, f32) {
         return (0.0, 0.0, 0.0);
     }
 
-    let target_samples = (pipeline.last_new_samples * 3).max(25_000);
+    let target_samples = 40_000usize;
     let m = target_samples.min(buf_len);
     let num_batches = (m / pipeline.config.batch_size).max(1);
     let total_epochs = pipeline.config.train_epochs_per_iter;
@@ -209,12 +209,12 @@ fn main() {
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&c| c > 0);
 
-    // 4. Số train epochs mỗi iteration (mặc định 5)
+    // 4. Số train epochs mỗi iteration (mặc định 2)
     let train_epochs = args
         .get(4)
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&e| e > 0)
-        .unwrap_or(5);
+        .unwrap_or(2);
 
     // 5. Iteration tối đa (iter_max, mặc định usize::MAX)
     let iter_max = args
