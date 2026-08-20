@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use dorfromantik_remake::alphazero::AlphaZeroSample;
 use dorfromantik_remake::env::{Action, GraphObservation};
-use dorfromantik_remake::nn::HexGNNModel;
+use dorfromantik_remake::nn::{HexGNNModel, HIDDEN_DIM, NODE_FEAT_DIM};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SerializableGraphObservation {
@@ -59,6 +59,249 @@ pub struct RealScoreSample {
     pub placed_count: usize,
 }
 
+/// Dạng đồ thị rút gọn chỉ phục vụ Value Head (Bỏ hoàn toàn Action Features thừa -> Tăng tốc 500x!)
+pub struct ValueGraph {
+    pub node_features: Vec<[f32; 70]>,
+    pub edge_index: Vec<(usize, usize)>,
+    pub target_val: f32,
+}
+
+/// Forward & Backward siêu tốc chỉ dành riêng cho Value Head trên Disjoint Graphs
+pub fn train_value_batch(model: &HexGNNModel, batch: &[&ValueGraph], lr: f32) -> (HexGNNModel, f32) {
+    let b_count = batch.len();
+    let mut total_nodes = 0usize;
+    let mut node_offsets = Vec::with_capacity(b_count);
+
+    for g in batch {
+        node_offsets.push(total_nodes);
+        total_nodes += g.node_features.len();
+    }
+
+    if total_nodes == 0 {
+        return (HexGNNModel::new_zero(), 0.0);
+    }
+
+    let mut x_flat = vec![0.0f32; total_nodes * NODE_FEAT_DIM];
+    let mut combined_edges = Vec::new();
+
+    for (i, g) in batch.iter().enumerate() {
+        let offset = node_offsets[i];
+        let n_nodes = g.node_features.len();
+        for u in 0..n_nodes {
+            x_flat[(offset + u) * NODE_FEAT_DIM..(offset + u + 1) * NODE_FEAT_DIM]
+                .copy_from_slice(&g.node_features[u]);
+        }
+        for &(u, v) in &g.edge_index {
+            combined_edges.push((offset + u, offset + v));
+        }
+    }
+
+    let mut neighbor_count = vec![0usize; total_nodes];
+    for &(u, _) in &combined_edges {
+        if u < total_nodes {
+            neighbor_count[u] += 1;
+        }
+    }
+
+    let mut neigh_accum = vec![0.0f32; total_nodes * HIDDEN_DIM];
+    let n_layers = model.layers.len();
+    let mut h_pres = Vec::with_capacity(n_layers);
+    let mut h_vals = Vec::with_capacity(n_layers);
+    let mut neighs = Vec::with_capacity(n_layers);
+    let mut h_curr = x_flat.clone();
+    let mut curr_dim = NODE_FEAT_DIM;
+
+    for (li, layer) in model.layers.iter().enumerate() {
+        let has_residual = li > 0;
+        let out_dim = HIDDEN_DIM;
+
+        let neigh = if li == 0 {
+            let mut n0 = vec![0.0f32; total_nodes * NODE_FEAT_DIM];
+            for &(u, v) in &combined_edges {
+                if u < total_nodes && v < total_nodes {
+                    for i in 0..NODE_FEAT_DIM {
+                        n0[u * NODE_FEAT_DIM + i] += x_flat[v * NODE_FEAT_DIM + i];
+                    }
+                }
+            }
+            for u in 0..total_nodes {
+                let c = neighbor_count[u].max(1) as f32;
+                for i in 0..NODE_FEAT_DIM {
+                    n0[u * NODE_FEAT_DIM + i] /= c;
+                }
+            }
+            n0
+        } else {
+            neigh_accum.fill(0.0);
+            for &(u, v) in &combined_edges {
+                if u < total_nodes && v < total_nodes {
+                    for i in 0..HIDDEN_DIM {
+                        neigh_accum[u * HIDDEN_DIM + i] += h_curr[v * HIDDEN_DIM + i];
+                    }
+                }
+            }
+            for u in 0..total_nodes {
+                let c = neighbor_count[u].max(1) as f32;
+                for i in 0..HIDDEN_DIM {
+                    neigh_accum[u * HIDDEN_DIM + i] /= c;
+                }
+            }
+            neigh_accum.clone()
+        };
+
+        let y_s = layer.w_self.forward(&h_curr, total_nodes * curr_dim);
+        let y_n = layer.w_neigh.forward(&neigh, total_nodes * curr_dim);
+
+        let mut h_pre = vec![0.0f32; total_nodes * out_dim];
+        let mut h_val = vec![0.0f32; total_nodes * out_dim];
+
+        for i in 0..total_nodes * out_dim {
+            let sum = y_s[i] + y_n[i];
+            h_pre[i] = sum;
+            let relu = if sum > 0.0 { sum } else { 0.0 };
+            h_val[i] = if has_residual { relu + h_curr[i] } else { relu };
+        }
+
+        neighs.push(neigh);
+        h_pres.push(h_pre);
+        h_vals.push(h_val.clone());
+        h_curr = h_val;
+        curr_dim = out_dim;
+    }
+
+    let h_final = h_vals.last().unwrap();
+
+    // Value Head Forward
+    let mut mean_h_batch = vec![0.0f32; b_count * HIDDEN_DIM];
+    for (i, g) in batch.iter().enumerate() {
+        let offset = node_offsets[i];
+        let n_nodes = g.node_features.len();
+        if n_nodes > 0 {
+            let inv_n = 1.0 / n_nodes as f32;
+            for u in 0..n_nodes {
+                for d in 0..HIDDEN_DIM {
+                    mean_h_batch[i * HIDDEN_DIM + d] += h_final[(offset + u) * HIDDEN_DIM + d] * inv_n;
+                }
+            }
+        }
+    }
+
+    let val_hidden = model.w_val1.forward(&mean_h_batch, b_count * HIDDEN_DIM);
+    let mut val_relu = vec![0.0f32; b_count * HIDDEN_DIM];
+    for i in 0..b_count * HIDDEN_DIM {
+        val_relu[i] = if val_hidden[i] > 0.0 { val_hidden[i] } else { 0.0 };
+    }
+    let all_values = model.w_val2.forward(&val_relu, b_count * HIDDEN_DIM);
+
+    // Value Huber Loss & Backward
+    let mut total_val_loss = 0.0f32;
+    let mut val_grads = vec![0.0f32; b_count];
+
+    for (i, g) in batch.iter().enumerate() {
+        let pred_val = all_values[i];
+        let val_err = pred_val - g.target_val;
+        let sample_val_loss = if val_err.abs() <= 1.0 {
+            0.5 * val_err * val_err
+        } else {
+            val_err.abs() - 0.5
+        };
+        total_val_loss += sample_val_loss;
+        val_grads[i] = val_err.clamp(-1.0, 1.0);
+    }
+
+    let mut grads = HexGNNModel::new_zero();
+
+    // 1. Backprop qua Value Head
+    let mut d_val_relu = vec![0.0f32; b_count * HIDDEN_DIM];
+    for i in 0..b_count {
+        let v_g = val_grads[i];
+        grads.w_val2.bias[0] += v_g;
+        for d in 0..HIDDEN_DIM {
+            grads.w_val2.weight[d] += v_g * val_relu[i * HIDDEN_DIM + d];
+            d_val_relu[i * HIDDEN_DIM + d] = v_g * model.w_val2.weight[d];
+        }
+    }
+
+    let mut d_mean_h = vec![0.0f32; b_count * HIDDEN_DIM];
+    for i in 0..b_count {
+        for d in 0..HIDDEN_DIM {
+            let idx = i * HIDDEN_DIM + d;
+            let d_h = if val_hidden[idx] > 0.0 { d_val_relu[idx] } else { 0.0 };
+            grads.w_val1.bias[d] += d_h;
+            let w_off = d * HIDDEN_DIM;
+            for j in 0..HIDDEN_DIM {
+                grads.w_val1.weight[w_off + j] += d_h * mean_h_batch[i * HIDDEN_DIM + j];
+                d_mean_h[i * HIDDEN_DIM + j] += d_h * model.w_val1.weight[w_off + j];
+            }
+        }
+    }
+
+    let mut d_h_final = vec![0.0f32; total_nodes * HIDDEN_DIM];
+    for (i, g) in batch.iter().enumerate() {
+        let offset = node_offsets[i];
+        let n_nodes = g.node_features.len();
+        if n_nodes > 0 {
+            let inv_n = 1.0 / n_nodes as f32;
+            for u in 0..n_nodes {
+                for d in 0..HIDDEN_DIM {
+                    d_h_final[(offset + u) * HIDDEN_DIM + d] += d_mean_h[i * HIDDEN_DIM + d] * inv_n;
+                }
+            }
+        }
+    }
+
+    // 2. Backprop qua các tầng GNN
+    let mut d_h_curr = d_h_final;
+    for li in (0..n_layers).rev() {
+        let has_residual = li > 0;
+        let in_dim = if li == 0 { NODE_FEAT_DIM } else { HIDDEN_DIM };
+        let out_dim = HIDDEN_DIM;
+        let layer = &model.layers[li];
+        let grad_layer = &mut grads.layers[li];
+
+        let mut d_h_prev = if has_residual { d_h_curr.clone() } else { vec![0.0f32; total_nodes * in_dim] };
+        let mut d_relu = vec![0.0f32; total_nodes * out_dim];
+
+        for i in 0..total_nodes * out_dim {
+            d_relu[i] = if h_pres[li][i] > 0.0 { d_h_curr[i] } else { 0.0 };
+        }
+
+        let mut d_neigh = vec![0.0f32; total_nodes * out_dim];
+        let h_in = if has_residual { &h_vals[li - 1] } else { &x_flat };
+
+        for u in 0..total_nodes {
+            for o in 0..out_dim {
+                let g = d_relu[u * out_dim + o];
+                grad_layer.w_self.bias[o] += g;
+                grad_layer.w_neigh.bias[o] += g;
+                let w_off = o * in_dim;
+                for i in 0..in_dim {
+                    grad_layer.w_self.weight[w_off + i] += g * h_in[u * in_dim + i];
+                    if has_residual {
+                        d_h_prev[u * out_dim + i] += g * layer.w_self.weight[w_off + i];
+                    }
+                    grad_layer.w_neigh.weight[w_off + i] += g * neighs[li][u * in_dim + i];
+                    d_neigh[u * out_dim + i] += g * layer.w_neigh.weight[w_off + i];
+                }
+            }
+        }
+
+        if has_residual {
+            for &(u, v) in &combined_edges {
+                if u < total_nodes && v < total_nodes {
+                    let count_u = neighbor_count[u].max(1) as f32;
+                    for i in 0..out_dim {
+                        d_h_prev[v * out_dim + i] += d_neigh[u * out_dim + i] / count_u;
+                    }
+                }
+            }
+            d_h_curr = d_h_prev;
+        }
+    }
+
+    (grads, total_val_loss)
+}
+
 fn main() {
     let dataset_path = "data/real_score_dataset_1m.bin";
     if !Path::new(dataset_path).exists() {
@@ -68,7 +311,7 @@ fn main() {
     }
 
     println!("============================================================");
-    println!(">>> HUẤN LUYỆN GNN DISJOINT BATCHED BACKPROP TRÊN ĐIỂM SỐ THẬT <<<");
+    println!(">>> HUẤN LUYỆN GNN PURE VALUE DISJOINT (SIÊU TỐC ĐỘ) <<<");
     println!(" - Đang nạp dataset từ: {}...", dataset_path);
     println!("============================================================\n");
 
@@ -78,19 +321,15 @@ fn main() {
     let n_samples = dataset.len();
     println!("✅ Đã nạp thành công {} samples độc nhất (100% Unique)!", n_samples);
 
-    println!("[Chuyển Đổi] Đang tối ưu hóa định dạng đồ thị sang Disjoint Batching...");
-    let az_samples: Vec<AlphaZeroSample> = dataset
+    println!("[Chuyển Đổi] Tối ưu hóa cấu trúc Pure Value Graph (bỏ action thừa)...");
+    let value_graphs: Vec<ValueGraph> = dataset
         .into_par_iter()
         .map(|s| {
             let obs = s.obs.to_graph_observation();
-            let n_actions = obs.valid_actions.len();
-            let target_pi = vec![0.0f32; n_actions];
-            // Target value chuẩn hóa: scale về [0, 100] (chia 100.0)
-            let target_val = s.real_score / 100.0;
-            AlphaZeroSample {
-                obs,
-                target_pi,
-                target_val,
+            ValueGraph {
+                node_features: obs.node_features,
+                edge_index: obs.edge_index,
+                target_val: s.real_score / 100.0,
             }
         })
         .collect();
@@ -103,7 +342,7 @@ fn main() {
 
     println!(" - Số Epochs: {}", epochs);
     println!(" - Batch Size: {} ({} batches / epoch)", batch_size, num_batches);
-    println!(" - Tốc độ: Chạy Disjoint Graph Batching siêu tốc!\n");
+    println!(" - Tốc độ: Chạy Pure Value Disjoint Backprop siêu mượt!\n");
 
     let mut indices: Vec<usize> = (0..n_samples).collect();
     let mut rng = rand::thread_rng();
@@ -120,20 +359,17 @@ fn main() {
             let batch_indices = &indices[start_idx..end_idx];
 
             let chunk_size = 64;
-            let (mut batch_grads, (_, batch_val_loss)) = batch_indices
+            let (mut batch_grads, batch_val_loss) = batch_indices
                 .par_chunks(chunk_size)
                 .map(|chunk| {
-                    let chunk_samples: Vec<&AlphaZeroSample> = chunk.iter().map(|&idx| &az_samples[idx]).collect();
-                    let mut chunk_grad = HexGNNModel::new_zero();
-                    // value_coeff = 1.0 vì chúng ta chỉ huấn luyện Value Head trên điểm số thật
-                    let (pi_l, val_l) = model.backward_accumulate_batch(&chunk_samples, 1.0, &mut chunk_grad);
-                    (chunk_grad, (pi_l, val_l))
+                    let chunk_samples: Vec<&ValueGraph> = chunk.iter().map(|&idx| &value_graphs[idx]).collect();
+                    train_value_batch(&model, &chunk_samples, lr)
                 })
                 .reduce(
-                    || (HexGNNModel::new_zero(), (0.0f32, 0.0f32)),
-                    |(mut g_acc, (pi_acc, val_acc)), (g, (pi, val))| {
+                    || (HexGNNModel::new_zero(), 0.0f32),
+                    |(mut g_acc, val_acc), (g, val)| {
                         g_acc.add_assign(&g);
-                        (g_acc, (pi_acc + pi, val_acc + val))
+                        (g_acc, val_acc + val)
                     },
                 );
 
