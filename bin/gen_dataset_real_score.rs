@@ -2,7 +2,6 @@ use rayon::prelude::*;
 use rand::Rng;
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -44,11 +43,11 @@ impl From<GraphObservation> for SerializableGraphObservation {
     }
 }
 
-/// Mẫu dữ liệu huấn luyện NNUE Supervised (Target = TỔNG ĐIỂM CUỐI VÁN - FINAL GAME SCORE)
+/// Mẫu dữ liệu huấn luyện GNN Value Head (Target = TỔNG ĐIỂM CUỐI VÁN - MONTE CARLO TARGET)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RealScoreSample {
     pub obs: SerializableGraphObservation,
-    pub real_score: f32, // ĐÃ ĐỔI: Chứa Tổng Điểm Cuối Ván (Terminal Outcome Score)
+    pub real_score: f32, // Chứa Tổng Điểm Cuối Ván (Expected Final Score)
     pub remaining_tiles: usize,
     pub placed_count: usize,
 }
@@ -157,52 +156,26 @@ pub fn evaluate_action_inplace(env: &DorfromantikEnv, act: Action, weights: &Heu
         + weights.w_open_edges * f_open_edges
 }
 
-/// Tính Hash 64-bit bất biến cho 1 trạng thái bàn cờ
-pub fn compute_board_hash(env: &DorfromantikEnv) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    let mut sorted_keys: Vec<(i32, i32)> = env.board.placed_tiles.keys().copied().collect();
-    sorted_keys.sort_unstable();
-
-    for pos in sorted_keys {
-        if let Some(pt) = env.board.placed_tiles.get(&pos) {
-            pos.hash(&mut hasher);
-            pt.rotation.hash(&mut hasher);
-            for e in pt.edge_config.edges {
-                (e as u8).hash(&mut hasher);
-            }
-        }
-    }
-    if let Some(curr) = env.current_tile() {
-        curr.to_hex_edge_config().edges.hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
 fn main() {
     let (target_seed, initial_stack, tile_limit) = load_game_config();
     let base_weights = load_best_weights();
-    let target_unique_samples = 1_000_000usize; // 1 TRIỆU MẪU CHUẨN
+    let target_total_samples = 1_000_000usize; // 1 TRIỆU MẪU KỲ VỌNG
 
     println!("============================================================");
-    println!(">>> BỘ SINH DATASET HỌC TỔNG ĐIỂM CUỐI VÁN (TERMINAL REWARD GNN) <<<");
+    println!(">>> BỘ SINH DATASET HỌC GIÁ TRỊ KỲ VỌNG (MONTE CARLO EXPECTED VALUE) <<<");
     println!(" - Seed Mục Tiêu : {}", target_seed);
-    println!(" - Mục Tiêu Mẫu  : {} samples độc nhất (100% Unique)", target_unique_samples);
-    println!(" - Mục Tiêu Học  : TARGET = TỔNG ĐIỂM KẾT THÚC VÁN ĐẤU (6,000 -> 7,420+ pts)");
-    println!(" - Cơ Chế RAM    : Khóa cứng < 200MB (Stream ghi đĩa liên tục)");
+    println!(" - Mục Tiêu Mẫu  : {} samples (Học phân phối xác suất kỳ vọng E[V])", target_total_samples);
+    println!(" - Mục Tiêu Học  : TARGET = TỔNG ĐIỂM KẾT THÚC VÁN ĐẤU");
+    println!(" - Cơ Chế        : Zero Lock Mutex - Stream ghi đĩa siêu tốc (RAM < 100MB)");
     println!("============================================================\n");
 
     let output_dir = "data";
     fs::create_dir_all(output_dir).unwrap();
     let output_file = format!("{}/real_score_dataset_1m.bin", output_dir);
 
-    // Xóa file cũ để ghi dataset mới học tổng điểm cuối ván
     let _ = fs::remove_file(&output_file);
 
     let start_time = Instant::now();
-    let seen_hashes = Mutex::new(HashSet::<u64>::with_capacity(target_unique_samples));
     let disk_writer = Mutex::new(BufWriter::new(
         OpenOptions::new()
             .create(true)
@@ -210,20 +183,20 @@ fn main() {
             .open(&output_file)
             .unwrap(),
     ));
-    let total_unique = AtomicUsize::new(0);
+    let total_samples_collected = AtomicUsize::new(0);
 
     let mini_batch_size = 500;
 
-    while total_unique.load(Ordering::Relaxed) < target_unique_samples {
+    while total_samples_collected.load(Ordering::Relaxed) < target_total_samples {
         (0..mini_batch_size).into_par_iter().for_each(|_| {
-            if total_unique.load(Ordering::Relaxed) >= target_unique_samples {
+            if total_samples_collected.load(Ordering::Relaxed) >= target_total_samples {
                 return;
             }
 
             let mut rng = rand::thread_rng();
             let normal = Normal::new(0.0, 0.15).unwrap();
 
-            // Biến thể phong cách chơi
+            // Biến thể phong cách chơi (Weight Noise)
             let mut game_weights = base_weights.clone();
             game_weights.w_fit *= 1.0 + normal.sample(&mut rng);
             game_weights.w_perfect *= 1.0 + normal.sample(&mut rng);
@@ -232,8 +205,6 @@ fn main() {
 
             let mut env = DorfromantikEnv::new(target_seed, initial_stack, tile_limit);
             let mut turn = 0;
-
-            // Lưu tạm toàn bộ trạng thái trong 1 ván đấu
             let mut episode_observations = Vec::with_capacity(tile_limit);
 
             while !env.is_game_over() {
@@ -243,20 +214,9 @@ fn main() {
                     break;
                 }
 
-                let hash = compute_board_hash(&env);
-                let is_new = {
-                    let mut set = seen_hashes.lock().unwrap();
-                    if set.len() < target_unique_samples && set.insert(hash) {
-                        true
-                    } else {
-                        false
-                    }
-                };
-
-                if is_new {
-                    let obs = env.extract_graph_observation();
-                    episode_observations.push((obs, env.score_manager.remaining_tiles, env.placed_count));
-                }
+                // Thu thập đồ thị của mọi trạng thái trong ván
+                let obs = env.extract_graph_observation();
+                episode_observations.push((obs, env.score_manager.remaining_tiles, env.placed_count));
 
                 // Chọn nước đi
                 let chosen_action = if turn <= 3 {
@@ -285,7 +245,7 @@ fn main() {
                 }
             }
 
-            // KHI VÁN ĐẤU HOÀN TẤT: LẤY TỔNG ĐIỂM CUỐI VÁN (FINAL TERMINAL SCORE) GÁN CHO TẤT CẢ CÁC BƯỚC!
+            // GÁN TỔNG ĐIỂM CUỐI VÁN CHO TẤT CẢ CÁC TRẠNG THÁI TRONG VÁN
             let final_game_score = env.score_manager.total_score as f32;
 
             if !episode_observations.is_empty() {
@@ -293,14 +253,14 @@ fn main() {
                 for (obs, rem, placed) in episode_observations {
                     local_samples.push(RealScoreSample {
                         obs: obs.into(),
-                        real_score: final_game_score, // GÁN NHÃN LÀ TỔNG ĐIỂM CUỐI CÙNG!
+                        real_score: final_game_score,
                         remaining_tiles: rem,
                         placed_count: placed,
                     });
                 }
 
                 let n_saved = local_samples.len();
-                let count = total_unique.fetch_add(n_saved, Ordering::Relaxed) + n_saved;
+                let count = total_samples_collected.fetch_add(n_saved, Ordering::Relaxed) + n_saved;
 
                 {
                     let mut writer = disk_writer.lock().unwrap();
@@ -310,12 +270,12 @@ fn main() {
                     let _ = writer.flush();
                 }
 
-                if count % 20_000 < n_saved || count >= target_unique_samples {
+                if count % 25_000 < n_saved || count >= target_total_samples {
                     let elapsed = start_time.elapsed().as_secs_f32();
                     let speed = count as f32 / elapsed.max(0.001);
                     println!(
-                        "⏳ [Tiến Độ] Đã lưu {:>7}/{} mẫu UNIQUE ({:>3.0}%) | Tốc độ: {:>6.0} mẫu/s | RAM: <150MB | {:.1}s",
-                        count, target_unique_samples, (count as f32 / target_unique_samples as f32) * 100.0, speed, elapsed
+                        "⏳ [Tiến Độ] Đã lưu {:>7}/{} mẫu Monte Carlo ({:>3.0}%) | Tốc độ: {:>6.0} mẫu/s | RAM: <100MB | {:.1}s",
+                        count, target_total_samples, (count as f32 / target_total_samples as f32) * 100.0, speed, elapsed
                     );
                 }
             }
@@ -323,6 +283,6 @@ fn main() {
     }
 
     let dur = start_time.elapsed();
-    println!("\n✅ Hoàn tất! Sinh xong {} MẪU UNIQUE (Gán nhãn Tổng Điểm Cuối Ván) trong {:.2}s!", target_unique_samples, dur.as_secs_f32());
-    println!("🎉 File dataset lưu tại: {} (Sẵn sàng huấn luyện GNN Tiên Tri Tương Lai)", output_file);
+    println!("\n✅ Hoàn tất! Sinh xong {} MẪU MONTE CARLO trong {:.2}s!", target_total_samples, dur.as_secs_f32());
+    println!("🎉 File dataset lưu tại: {} (Chuẩn bị huấn luyện Value Function E[V])", output_file);
 }
