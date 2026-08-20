@@ -1,9 +1,9 @@
+use rayon::prelude::*;
 use rand::Rng;
 use rand_distr::{Distribution, Normal};
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -44,11 +44,11 @@ impl From<GraphObservation> for SerializableGraphObservation {
     }
 }
 
-/// Mẫu dữ liệu huấn luyện NNUE Supervised (SerializableGraphObservation + Điểm Số Thật)
+/// Mẫu dữ liệu huấn luyện NNUE Supervised (Target = TỔNG ĐIỂM CUỐI VÁN - FINAL GAME SCORE)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RealScoreSample {
     pub obs: SerializableGraphObservation,
-    pub real_score: f32,
+    pub real_score: f32, // ĐÃ ĐỔI: Chứa Tổng Điểm Cuối Ván (Terminal Outcome Score)
     pub remaining_tiles: usize,
     pub placed_count: usize,
 }
@@ -93,21 +93,9 @@ fn load_game_config() -> (i32, usize, usize) {
         for line in content.lines() {
             if let Some((k, v)) = line.split_once('=') {
                 match k.trim() {
-                    "REAL_TILE_SEED" => {
-                        if let Ok(s) = v.trim().parse() {
-                            seed = s;
-                        }
-                    }
-                    "ACTIVE_TileStackHeight" => {
-                        if let Ok(s) = v.trim().parse() {
-                            stack = s;
-                        }
-                    }
-                    "ACTIVE_TileLimit" => {
-                        if let Ok(s) = v.trim().parse() {
-                            limit = s;
-                        }
-                    }
+                    "REAL_TILE_SEED" => if let Ok(s) = v.trim().parse() { seed = s; },
+                    "ACTIVE_TileStackHeight" => if let Ok(s) = v.trim().parse() { stack = s; },
+                    "ACTIVE_TileLimit" => if let Ok(s) = v.trim().parse() { limit = s; },
                     _ => {}
                 }
             }
@@ -128,13 +116,9 @@ fn load_best_weights() -> HeuristicWeights {
     HeuristicWeights::default()
 }
 
-/// Đánh giá nhanh nước đi trực tiếp trên bảng không clone `env` (Siêu Tốc)
+/// Đánh giá nhanh nước đi trực tiếp trên bảng không clone `env`
 #[inline(always)]
-pub fn evaluate_action_inplace(
-    env: &DorfromantikEnv,
-    act: Action,
-    weights: &HeuristicWeights,
-) -> f32 {
+pub fn evaluate_action_inplace(env: &DorfromantikEnv, act: Action, weights: &HeuristicWeights) -> f32 {
     let curr_tile = match env.current_tile() {
         Some(t) => t,
         None => return 0.0,
@@ -164,21 +148,16 @@ pub fn evaluate_action_inplace(
         }
     }
 
-    let f_perfect = if neighbor_count == 6 && matched_edges == 6 {
-        1.0
-    } else {
-        0.0
-    };
+    let f_perfect = if neighbor_count == 6 && matched_edges == 6 { 1.0 } else { 0.0 };
     let f_open_edges = (6.0 - neighbor_count as f32).max(0.0);
 
-    // Tính điểm tổng hợp nhanh
     weights.w_fit * f_fit
         + weights.w_perfect * f_perfect
         + weights.w_mismatch_penalty * f_mismatch
         + weights.w_open_edges * f_open_edges
 }
 
-/// Tính Hash 64-bit bất biến cho 1 trạng thái bàn cờ (Board State Hash)
+/// Tính Hash 64-bit bất biến cho 1 trạng thái bàn cờ
 pub fn compute_board_hash(env: &DorfromantikEnv) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -208,20 +187,18 @@ fn main() {
     let target_unique_samples = 1_000_000usize; // 1 TRIỆU MẪU CHUẨN
 
     println!("============================================================");
-    println!(">>> BỘ SINH DATASET 1M MẪU SIÊU TỐC & DISK STREAMING (RAM < 200MB) <<<");
+    println!(">>> BỘ SINH DATASET HỌC TỔNG ĐIỂM CUỐI VÁN (TERMINAL REWARD GNN) <<<");
     println!(" - Seed Mục Tiêu : {}", target_seed);
-    println!(
-        " - Mục Tiêu Mẫu  : {} samples độc nhất (100% Unique)",
-        target_unique_samples
-    );
-    println!(" - Bộ Nhớ RAM    : Khóa cứng < 200MB (Stream ghi đĩa liên tục)");
+    println!(" - Mục Tiêu Mẫu  : {} samples độc nhất (100% Unique)", target_unique_samples);
+    println!(" - Mục Tiêu Học  : TARGET = TỔNG ĐIỂM KẾT THÚC VÁN ĐẤU (6,000 -> 7,420+ pts)");
+    println!(" - Cơ Chế RAM    : Khóa cứng < 200MB (Stream ghi đĩa liên tục)");
     println!("============================================================\n");
 
     let output_dir = "data";
     fs::create_dir_all(output_dir).unwrap();
     let output_file = format!("{}/real_score_dataset_1m.bin", output_dir);
 
-    // Xóa file cũ nếu có để ghi mới
+    // Xóa file cũ để ghi dataset mới học tổng điểm cuối ván
     let _ = fs::remove_file(&output_file);
 
     let start_time = Instant::now();
@@ -255,7 +232,9 @@ fn main() {
 
             let mut env = DorfromantikEnv::new(target_seed, initial_stack, tile_limit);
             let mut turn = 0;
-            let mut local_samples = Vec::with_capacity(tile_limit);
+
+            // Lưu tạm toàn bộ trạng thái trong 1 ván đấu
+            let mut episode_observations = Vec::with_capacity(tile_limit);
 
             while !env.is_game_over() {
                 turn += 1;
@@ -265,8 +244,6 @@ fn main() {
                 }
 
                 let hash = compute_board_hash(&env);
-
-                // Lọc trùng bằng Hash 64-bit (Chỉ tốn 8 bytes / mẫu)
                 let is_new = {
                     let mut set = seen_hashes.lock().unwrap();
                     if set.len() < target_unique_samples && set.insert(hash) {
@@ -278,16 +255,10 @@ fn main() {
 
                 if is_new {
                     let obs = env.extract_graph_observation();
-                    let sample = RealScoreSample {
-                        obs: obs.into(),
-                        real_score: env.score_manager.total_score as f32,
-                        remaining_tiles: env.score_manager.remaining_tiles,
-                        placed_count: env.placed_count,
-                    };
-                    local_samples.push(sample);
+                    episode_observations.push((obs, env.score_manager.remaining_tiles, env.placed_count));
                 }
 
-                // Chọn nước đi siêu tốc không clone
+                // Chọn nước đi
                 let chosen_action = if turn <= 3 {
                     valid_actions[rng.gen_range(0..valid_actions.len())]
                 } else {
@@ -314,8 +285,20 @@ fn main() {
                 }
             }
 
-            // Ghi trực tiếp xuống đĩa rồi xả RAM ngay lập tức!
-            if !local_samples.is_empty() {
+            // KHI VÁN ĐẤU HOÀN TẤT: LẤY TỔNG ĐIỂM CUỐI VÁN (FINAL TERMINAL SCORE) GÁN CHO TẤT CẢ CÁC BƯỚC!
+            let final_game_score = env.score_manager.total_score as f32;
+
+            if !episode_observations.is_empty() {
+                let mut local_samples = Vec::with_capacity(episode_observations.len());
+                for (obs, rem, placed) in episode_observations {
+                    local_samples.push(RealScoreSample {
+                        obs: obs.into(),
+                        real_score: final_game_score, // GÁN NHÃN LÀ TỔNG ĐIỂM CUỐI CÙNG!
+                        remaining_tiles: rem,
+                        placed_count: placed,
+                    });
+                }
+
                 let n_saved = local_samples.len();
                 let count = total_unique.fetch_add(n_saved, Ordering::Relaxed) + n_saved;
 
@@ -340,13 +323,6 @@ fn main() {
     }
 
     let dur = start_time.elapsed();
-    println!(
-        "\n✅ Hoàn tất! Sinh xong {} MẪU UNIQUE trong {:.2}s!",
-        target_unique_samples,
-        dur.as_secs_f32()
-    );
-    println!(
-        "🎉 File dataset lưu tại: {} (RAM sử dụng luôn < 150MB)",
-        output_file
-    );
+    println!("\n✅ Hoàn tất! Sinh xong {} MẪU UNIQUE (Gán nhãn Tổng Điểm Cuối Ván) trong {:.2}s!", target_unique_samples, dur.as_secs_f32());
+    println!("🎉 File dataset lưu tại: {} (Sẵn sàng huấn luyện GNN Tiên Tri Tương Lai)", output_file);
 }
