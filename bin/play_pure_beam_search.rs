@@ -1,7 +1,6 @@
 use rayon::prelude::*;
 use std::env as std_env;
 use std::fs;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Instant;
 
 use dorfromantik_remake::board::{get_neighbor_pos, opposite_direction};
@@ -28,7 +27,7 @@ fn load_monthly_game_config() -> (i32, usize, usize) {
     (seed, initial_stack, tile_limit)
 }
 
-/// Đánh giá nhanh tiềm năng của 1 nước đi bằng Điểm Ghép Cạnh + Thưởng Perfect
+/// Đánh giá nhanh tiềm năng của 1 nước đi bằng Điểm Ghép Cạnh + Thưởng Perfect (chỉ dùng để sort candidate nếu có giới hạn beam)
 #[inline(always)]
 fn evaluate_candidate_fast(env: &DorfromantikEnv, act: Action) -> f32 {
     let curr_tile = match env.current_tile() {
@@ -59,16 +58,8 @@ fn evaluate_candidate_fast(env: &DorfromantikEnv, act: Action) -> f32 {
     fit_score + perfect_bonus
 }
 
-/// Tính Cận Trên (Upper-Bound) điểm số tối đa có thể đạt thêm trong k bước tới
-#[inline(always)]
-fn max_possible_gain(remaining_depth: usize) -> f32 {
-    // Cận trên toán học an toàn tuyệt đối (Admissible Bound):
-    // 1 tile tối đa: 60 fit + 60 perfect + 2 quests (200) + 11 tiles thưởng (660) = ~980 điểm
-    remaining_depth as f32 * 980.0
-}
-
-/// Thuật toán PURE BEAM SEARCH + BRANCH & BOUND PRUNING (Cắt Tỉa Cận Trên Siêu Tốc)
-pub fn select_best_action_branch_bound(
+/// Thuật toán 100% PURE BRUTE-FORCE (Không Cắt Tỉa, 100% Total Score Thuần Túy)
+pub fn select_best_action_raw_brute_force(
     env: &DorfromantikEnv,
     beam_width_step1: usize,
     beam_width_step2: usize,
@@ -81,7 +72,7 @@ pub fn select_best_action_branch_bound(
         return valid_actions.get(0).copied().unwrap_or(Action { q: 0, r: 0, rotation: 0 });
     }
 
-    // TẦNG 1: Lọc ứng viên và sắp xếp giảm dần theo chất lượng
+    // TẦNG 1
     let mut candidates_step1: Vec<(f32, Action)> = valid_actions
         .iter()
         .map(|&act| (evaluate_candidate_fast(env, act), act))
@@ -89,44 +80,30 @@ pub fn select_best_action_branch_bound(
     candidates_step1.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
     let top_candidates_step1: Vec<Action> = if beam_width_step1 == 0 || beam_width_step1 >= candidates_step1.len() {
-        candidates_step1.into_iter().map(|(_, a)| a).collect()
+        valid_actions.clone()
     } else {
         candidates_step1.into_iter().take(beam_width_step1).map(|(_, a)| a).collect()
     };
 
-    // Alpha chung được chia sẻ giữa tất cả các luồng để Cắt Tỉa Sớm (Global Alpha Pruning)
-    let global_best_alpha = AtomicI64::new(i64::MIN);
-
+    // DUYỆT TẦNG 1 SONG SONG
     let evaluated_branches: Vec<(f32, Action)> = top_candidates_step1
         .par_iter()
         .map(|&act1| {
             let mut env1 = env.clone();
             let _ = env1.step(act1);
 
-            let score1 = env1.score_manager.total_score as f32 + (env1.score_manager.remaining_tiles * 60) as f32;
+            let score1 = env1.score_manager.total_score as f32;
 
             if env1.is_game_over() || depth == 1 {
-                let s_int = (score1 * 100.0) as i64;
-                global_best_alpha.fetch_max(s_int, Ordering::Relaxed);
                 return (score1, act1);
-            }
-
-            // BRANCH & BOUND CHECK TẦNG 1:
-            let upper_bound1 = score1 + max_possible_gain(depth - 1);
-            let current_best = global_best_alpha.load(Ordering::Relaxed) as f32 / 100.0;
-            if upper_bound1 <= current_best {
-                // Nhánh này dù may mắn nhất cũng không thể thắng kỷ lục hiện tại => CẮT TỈA!
-                return (f32::NEG_INFINITY, act1);
             }
 
             let valid_actions2 = env1.get_valid_actions();
             if valid_actions2.is_empty() {
-                let s_int = (score1 * 100.0) as i64;
-                global_best_alpha.fetch_max(s_int, Ordering::Relaxed);
                 return (score1, act1);
             }
 
-            // TẦNG 2: Sắp xếp giảm dần để sớm cập nhật Alpha cao nhất
+            // TẦNG 2
             let mut candidates_step2: Vec<(f32, Action)> = valid_actions2
                 .iter()
                 .map(|&act| (evaluate_candidate_fast(&env1, act), act))
@@ -134,7 +111,7 @@ pub fn select_best_action_branch_bound(
             candidates_step2.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
             let top_candidates_step2: Vec<Action> = if beam_width_step2 == 0 || beam_width_step2 >= candidates_step2.len() {
-                candidates_step2.into_iter().map(|(_, a)| a).collect()
+                valid_actions2.clone()
             } else {
                 candidates_step2.into_iter().take(beam_width_step2).map(|(_, a)| a).collect()
             };
@@ -145,30 +122,19 @@ pub fn select_best_action_branch_bound(
                 let mut env2 = env1.clone();
                 let _ = env2.step(act2);
 
-                let score2 = env2.score_manager.total_score as f32 + (env2.score_manager.remaining_tiles * 60) as f32;
+                let score2 = env2.score_manager.total_score as f32;
 
                 if env2.is_game_over() || depth == 2 {
                     if score2 > max_branch_score {
                         max_branch_score = score2;
-                        let s_int = (score2 * 100.0) as i64;
-                        global_best_alpha.fetch_max(s_int, Ordering::Relaxed);
                     }
                     continue;
-                }
-
-                // BRANCH & BOUND CHECK TẦNG 2:
-                let upper_bound2 = score2 + max_possible_gain(depth - 2);
-                let cur_alpha = global_best_alpha.load(Ordering::Relaxed) as f32 / 100.0;
-                if upper_bound2 <= cur_alpha {
-                    continue; // Cắt tỉa nhánh con của Tầng 2
                 }
 
                 let valid_actions3 = env2.get_valid_actions();
                 if valid_actions3.is_empty() {
                     if score2 > max_branch_score {
                         max_branch_score = score2;
-                        let s_int = (score2 * 100.0) as i64;
-                        global_best_alpha.fetch_max(s_int, Ordering::Relaxed);
                     }
                     continue;
                 }
@@ -181,7 +147,7 @@ pub fn select_best_action_branch_bound(
                 candidates_step3.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
                 let top_candidates_step3: Vec<Action> = if beam_width_step3 == 0 || beam_width_step3 >= candidates_step3.len() {
-                    candidates_step3.into_iter().map(|(_, a)| a).collect()
+                    valid_actions3.clone()
                 } else {
                     candidates_step3.into_iter().take(beam_width_step3).map(|(_, a)| a).collect()
                 };
@@ -190,30 +156,19 @@ pub fn select_best_action_branch_bound(
                     let mut env3 = env2.clone();
                     let _ = env3.step(act3);
 
-                    let score3 = env3.score_manager.total_score as f32 + (env3.score_manager.remaining_tiles * 60) as f32;
+                    let score3 = env3.score_manager.total_score as f32;
 
                     if env3.is_game_over() || depth == 3 {
                         if score3 > max_branch_score {
                             max_branch_score = score3;
-                            let s_int = (score3 * 100.0) as i64;
-                            global_best_alpha.fetch_max(s_int, Ordering::Relaxed);
                         }
                         continue;
-                    }
-
-                    // BRANCH & BOUND CHECK TẦNG 3:
-                    let upper_bound3 = score3 + max_possible_gain(depth - 3);
-                    let cur_alpha3 = global_best_alpha.load(Ordering::Relaxed) as f32 / 100.0;
-                    if upper_bound3 <= cur_alpha3 {
-                        continue; // Cắt tỉa nhánh con của Tầng 3
                     }
 
                     let valid_actions4 = env3.get_valid_actions();
                     if valid_actions4.is_empty() {
                         if score3 > max_branch_score {
                             max_branch_score = score3;
-                            let s_int = (score3 * 100.0) as i64;
-                            global_best_alpha.fetch_max(s_int, Ordering::Relaxed);
                         }
                         continue;
                     }
@@ -226,7 +181,7 @@ pub fn select_best_action_branch_bound(
                     candidates_step4.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
                     let top_candidates_step4: Vec<Action> = if beam_width_step4 == 0 || beam_width_step4 >= candidates_step4.len() {
-                        candidates_step4.into_iter().map(|(_, a)| a).collect()
+                        valid_actions4.clone()
                     } else {
                         candidates_step4.into_iter().take(beam_width_step4).map(|(_, a)| a).collect()
                     };
@@ -235,11 +190,9 @@ pub fn select_best_action_branch_bound(
                         let mut env4 = env3.clone();
                         let _ = env4.step(act4);
 
-                        let score4 = env4.score_manager.total_score as f32 + (env4.score_manager.remaining_tiles * 60) as f32;
+                        let score4 = env4.score_manager.total_score as f32;
                         if score4 > max_branch_score {
                             max_branch_score = score4;
-                            let s_int = (score4 * 100.0) as i64;
-                            global_best_alpha.fetch_max(s_int, Ordering::Relaxed);
                         }
                     }
                 }
@@ -261,36 +214,24 @@ fn main() {
     let args: Vec<String> = std_env::args().collect();
 
     let depth: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(3);
-    let w1: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(32);
-    let w2: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(16);
-    let w3: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(8);
-    let w4: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(4);
-
-    let total_branches = match depth {
-        2 => w1 * w2,
-        3 => w1 * w2 * w3,
-        4 => w1 * w2 * w3 * w4,
-        _ => w1 * w2 * w3,
-    };
+    let w1: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0); // 0 = 100% tất cả các nước
+    let w2: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0); // 0 = 100% tất cả các nước
+    let w3: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0); // 0 = 100% tất cả các nước
+    let w4: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0);
 
     println!("============================================================");
-    println!(">>> PURE BEAM SEARCH + BRANCH & BOUND ALPHA PRUNING <<<");
+    println!(">>> 100% PURE BRUTE-FORCE (RAW TOTAL SCORE ONLY) <<<");
     println!(" - Seed Mục Tiêu : {}", target_seed);
     println!(" - Tile Limit    : {} tiles", tile_limit);
     println!(" - Độ Sâu (Depth): {} Tầng", depth);
-    println!(" - Cấu Hình Nhánh: W1({}) x W2({}) x W3({}) x W4({})", w1, w2, w3, w4);
-    println!(" - Tối Ưu        : Cắt tỉa cận trên (Alpha Upper-Bound Pruning) đa luồng");
-    if w1 == 0 && w2 == 0 && w3 == 0 {
-        println!(" - Chế Độ        : ⚡ BRUTE-FORCE TOÀN DIỆN 100% CÓ CẮT TỈA ⚡");
-    } else {
-        println!(" - Cực Đại Nhánh : ~{} nhánh giả lập / Turn", total_branches);
-    }
+    println!(" - Cơ Chế        : 100% TOTAL SCORE THUẦN TÚY (Bỏ cọc bài, bỏ cắt tỉa)");
+    println!(" - Cấu Hình      : W1({}) x W2({}) x W3({}) x W4({})", w1, w2, w3, w4);
     println!("============================================================\n");
 
     let mut env = DorfromantikEnv::new(target_seed, initial_stack, tile_limit);
     let start_time = Instant::now();
 
-    println!("🎮 BẮT ĐẦU VÁN ĐẤU PURE SEARCH (BRANCH & BOUND)...\n");
+    println!("🎮 BẮT ĐẦU VÁN ĐẤU RAW BRUTE-FORCE...\n");
 
     let mut turn = 0;
     while !env.is_game_over() {
@@ -298,7 +239,7 @@ fn main() {
         let step_start = Instant::now();
         let old_score = env.score_manager.total_score;
 
-        let best_act = select_best_action_branch_bound(&env, w1, w2, w3, w4, depth);
+        let best_act = select_best_action_raw_brute_force(&env, w1, w2, w3, w4, depth);
         let res = env.step(best_act);
 
         let earned = env.score_manager.total_score.saturating_sub(old_score);
