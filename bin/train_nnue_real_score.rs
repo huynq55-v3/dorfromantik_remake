@@ -480,7 +480,7 @@ fn main() {
                             chunk_graphs.push(ValueGraph {
                                 node_features: obs.node_features,
                                 edge_index: obs.edge_index,
-                                target_val: sample.real_score / 1000.0, // CHUẨN HÓA / 1000.0 (5.0 -> 7.5)
+                                target_val: sample.real_score / 10.0, // CHUẨN HÓA / 10.0 (600.0 -> 740.0)
                             });
                         }
                     }

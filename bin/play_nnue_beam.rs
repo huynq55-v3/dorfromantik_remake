@@ -37,7 +37,7 @@ fn evaluate_state_gnn(model: &HexGNNModel, env: &DorfromantikEnv) -> f32 {
         &obs.valid_actions,
         &obs.action_features,
     );
-    val * 1000.0 // Scaled về điểm thực chuẩn xác (/1000.0 lúc train)
+    val * 10.0 // Scaled về điểm thực chuẩn xác (/10.0 lúc train)
 }
 
 /// Chọn nước đi tối ưu bằng GNN Value Head:
