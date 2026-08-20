@@ -114,9 +114,8 @@ fn main() {
         .into_par_iter()
         .flat_map(|_| {
             let mut rng = rand::thread_rng();
-            // 70% chạy trên Seed tháng 8, 30% chạy trên seed ngẫu nhiên để mở rộng không gian tổng quát
-            let game_seed = if rng.gen::<f32>() < 0.70 { target_seed } else { rng.gen::<i32>() };
-            let mut env = DorfromantikEnv::new(game_seed, initial_stack, tile_limit);
+            // Chạy 100% chuẩn xác trên Target Seed của monthly_game_info.txt
+            let mut env = DorfromantikEnv::new(target_seed, initial_stack, tile_limit);
 
             let mut game_records = Vec::with_capacity(tile_limit);
 
