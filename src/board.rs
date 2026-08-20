@@ -335,15 +335,19 @@ impl Board {
 
                 for &other_gid in &group_ids_vec[1..] {
                     if let Some(other_group) = self.groups.remove(&other_gid) {
+                        for &m_pos in &other_group.member_tiles {
+                            for d in 0..6 {
+                                if let Some(g) = self.edge_to_group.get_mut(&(m_pos, d)) {
+                                    if *g == other_gid {
+                                        *g = main_gid;
+                                    }
+                                }
+                            }
+                        }
                         if let Some(main_group) = self.groups.get_mut(&main_gid) {
                             main_group.member_tiles.extend(other_group.member_tiles);
                             main_group.total_element_count += other_group.total_element_count;
                             main_group.total_segment_count += other_group.total_segment_count;
-                        }
-                        for g in self.edge_to_group.values_mut() {
-                            if *g == other_gid {
-                                *g = main_gid;
-                            }
                         }
                     }
                 }
