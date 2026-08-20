@@ -1,4 +1,5 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::board::{Board, get_neighbor_pos};
 use crate::game_config::GroupType;
 use crate::generator::TileGenerator;
@@ -394,8 +395,9 @@ impl DorfromantikEnv {
         let placed = &self.board.placed_tiles;
         let candidates = self.board.get_candidate_placements();
 
-        let mut node_positions = Vec::new();
-        let mut pos_to_idx = HashMap::new();
+        let num_nodes_est = placed.len() + candidates.len();
+        let mut node_positions = Vec::with_capacity(num_nodes_est);
+        let mut pos_to_idx = HashMap::with_capacity_and_hasher(num_nodes_est, Default::default());
 
         for &pos in placed.keys() {
             pos_to_idx.insert(pos, node_positions.len());
@@ -550,8 +552,8 @@ impl DorfromantikEnv {
             node_features.push(feature);
         }
 
-        // Build Graph Edge Index
-        let mut edge_index = Vec::new();
+        // Build Graph Edge Index với pre-allocated memory
+        let mut edge_index = Vec::with_capacity(node_positions.len() * 4);
         for (idx, &pos) in node_positions.iter().enumerate() {
             for dir in 0..6 {
                 let n_pos = get_neighbor_pos(pos.0, pos.1, dir);

@@ -1,3 +1,4 @@
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use crate::game_config::GroupType;
@@ -71,24 +72,24 @@ pub struct ElementGroup {
     pub group_type: GroupType,
     pub total_element_count: usize,
     pub total_segment_count: usize,
-    pub member_tiles: HashSet<(i32, i32)>,
+    pub member_tiles: FxHashSet<(i32, i32)>,
     pub is_closed: bool,
 }
 
 /// Trạng thái lưu tạm để undo 1 nước đi (không clone placed_tiles).
 #[derive(Debug, Clone)]
 pub struct BoardUndoState {
-    pub groups: HashMap<usize, ElementGroup>,
-    pub edge_to_group: HashMap<((i32, i32), usize), usize>,
+    pub groups: FxHashMap<usize, ElementGroup>,
+    pub edge_to_group: FxHashMap<((i32, i32), usize), usize>,
     pub next_group_id: usize,
 }
 
 /// Board quản lý bàn chơi và thuật toán ghép cụm ElementGroupManager
 #[derive(Debug, Clone)]
 pub struct Board {
-    pub placed_tiles: HashMap<(i32, i32), PlacedTile>,
-    pub groups: HashMap<usize, ElementGroup>,
-    pub edge_to_group: HashMap<((i32, i32), usize), usize>,
+    pub placed_tiles: FxHashMap<(i32, i32), PlacedTile>,
+    pub groups: FxHashMap<usize, ElementGroup>,
+    pub edge_to_group: FxHashMap<((i32, i32), usize), usize>,
     pub next_group_id: usize,
 }
 
@@ -101,9 +102,9 @@ impl Default for Board {
 impl Board {
     pub fn new() -> Self {
         Self {
-            placed_tiles: HashMap::new(),
-            groups: HashMap::new(),
-            edge_to_group: HashMap::new(),
+            placed_tiles: FxHashMap::default(),
+            groups: FxHashMap::default(),
+            edge_to_group: FxHashMap::default(),
             next_group_id: 1,
         }
     }
@@ -295,7 +296,7 @@ impl Board {
             if connected_group_ids.is_empty() {
                 let gid = self.next_group_id;
                 self.next_group_id += 1;
-                let mut members = HashSet::new();
+                let mut members = FxHashSet::default();
                 members.insert((q, r));
 
                 let group = ElementGroup {
