@@ -71,7 +71,7 @@ fn find_latest_iter_model(model_dir: &str) -> Option<(usize, String)> {
 }
 fn fast_train_step(pipeline: &mut AlphaZeroPipeline) -> (f32, f32, f32) {
     let buf_len = pipeline.replay_buffer.len();
-    let warmup_threshold = (pipeline.replay_buffer.capacity as f32 * 0.20) as usize;
+    let warmup_threshold = (pipeline.replay_buffer.capacity as f32 * 0.25) as usize;
     if buf_len < warmup_threshold {
         println!(
             "[Train GPU] Warm-up: buffer {}/{} sample (cần ≥ {}) — chưa train, tiếp tục self-play tích lũy.",
@@ -447,8 +447,8 @@ fn main() {
     let buffer_capacity = config.replay_buffer_capacity.unwrap_or(200_000);
     println!(" - Replay Buffer Capacity: {} samples", buffer_capacity);
     println!(
-        " - Warm-up (train sau ≥ 20%): ≥ {} samples",
-        ((buffer_capacity as f32) * 0.20) as usize
+        " - Warm-up (train sau ≥ 25%): ≥ {} samples",
+        ((buffer_capacity as f32) * 0.25) as usize
     );
     println!(
         " - Dirichlet Alpha: {} | Dirichlet Eps: {}",

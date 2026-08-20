@@ -439,17 +439,15 @@ impl DorfromantikEnv {
                 }
 
                 // 14: (bỏ — không dùng, giữ = 0 để không phá layout kênh feature)
-                // 15: Group Open Edges (số cạnh mở của group liên thông, giúp biết quest sắp bị bịt hay không)
-                let mut max_open_edges = 0;
+                // 15: Group Open Edges (đếm nhanh số cạnh mở trực tiếp của tile)
+                let mut open_edges = 0;
                 for dir in 0..6 {
-                    if let Some(gt) = pt.edge_config.edges[dir].to_group_type() {
-                        let open = self.board.count_group_open_edges(pos, gt);
-                        if open > max_open_edges {
-                            max_open_edges = open;
-                        }
+                    let n_pos = get_neighbor_pos(pos.0, pos.1, dir);
+                    if !placed.contains_key(&n_pos) {
+                        open_edges += 1;
                     }
                 }
-                feature[15] = (max_open_edges as f32 / 12.0).clamp(0.0, 1.0);
+                feature[15] = (open_edges as f32 / 6.0).clamp(0.0, 1.0);
 
                 // 16..27: Quest features
                 if let GeneratedTile::Quest { quest_data, .. } = &pt.tile {

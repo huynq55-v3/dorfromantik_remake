@@ -493,24 +493,23 @@ impl Board {
     }
 
     /// Đếm số cạnh mở (open edges) của cụm địa hình chứa `pos` cho `group_type`
+    /// Tối ưu hóa cực đại: duyệt trực tiếp qua edge_to_group mà KHÔNG cấp phát HashSet member_tiles!
     pub fn count_group_open_edges(&self, pos: (i32, i32), group_type: GroupType) -> usize {
         let gids = self.get_group_ids_for_tile(pos, group_type);
-        let mut member_tiles = HashSet::new();
-
         if gids.is_empty() {
-            member_tiles.insert(pos);
-        } else {
-            for gid in gids {
-                if let Some(group) = self.groups.get(&gid) {
-                    member_tiles.extend(group.member_tiles.iter().copied());
-                }
-            }
-            if member_tiles.is_empty() {
-                member_tiles.insert(pos);
-            }
+            return 0;
         }
 
-        self.count_open_edges_for_tiles(&member_tiles, group_type, None)
+        let mut open_edges = 0;
+        for (&(t_pos, dir), &gid) in &self.edge_to_group {
+            if gids.contains(&gid) {
+                let n_pos = get_neighbor_pos(t_pos.0, t_pos.1, dir);
+                if !self.placed_tiles.contains_key(&n_pos) {
+                    open_edges += 1;
+                }
+            }
+        }
+        open_edges
     }
 
     /// Kênh (index 0..5) trong mảng 5 feature [nhà, cây, rock, water, train] cho 1 GroupType.
