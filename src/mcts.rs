@@ -466,6 +466,8 @@ impl MCTSSearch {
         // 2. Chạy N lượt MCTS Simulations (Double-Buffering Pipelined nếu có GPU executor)
         let clone_ns = std::sync::atomic::AtomicU64::new(0);
         let step_ns = std::sync::atomic::AtomicU64::new(0);
+        let ucb_ns = std::sync::atomic::AtomicU64::new(0);
+        let obs_ns = std::sync::atomic::AtomicU64::new(0);
         let perf = std::env::var("DORFO_PERF").is_ok();
         if let Some(gpu) = gpu_exec {
             if perf {
@@ -485,7 +487,7 @@ impl MCTSSearch {
 
                 // Khởi động: CPU duyệt UCB Group A và gửi lệnh GPU Async vào Slot 0
                 let (mut sim_res_a, mut leaf_obs_a, mut leaf_idx_a) =
-                    self.run_sim_traversal_range(range_a.clone(), &roots, all_envs, active_indices, &q_mins, &q_maxs, &clone_ns, &step_ns);
+                    self.run_sim_traversal_range(range_a.clone(), &roots, all_envs, active_indices, &q_mins, &q_maxs, &clone_ns, &step_ns, &ucb_ns, &obs_ns);
                 let leaf_refs_a: Vec<&crate::env::GraphObservation> = leaf_obs_a.iter().collect();
                 let mut pending_a = gpu.forward_batch_gpu_async_slot(0, &leaf_refs_a);
 
@@ -493,7 +495,7 @@ impl MCTSSearch {
                     // CPU chạy Rayon MCTS Traversal cho Group B trong lúc GPU đang tính Slot 0!
                     let ts = std::time::Instant::now();
                     let (sim_res_b, leaf_obs_b, leaf_idx_b) =
-                        self.run_sim_traversal_range(range_b.clone(), &roots, all_envs, active_indices, &q_mins, &q_maxs, &clone_ns, &step_ns);
+                        self.run_sim_traversal_range(range_b.clone(), &roots, all_envs, active_indices, &q_mins, &q_maxs, &clone_ns, &step_ns, &ucb_ns, &obs_ns);
                     t_trav_total += ts.elapsed();
 
                     // Nhận kết quả GPU Group A (Slot 0)
@@ -517,7 +519,7 @@ impl MCTSSearch {
                     // CPU chạy Rayon MCTS Traversal cho Group A (lượt kế tiếp) trong lúc GPU đang tính Slot 1!
                     let ts = std::time::Instant::now();
                     let (next_sim_res_a, next_leaf_obs_a, next_leaf_idx_a) =
-                        self.run_sim_traversal_range(range_a.clone(), &roots, all_envs, active_indices, &q_mins, &q_maxs, &clone_ns, &step_ns);
+                        self.run_sim_traversal_range(range_a.clone(), &roots, all_envs, active_indices, &q_mins, &q_maxs, &clone_ns, &step_ns, &ucb_ns, &obs_ns);
                     t_trav_total += ts.elapsed();
 
                     // Nhận kết quả GPU Group B (Slot 1)
@@ -556,7 +558,7 @@ impl MCTSSearch {
                 // Fallback đơn lẻ nếu b_count < 4
                 for _ in 0..self.config.n_simulations {
                     let (sim_res, leaf_obs, leaf_idx) =
-                        self.run_sim_traversal_range(0..b_count, &roots, all_envs, active_indices, &q_mins, &q_maxs, &clone_ns, &step_ns);
+                        self.run_sim_traversal_range(0..b_count, &roots, all_envs, active_indices, &q_mins, &q_maxs, &clone_ns, &step_ns, &ucb_ns, &obs_ns);
                     let leaf_refs: Vec<&crate::env::GraphObservation> = leaf_obs.iter().collect();
                     let results = gpu.forward_batch_gpu(&leaf_refs);
                     self.run_sim_backprop_range(0..b_count, sim_res, leaf_obs, leaf_idx, &results, &mut roots, &mut q_mins, &mut q_maxs);
@@ -567,13 +569,15 @@ impl MCTSSearch {
                 let wall = t_search0.elapsed().as_secs_f64();
                 let _ = writeln!(
                     std::io::stdout(),
-                    "[PERF] search_batch_indexed mode=GPU rounds={} wall={:.3}s trav={:.3}s gpu_wait={:.3}s backprop={:.3}s clone={:.3}s step={:.3}s",
+                    "[PERF] search_batch_indexed mode=GPU rounds={} wall={:.3}s trav={:.3}s gpu_wait={:.3}s backprop={:.3}s | clone={:.3}s ucb={:.3}s step={:.3}s obs_ext={:.3}s",
                     self.config.n_simulations, wall,
                     t_trav_total.as_secs_f64(),
                     t_gpu_total.as_secs_f64(),
                     t_bp_total.as_secs_f64(),
                     clone_ns.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
+                    ucb_ns.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
                     step_ns.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
+                    obs_ns.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
                 );
                 let _ = std::io::stdout().flush();
             }
@@ -585,7 +589,7 @@ impl MCTSSearch {
             for _ in 0..self.config.n_simulations {
                 let ts = std::time::Instant::now();
                 let (sim_res, leaf_obs, leaf_idx) =
-                    self.run_sim_traversal_range(0..b_count, &roots, all_envs, active_indices, &q_mins, &q_maxs, &clone_ns, &step_ns);
+                    self.run_sim_traversal_range(0..b_count, &roots, all_envs, active_indices, &q_mins, &q_maxs, &clone_ns, &step_ns, &ucb_ns, &obs_ns);
                 t_trav_total += ts.elapsed();
                 let leaf_refs: Vec<&crate::env::GraphObservation> = leaf_obs.iter().collect();
                 let results = model.forward_batch(&leaf_refs);
@@ -1044,6 +1048,8 @@ impl MCTSSearch {
         q_maxs: &[f32],
         clone_ns: &std::sync::atomic::AtomicU64,
         step_ns: &std::sync::atomic::AtomicU64,
+        ucb_ns: &std::sync::atomic::AtomicU64,
+        obs_ns: &std::sync::atomic::AtomicU64,
     ) -> (
         Vec<(Option<DorfromantikEnv>, Vec<usize>, Vec<f32>)>,
         Vec<crate::env::GraphObservation>,
@@ -1071,6 +1077,7 @@ impl MCTSSearch {
                     let q_max = q_maxs[i];
 
                     while curr.is_expanded && !curr.children.is_empty() && !curr.is_terminal {
+                        let t_ucb0 = std::time::Instant::now();
                         let total_n = curr.children.iter().map(|(_, c)| c.visit_count).sum::<u32>() as f32;
                         let sqrt_n = total_n.sqrt();
 
@@ -1095,6 +1102,7 @@ impl MCTSSearch {
                                 best_idx = idx;
                             }
                         }
+                        ucb_ns.fetch_add(t_ucb0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
 
                         let (chosen_action, _) = curr.children[best_idx];
                         let ts = std::time::Instant::now();
@@ -1112,6 +1120,7 @@ impl MCTSSearch {
                     }
 
                     // Kiểm tra và trích xuất GraphObservation NGAY TẠI CHỖ (Không Fork-Join lần 2):
+                    let t_obs0 = std::time::Instant::now();
                     let maybe_obs = if !curr.is_terminal && !curr.is_expanded {
                         let leaf_obs = sim_env.extract_graph_observation();
                         if !leaf_obs.valid_actions.is_empty() {
@@ -1122,6 +1131,7 @@ impl MCTSSearch {
                     } else {
                         None
                     };
+                    obs_ns.fetch_add(t_obs0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
 
                     ((Some(sim_env), node_path, rewards), maybe_obs)
                 } else {
