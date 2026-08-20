@@ -109,6 +109,10 @@ fn main() {
 
     let start_time = Instant::now();
     let batch_games = 50_000;
+    let completed_games = AtomicUsize::new(0);
+    let total_samples_collected = AtomicUsize::new(0);
+
+    println!("[Khởi Động] Đang chạy song song {} ván đấu trên Rayon...", batch_games);
 
     let all_samples: Vec<(u64, RealScoreSample)> = (0..batch_games)
         .into_par_iter()
@@ -163,6 +167,18 @@ fn main() {
                 if res.done {
                     break;
                 }
+            }
+
+            let done_g = completed_games.fetch_add(1, Ordering::Relaxed) + 1;
+            let current_collected = total_samples_collected.fetch_add(game_records.len(), Ordering::Relaxed) + game_records.len();
+
+            if done_g % 2_500 == 0 || done_g == batch_games {
+                let elapsed = start_time.elapsed().as_secs_f32();
+                let speed = current_collected as f32 / elapsed;
+                println!(
+                    "⏳ [Tiến Độ] Đã xong {:>5}/{} ván ({:>3.0}%) | Thu được {:>7} mẫu thô | Tốc độ: {:>6.0} mẫu/s | {:.1}s",
+                    done_g, batch_games, (done_g as f32 / batch_games as f32) * 100.0, current_collected, speed, elapsed
+                );
             }
 
             game_records
