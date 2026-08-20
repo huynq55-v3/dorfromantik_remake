@@ -1,5 +1,5 @@
 use dorfromantik_remake::alphazero::{
-    AlphaZeroPipeline, AlphaZeroTrainerConfig, GameMatchRecord, MaxScoreStateRecord,
+    AlphaZeroPipeline, AlphaZeroTrainerConfig, GameMatchRecord,
 };
 use dorfromantik_remake::gpu_engine::GpuEngine;
 use dorfromantik_remake::gpu_nn::GpuNNExecutor;
@@ -71,7 +71,8 @@ fn find_latest_iter_model(model_dir: &str) -> Option<(usize, String)> {
 }
 fn fast_train_step(pipeline: &mut AlphaZeroPipeline) -> (f32, f32, f32) {
     let buf_len = pipeline.replay_buffer.len();
-    let warmup_threshold = (pipeline.replay_buffer.capacity as f32 * 0.25) as usize;
+    // Warm-up: chỉ bắt đầu train khi buffer đã nạp đủ 1/5 dung lượng (20%)
+    let warmup_threshold = pipeline.replay_buffer.capacity / 5;
     if buf_len < warmup_threshold {
         println!(
             "[Train GPU] Warm-up: buffer {}/{} sample (cần ≥ {}) — chưa train, tiếp tục self-play tích lũy.",
@@ -277,7 +278,6 @@ fn main() {
     let buffer_path = format!("{}/alphazero_buffer.bin", model_dir);
     let meta_path = format!("{}/alphazero_meta.txt", model_dir);
     let best_game_path = format!("{}/best_game_record.json", model_dir);
-    let max_score_states_path = format!("{}/max_score_states.json", model_dir);
 
     let mut pipeline = AlphaZeroPipeline::new(config.clone());
     let mut start_iter = 0;
@@ -352,48 +352,6 @@ fn main() {
             }
         }
     }
-
-    // 3.5. Khôi phục và gộp danh sách max-score states (AI: max 2000, Human: max 1000 -> lấy top 2000)
-    let human_states_path = format!("{}/human_expert_states.json", model_dir);
-    let mut combined_states: Vec<MaxScoreStateRecord> = Vec::new();
-
-    if Path::new(&max_score_states_path).exists() {
-        if let Ok(content) = fs::read_to_string(&max_score_states_path) {
-            if let Ok(states) = serde_json::from_str::<Vec<MaxScoreStateRecord>>(&content) {
-                combined_states.extend(states);
-            }
-        }
-    }
-    if Path::new(&human_states_path).exists() {
-        if let Ok(content) = fs::read_to_string(&human_states_path) {
-            if let Ok(states) = serde_json::from_str::<Vec<MaxScoreStateRecord>>(&content) {
-                println!(
-                    "[HumanExpertStates] Đã tìm thấy {} states do con người chơi từ `{}`.",
-                    states.len(),
-                    human_states_path
-                );
-                combined_states.extend(states);
-            }
-        }
-    }
-
-    if !combined_states.is_empty() {
-        // Sắp xếp giảm dần theo Q-value và lấy top 2000
-        combined_states.sort_unstable_by(|a, b| {
-            b.q_value
-                .partial_cmp(&a.q_value)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        if combined_states.len() > 2000 {
-            combined_states.truncate(2000);
-        }
-        pipeline.max_score_states = combined_states;
-        println!(
-            "[MaxScoreStates] Đã nạp và gộp top {} states xuất phát cho 50% envs (AI + Human).",
-            pipeline.max_score_states.len()
-        );
-    }
-
     // 4. Khôi phục Replay Buffer nếu có
     if Path::new(&buffer_path).exists() {
         println!("[Buffer] Đang nạp Replay Buffer từ `{}`...", buffer_path);
@@ -508,29 +466,6 @@ fn main() {
             exec.sync_weights(&pipeline.model);
         }
 
-        // Tự động load và gộp human_expert_states.json vào pool trước khi Refresh Q
-        if Path::new(&human_states_path).exists() {
-            if let Ok(content) = fs::read_to_string(&human_states_path) {
-                if let Ok(human_states) = serde_json::from_str::<Vec<MaxScoreStateRecord>>(&content)
-                {
-                    for h_st in human_states {
-                        pipeline.add_high_q_state(h_st.q_value, h_st.remaining_tiles, &h_st.moves);
-                    }
-                }
-            }
-        }
-
-        // A.5. Refresh Q-value của toàn bộ max-score states bằng Model Value Head (V_model) trực tiếp
-        let refresh_start = Instant::now();
-        let n_refreshed = pipeline.refresh_max_score_state_q_values(gpu_executor.as_ref(), 0);
-        let refresh_dur = refresh_start.elapsed();
-        println!(
-            "[Refresh Q] Cập nhật Q-value {}/{} states qua Model Value Head trong {:.2}s",
-            n_refreshed,
-            pipeline.max_score_states.len(),
-            refresh_dur.as_secs_f32()
-        );
-
         // B. Tự chơi (Vectorized Batch MCTS + GPU Neural Network Inference)
         let self_play_start = Instant::now();
         let (avg_score, max_score, avg_placed, best_self_play_record) =
@@ -602,11 +537,6 @@ fn main() {
                 buffer_path,
                 save_start.elapsed().as_secs_f32()
             );
-        }
-
-        // Lưu danh sách max-score states
-        if let Ok(json_str) = serde_json::to_string_pretty(&pipeline.max_score_states) {
-            let _ = fs::write(&max_score_states_path, json_str);
         }
 
         // Ghi metadata file (iteration, kỷ lục)
