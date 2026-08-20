@@ -5,7 +5,7 @@ use crate::game_config::GroupType;
 use crate::generator::TileGenerator;
 use crate::quest_manager::QuestManager;
 use crate::score_manager::ScoreManager;
-use crate::tile::{EqualityComparison, GeneratedTile};
+use crate::tile::{EdgeType, EqualityComparison, GeneratedTile};
 
 /// Node feature indices (70 dims). Định nghĩa tường minh để tránh magic numbers.
 pub mod node_feat {
@@ -426,32 +426,61 @@ impl DorfromantikEnv {
 
             if is_placed {
                 let pt = &placed[&pos];
-                // 2..8: 6 Edges terrain normalized (0.0 .. 1.0)
+                let mut open_edges = 0;
+                let is_station = pt.edge_config.edges.iter().any(|&e| matches!(e, EdgeType::WaterTrainStation));
+                let station_counts = if is_station {
+                    let (mut w, mut t) = (None, None);
+                    for d in 0..6 {
+                        if let Some(&gid) = self.board.edge_to_group.get(&(pos, d)) {
+                            if let Some(group) = self.board.groups.get(&gid) {
+                                match group.group_type {
+                                    GroupType::Water => w = Some(group.total_element_count),
+                                    GroupType::TrainTracks => t = Some(group.total_element_count),
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    Some((w, t))
+                } else {
+                    None
+                };
+
                 for dir in 0..6 {
                     let edge_type = pt.edge_config.edges[dir];
                     feature[node_feat::EDGE_TERRAIN_START + dir] = (edge_type as usize as f32) / 7.0;
-                }
 
-                // 8..14: Open/Closed edge flags
-                for dir in 0..6 {
                     let n_pos = get_neighbor_pos(pos.0, pos.1, dir);
-                    feature[node_feat::OPEN_EDGE_START + dir] = if placed.contains_key(&n_pos) { 0.0 } else { 1.0 };
-                }
-
-                // 14: (bỏ — không dùng, giữ = 0 để không phá layout kênh feature)
-                // 15: Group Open Edges (đếm nhanh số cạnh mở trực tiếp của tile)
-                let mut open_edges = 0;
-                for dir in 0..6 {
-                    let n_pos = get_neighbor_pos(pos.0, pos.1, dir);
-                    if !placed.contains_key(&n_pos) {
+                    let is_open = !placed.contains_key(&n_pos);
+                    if is_open {
+                        feature[node_feat::OPEN_EDGE_START + dir] = 1.0;
                         open_edges += 1;
+
+                        if let Some((w, t)) = station_counts {
+                            if matches!(edge_type, EdgeType::WaterTrainStation) {
+                                if let Some(w_cnt) = w { feature[node_feat::EDGE_FEATURES_START + dir * 5 + 3] = w_cnt as f32; }
+                                if let Some(t_cnt) = t { feature[node_feat::EDGE_FEATURES_START + dir * 5 + 4] = t_cnt as f32; }
+                            }
+                        } else if let Some(&gid) = self.board.edge_to_group.get(&(pos, dir)) {
+                            if let Some(group) = self.board.groups.get(&gid) {
+                                let ch = match group.group_type {
+                                    GroupType::Village => 0,
+                                    GroupType::Forest => 1,
+                                    GroupType::Agriculture => 2,
+                                    GroupType::Water => 3,
+                                    GroupType::TrainTracks => 4,
+                                };
+                                feature[node_feat::EDGE_FEATURES_START + dir * 5 + ch] = group.total_element_count as f32;
+                            }
+                        }
+                    } else {
+                        feature[node_feat::OPEN_EDGE_START + dir] = 0.0;
                     }
                 }
                 feature[15] = (open_edges as f32 / 6.0).clamp(0.0, 1.0);
 
                 // 16..27: Quest features
                 if let GeneratedTile::Quest { quest_data, .. } = &pt.tile {
-                    // Quest đang cần xử lý hay không (1 = active, 0 = đã kết thúc / không còn là quest)
                     feature[node_feat::QUEST_ACTIVE] = if pt.quest_finalized { 0.0 } else { 1.0 };
                     if !pt.quest_finalized {
                         let gt = quest_data.primary_group_type();
@@ -469,19 +498,8 @@ impl DorfromantikEnv {
                             EqualityComparison::Exactly => feature[node_feat::QUEST_EQUALITY_EXACTLY] = 1.0,
                         }
 
-                        // Con số requirement hiện tại = số object cần thêm bên ngoài để hoàn thành quest
-                        // (đã trừ object sẵn có trên chính quest tile, khớp với badge hiển thị +5 / =7)
                         let remaining_need = quest_data.remaining_display_value() as f32;
                         feature[node_feat::QUEST_REMAINING] = (remaining_need / 100.0).clamp(0.0, 1.0);
-                    }
-                }
-
-                // 40..70: 30 feature đếm group theo cạnh (6 cạnh × 5 loại: nhà, cây, rock, water, train).
-                // Chỉ áp dụng cho tile ĐÃ ĐẶT (ô trống không có địa hình nên vẫn = 0).
-                let edge_feats = self.board.count_edge_features(pos);
-                for edge_idx in 0..6 {
-                    for ch in 0..5 {
-                        feature[node_feat::EDGE_FEATURES_START + edge_idx * 5 + ch] = edge_feats[edge_idx][ch];
                     }
                 }
             } else {
