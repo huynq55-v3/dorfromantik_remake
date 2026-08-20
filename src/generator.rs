@@ -1,6 +1,21 @@
 use crate::game_config::{GroupType, QuestConfigurations, SegmentPresetConfigurations, SegmentType, TilePresetConfigurations};
 use crate::tile::{BaseTile, GeneratedTile, QuestTileData, SegmentData};
 use crate::unity_random::UnityRandom;
+use std::sync::LazyLock;
+
+/// Cache tĩnh — khởi tạo DUY NHẤT 1 lần cho toàn bộ chương trình.
+/// Loại bỏ hoàn toàn fs::read_to_string() và heap allocation trong hot path MCTS.
+static TILE_PRESETS: LazyLock<TilePresetConfigurations> = LazyLock::new(|| {
+    TilePresetConfigurations::default()
+});
+
+static SEG_PRESETS: LazyLock<SegmentPresetConfigurations> = LazyLock::new(|| {
+    SegmentPresetConfigurations::from_file("monthly_game_info.txt")
+});
+
+static QUEST_CONFIGS: LazyLock<QuestConfigurations> = LazyLock::new(|| {
+    QuestConfigurations::from_file("monthly_game_info.txt")
+});
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TileGenFilter {
@@ -120,7 +135,7 @@ impl TileGenerator {
     pub fn generate_quest_tile(&mut self, quest_seed: i32, used_filter: TileGenFilter, level: usize) -> QuestTileData {
         let quest_seed_mul2 = quest_seed.wrapping_mul(2);
         let mut rng = UnityRandom::init_state(quest_seed_mul2);
-        let quest_configs = QuestConfigurations::from_file("monthly_game_info.txt");
+        let quest_configs = &*QUEST_CONFIGS;
 
         // println!("\n=== GENERATE QUEST TILE DETAILS (Quest Seed: {}, InitState Seed: {}, Filter: {:?}) ===", quest_seed, quest_seed_mul2, used_filter);
         // println!("  [Excluded Group Types]: {:?}", quest_configs.excluded_group_types);
@@ -257,8 +272,8 @@ impl TileGenerator {
 
         // Nếu là Normal Tile
         let mut rng_tile = UnityRandom::init_state(num);
-        let tile_configs = TilePresetConfigurations::default();
-        let seg_configs = SegmentPresetConfigurations::from_file("monthly_game_info.txt");
+        let tile_configs = &*TILE_PRESETS;
+        let seg_configs = &*SEG_PRESETS;
 
         // Lọc tilePresets theo used_filter (nếu AtLeastTwoEmptyEdges thì occupied_edges < 5)
         let filtered_presets: Vec<_> = tile_configs

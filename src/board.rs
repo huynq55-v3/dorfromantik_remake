@@ -74,6 +74,8 @@ pub struct ElementGroup {
     pub total_segment_count: usize,
     pub member_tiles: FxHashSet<(i32, i32)>,
     pub is_closed: bool,
+    /// Số cạnh mở (chưa có tile kề) của cụm — duy trì incremental O(1) khi place tile.
+    pub open_edge_count: usize,
 }
 
 /// Trạng thái lưu tạm để undo 1 nước đi (không clone placed_tiles).
@@ -251,6 +253,19 @@ impl Board {
             self.active_quest_positions.insert((q, r));
         }
 
+        // Trước khi hợp nhất group: Trừ open_edge_count cho tất cả các group kề
+        // mà có cạnh trỏ vào ô (q,r) — vì ô này giờ đã có tile, cạnh đó không còn mở.
+        for dir in 0..6 {
+            let neighbor_pos = get_neighbor_pos(q, r, dir);
+            let neighbor_dir = opposite_direction(dir);
+            // Cạnh (neighbor_pos, neighbor_dir) trước đây mở nếu (q,r) trống, giờ bị đóng
+            if let Some(&gid) = self.edge_to_group.get(&(neighbor_pos, neighbor_dir)) {
+                if let Some(group) = self.groups.get_mut(&gid) {
+                    group.open_edge_count = group.open_edge_count.saturating_sub(1);
+                }
+            }
+        }
+
         // Hợp nhất cụm địa hình liên thông (ElementGroupManager)
         self.update_element_groups(q, r);
 
@@ -286,11 +301,19 @@ impl Board {
             let element_count = seg.element_count;
             let segment_count = 1;
 
+            // Đếm số cạnh mở (ô kề trống) của segment mới, đồng thời tìm các group kết nối
             let mut connected_group_ids = HashSet::new();
+            let mut new_seg_open_edges = 0usize;
+
             for &dir in &seg.edges {
                 let neighbor_pos = get_neighbor_pos(q, r, dir);
-                let neighbor_dir = opposite_direction(dir);
-                if let Some(neighbor) = self.placed_tiles.get(&neighbor_pos) {
+                if !self.placed_tiles.contains_key(&neighbor_pos) {
+                    // Ô kề trống → cạnh mở cho segment mới
+                    new_seg_open_edges += 1;
+                } else {
+                    // Ô kề có tile → kiểm tra kết nối group
+                    let neighbor_dir = opposite_direction(dir);
+                    let neighbor = self.placed_tiles.get(&neighbor_pos).unwrap();
                     let my_edge = placed.edge_config.edges[dir];
                     let neighbor_edge = neighbor.edge_config.edges[neighbor_dir];
                     if my_edge.to_group_type() == Some(gt) && neighbor_edge.to_group_type() == Some(gt) {
@@ -298,10 +321,13 @@ impl Board {
                             connected_group_ids.insert(gid);
                         }
                     }
+                    // Nếu ô kề có tile nhưng không compatible → cạnh này không mở, không tính
+                    // (cạnh phía neighbor đã được trừ ở place_tile trước khi gọi update_element_groups)
                 }
             }
 
             if connected_group_ids.is_empty() {
+                // Tạo group mới — tất cả cạnh mở = new_seg_open_edges
                 let gid = self.next_group_id;
                 self.next_group_id += 1;
                 let mut members = FxHashSet::default();
@@ -314,6 +340,7 @@ impl Board {
                     total_segment_count: segment_count,
                     member_tiles: members,
                     is_closed: false,
+                    open_edge_count: new_seg_open_edges,
                 };
                 self.groups.insert(gid, group);
                 for &dir in &seg.edges {
@@ -331,6 +358,8 @@ impl Board {
                     main_group.member_tiles.insert((q, r));
                     main_group.total_element_count += element_count;
                     main_group.total_segment_count += segment_count;
+                    // Cộng cạnh mở mới (cạnh neighbor đã được trừ ở place_tile)
+                    main_group.open_edge_count += new_seg_open_edges;
                 }
 
                 for &other_gid in &group_ids_vec[1..] {
@@ -348,6 +377,7 @@ impl Board {
                             main_group.member_tiles.extend(other_group.member_tiles);
                             main_group.total_element_count += other_group.total_element_count;
                             main_group.total_segment_count += other_group.total_segment_count;
+                            main_group.open_edge_count += other_group.open_edge_count;
                         }
                     }
                 }
@@ -505,23 +535,17 @@ impl Board {
     }
 
     /// Đếm số cạnh mở (open edges) của cụm địa hình chứa `pos` cho `group_type`
-    /// Tối ưu hóa cực đại: duyệt trực tiếp qua edge_to_group mà KHÔNG cấp phát HashSet member_tiles!
+    /// Tối ưu hóa O(1): đọc trực tiếp open_edge_count đã duy trì incremental trong ElementGroup.
     pub fn count_group_open_edges(&self, pos: (i32, i32), group_type: GroupType) -> usize {
         let gids = self.get_group_ids_for_tile(pos, group_type);
         if gids.is_empty() {
             return 0;
         }
 
-        let mut open_edges = 0;
-        for (&(t_pos, dir), &gid) in &self.edge_to_group {
-            if gids.contains(&gid) {
-                let n_pos = get_neighbor_pos(t_pos.0, t_pos.1, dir);
-                if !self.placed_tiles.contains_key(&n_pos) {
-                    open_edges += 1;
-                }
-            }
-        }
-        open_edges
+        gids.iter()
+            .filter_map(|gid| self.groups.get(gid))
+            .map(|g| g.open_edge_count)
+            .sum()
     }
 
     /// Kênh (index 0..5) trong mảng 5 feature [nhà, cây, rock, water, train] cho 1 GroupType.
@@ -1234,5 +1258,72 @@ mod tests {
         assert_eq!(fa2[0][4], 0.0, "A edge0 connected should be 0");
         // Các feature khác của A vẫn = 0 (không có group nhà/cây/rock/water)
         assert_eq!(fa2[0].iter().enumerate().filter(|(i, v)| *i != 4 && **v != 0.0).count(), 0);
+    }
+
+    #[test]
+    fn test_open_edge_count_incremental_correctness() {
+        let mut board = Board::new();
+
+        // 1. Đặt tile A tại (0, 0) có Forest ở cạnh 0, 1, 2 (ST3A) -> Ban đầu có 3 cạnh mở
+        let tile_a = GeneratedTile::Normal {
+            base_tile: BaseTile::new(1, 1, "TileA"),
+            segments: vec![SegmentData {
+                index: 0,
+                group_type: GroupType::Forest,
+                segment_type: SegmentType::ST3A,
+                occupied_edges: vec![0, 1, 2],
+                rotation: 0,
+                is_hybrid: false,
+            }],
+        };
+        assert!(board.place_tile(0, 0, tile_a, 0));
+        assert_eq!(board.count_group_open_edges((0, 0), GroupType::Forest), 3);
+
+        // 2. Đặt tile B tại (0, 1) (dir 0 của A) có Forest ở cạnh 3 (đối diện cạnh 0 của A) và cạnh 0 (mở lên trên)
+        // Cạnh 0 của A bị đóng (còn 2 cạnh mở 1, 2). Cạnh 0 của B mở (+1). -> Tổng = 3
+        let tile_b = GeneratedTile::Normal {
+            base_tile: BaseTile::new(2, 2, "TileB"),
+            segments: vec![SegmentData {
+                index: 0,
+                group_type: GroupType::Forest,
+                segment_type: SegmentType::ST2C,
+                occupied_edges: vec![3, 0],
+                rotation: 0,
+                is_hybrid: false,
+            }],
+        };
+        assert!(board.place_tile(0, 1, tile_b, 0));
+        assert_eq!(board.count_group_open_edges((0, 0), GroupType::Forest), 3);
+        assert_eq!(board.count_group_open_edges((0, 1), GroupType::Forest), 3);
+
+        // 3. Đặt Plain Tile tại (1, 1) (dir 1 của A) chặn cạnh 1 của A
+        let plain_tile1 = GeneratedTile::Normal {
+            base_tile: BaseTile::new(3, 3, "PlainTile1"),
+            segments: vec![],
+        };
+        assert!(board.place_tile(1, 1, plain_tile1, 0));
+        // Cạnh 1 của A bị chặn -> Tổng cạnh mở của cụm còn 2 (cạnh 2 của A và cạnh 0 của B)
+        assert_eq!(board.count_group_open_edges((0, 0), GroupType::Forest), 2);
+        assert_eq!(board.count_group_open_edges((0, 1), GroupType::Forest), 2);
+
+        // 4. Đặt Plain Tile tại (1, 0) (dir 2 của A) chặn cạnh 2 của A
+        let plain_tile2 = GeneratedTile::Normal {
+            base_tile: BaseTile::new(4, 4, "PlainTile2"),
+            segments: vec![],
+        };
+        assert!(board.place_tile(1, 0, plain_tile2, 0));
+        // Cạnh 2 của A bị chặn -> Cụm {A, B} chỉ còn 1 cạnh mở (cạnh 0 của B)
+        assert_eq!(board.count_group_open_edges((0, 0), GroupType::Forest), 1);
+        assert_eq!(board.count_group_open_edges((0, 1), GroupType::Forest), 1);
+
+        // 5. Đặt Plain Tile tại (0, 2) (dir 0 của B) chặn cạnh 0 của B
+        let plain_tile3 = GeneratedTile::Normal {
+            base_tile: BaseTile::new(5, 5, "PlainTile3"),
+            segments: vec![],
+        };
+        assert!(board.place_tile(0, 2, plain_tile3, 0));
+        // Tất cả các cạnh của cụm {A, B} đều đã bị bao kín hoàn toàn -> open_edge_count == 0!
+        assert_eq!(board.count_group_open_edges((0, 0), GroupType::Forest), 0);
+        assert_eq!(board.count_group_open_edges((0, 1), GroupType::Forest), 0);
     }
 }
