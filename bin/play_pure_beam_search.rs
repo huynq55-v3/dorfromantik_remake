@@ -62,8 +62,9 @@ fn evaluate_candidate_fast(env: &DorfromantikEnv, act: Action) -> f32 {
 /// Tính Cận Trên (Upper-Bound) điểm số tối đa có thể đạt thêm trong k bước tới
 #[inline(always)]
 fn max_possible_gain(remaining_depth: usize) -> f32 {
-    // 1 tile tối đa có thể ăn: 60 fit + 60 perfect + 100 quest + (6 tiles thưởng * 60) = 580 điểm
-    remaining_depth as f32 * 360.0
+    // Cận trên toán học an toàn tuyệt đối (Admissible Bound):
+    // 1 tile tối đa: 60 fit + 60 perfect + 2 quests (200) + 11 tiles thưởng (660) = ~980 điểm
+    remaining_depth as f32 * 980.0
 }
 
 /// Thuật toán PURE BEAM SEARCH + BRANCH & BOUND PRUNING (Cắt Tỉa Cận Trên Siêu Tốc)
