@@ -48,6 +48,10 @@ name = "play_nnue_beam"
 path = "bin/play_nnue_beam.rs"
 
 [[bin]]
+name = "play_pure_beam_search"
+path = "bin/play_pure_beam_search.rs"
+
+[[bin]]
 name = "gen_dataset_gnn_selfplay"
 path = "bin/gen_dataset_gnn_selfplay.rs"
 

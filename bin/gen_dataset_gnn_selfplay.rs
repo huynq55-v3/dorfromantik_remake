@@ -1,5 +1,5 @@
-use rayon::prelude::*;
 use rand::Rng;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
@@ -59,9 +59,21 @@ fn load_game_config() -> (i32, usize, usize) {
         for line in content.lines() {
             if let Some((k, v)) = line.split_once('=') {
                 match k.trim() {
-                    "REAL_TILE_SEED" => if let Ok(s) = v.trim().parse() { seed = s; },
-                    "ACTIVE_TileStackHeight" => if let Ok(s) = v.trim().parse() { stack = s; },
-                    "ACTIVE_TileLimit" => if let Ok(s) = v.trim().parse() { limit = s; },
+                    "REAL_TILE_SEED" => {
+                        if let Ok(s) = v.trim().parse() {
+                            seed = s;
+                        }
+                    }
+                    "ACTIVE_TileStackHeight" => {
+                        if let Ok(s) = v.trim().parse() {
+                            stack = s;
+                        }
+                    }
+                    "ACTIVE_TileLimit" => {
+                        if let Ok(s) = v.trim().parse() {
+                            limit = s;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -108,7 +120,11 @@ fn evaluate_state_gnn(model: &HexGNNModel, env: &DorfromantikEnv) -> f32 {
 fn select_action_gnn_fast(model: &HexGNNModel, env: &DorfromantikEnv) -> Action {
     let valid_actions = env.get_valid_actions();
     if valid_actions.len() <= 1 {
-        return valid_actions.get(0).copied().unwrap_or(Action { q: 0, r: 0, rotation: 0 });
+        return valid_actions.get(0).copied().unwrap_or(Action {
+            q: 0,
+            r: 0,
+            rotation: 0,
+        });
     }
 
     let curr_tile = env.current_tile().unwrap();
@@ -158,7 +174,7 @@ fn select_action_gnn_fast(model: &HexGNNModel, env: &DorfromantikEnv) -> Action 
 fn main() {
     let (target_seed, initial_stack, tile_limit) = load_game_config();
     let model_path = "models/nnue_real_score_model.bin";
-    let target_unique_samples = 300_000usize;
+    let target_unique_samples = 1_000_000usize;
 
     println!("============================================================");
     println!(">>> BỘ SINH DỮ LIỆU TỰ CHƠI BẰNG GNN (GNN SELF-PLAY FLYWHEEL) <<<");
@@ -180,7 +196,11 @@ fn main() {
     let start_time = Instant::now();
     let seen_hashes = Mutex::new(HashSet::<u64>::with_capacity(target_unique_samples));
     let disk_writer = Mutex::new(BufWriter::new(
-        OpenOptions::new().create(true).append(true).open(output_file).unwrap()
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(output_file)
+            .unwrap(),
     ));
     let total_unique = AtomicUsize::new(0);
 
@@ -265,6 +285,9 @@ fn main() {
     }
 
     let dur = start_time.elapsed();
-    println!("\n✅ Hoàn tất GNN Self-Play Flywheel trong {:.2}s!", dur.as_secs_f32());
+    println!(
+        "\n✅ Hoàn tất GNN Self-Play Flywheel trong {:.2}s!",
+        dur.as_secs_f32()
+    );
     println!("🎉 File dataset lưu tại: {}", output_file);
 }
