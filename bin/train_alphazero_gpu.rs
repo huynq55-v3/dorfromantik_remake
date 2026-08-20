@@ -1,8 +1,3 @@
-use std::fs;
-use std::path::Path;
-use std::sync::Arc;
-use std::time::Instant;
-use rayon::prelude::*;
 use dorfromantik_remake::alphazero::{
     AlphaZeroPipeline, AlphaZeroTrainerConfig, GameMatchRecord, MaxScoreStateRecord,
 };
@@ -10,6 +5,11 @@ use dorfromantik_remake::gpu_engine::GpuEngine;
 use dorfromantik_remake::gpu_nn::GpuNNExecutor;
 use dorfromantik_remake::mcts::MCTSConfig;
 use dorfromantik_remake::nn::HexGNNModel;
+use rayon::prelude::*;
+use std::fs;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Instant;
 
 fn load_monthly_game_config() -> (i32, usize, usize) {
     let mut seed = -2093096630;
@@ -80,7 +80,7 @@ fn fast_train_step(pipeline: &mut AlphaZeroPipeline) -> (f32, f32, f32) {
         return (0.0, 0.0, 0.0);
     }
 
-    let target_samples = 40_000usize;
+    let target_samples = 20_000usize;
     let m = target_samples.min(buf_len);
     let num_batches = (m / pipeline.config.batch_size).max(1);
     let total_epochs = pipeline.config.train_epochs_per_iter;
@@ -94,7 +94,7 @@ fn fast_train_step(pipeline: &mut AlphaZeroPipeline) -> (f32, f32, f32) {
     let mut step_count = 0;
 
     // Kích thước sub-batch cho mỗi luồng tính toán ma trận gộp
-    let chunk_size = 64; 
+    let chunk_size = 64;
 
     for epoch in 0..total_epochs {
         let epoch_indices = pipeline.replay_buffer.sample_prioritized_unique_indices(m);
@@ -152,7 +152,9 @@ fn fast_train_step(pipeline: &mut AlphaZeroPipeline) -> (f32, f32, f32) {
             scaled_grads.scale_assign(1.0 / mb_len);
             scaled_grads.clip_grad_norm(1.0);
 
-            pipeline.model.update_weights_adam(&scaled_grads, pipeline.config.lr);
+            pipeline
+                .model
+                .update_weights_adam(&scaled_grads, pipeline.config.lr);
 
             total_policy_loss += mb_pi_loss / mb_len;
             total_value_loss += mb_val_loss / mb_len;
@@ -169,7 +171,11 @@ fn fast_train_step(pipeline: &mut AlphaZeroPipeline) -> (f32, f32, f32) {
     if step_count > 0 {
         let avg_pi = total_policy_loss / step_count as f32;
         let avg_val = total_value_loss / step_count as f32;
-        (avg_pi + avg_val * pipeline.config.value_loss_coeff, avg_pi, avg_val)
+        (
+            avg_pi + avg_val * pipeline.config.value_loss_coeff,
+            avg_pi,
+            avg_val,
+        )
     } else {
         (0.0, 0.0, 0.0)
     }
@@ -183,7 +189,10 @@ fn main() {
     // 1. Khởi tạo GPU Context (giữ lại device/queue để dùng sau)
     let gpu_engine = GpuEngine::new();
     if let Some(ref g) = gpu_engine {
-        println!("[GPU Engine] Đã phát hiện và khởi tạo GPU: {}", g.device_name);
+        println!(
+            "[GPU Engine] Đã phát hiện và khởi tạo GPU: {}",
+            g.device_name
+        );
     } else {
         println!("[GPU Engine] Không phát hiện GPU phù hợp, sử dụng CPU fallback!");
     }
@@ -298,11 +307,17 @@ fn main() {
                 pipeline.model = loaded_model;
             }
             Err(e) => {
-                println!("[Checkpoint] CẢNH BÁO: Lỗi đọc model cũ ({:?}), tạo model mới.", e);
+                println!(
+                    "[Checkpoint] CẢNH BÁO: Lỗi đọc model cũ ({:?}), tạo model mới.",
+                    e
+                );
             }
         }
     } else if Path::new(&latest_model_path).exists() {
-        println!("[Checkpoint] Đang nạp model cũ từ `{}`...", latest_model_path);
+        println!(
+            "[Checkpoint] Đang nạp model cũ từ `{}`...",
+            latest_model_path
+        );
         if let Ok(loaded_model) = HexGNNModel::load_from_file(&latest_model_path) {
             println!(
                 "[Checkpoint] SUCCESS: Đã nạp thành công model (Step count = {})!",
@@ -311,7 +326,10 @@ fn main() {
             pipeline.model = loaded_model;
         }
     } else if Path::new(&best_model_path).exists() {
-        println!("[Checkpoint] Đang nạp best model từ `{}`...", best_model_path);
+        println!(
+            "[Checkpoint] Đang nạp best model từ `{}`...",
+            best_model_path
+        );
         if let Ok(loaded_model) = HexGNNModel::load_from_file(&best_model_path) {
             println!(
                 "[Checkpoint] SUCCESS: Đã nạp thành công best model (Step count = {})!",
@@ -348,7 +366,11 @@ fn main() {
     if Path::new(&human_states_path).exists() {
         if let Ok(content) = fs::read_to_string(&human_states_path) {
             if let Ok(states) = serde_json::from_str::<Vec<MaxScoreStateRecord>>(&content) {
-                println!("[HumanExpertStates] Đã tìm thấy {} states do con người chơi từ `{}`.", states.len(), human_states_path);
+                println!(
+                    "[HumanExpertStates] Đã tìm thấy {} states do con người chơi từ `{}`.",
+                    states.len(),
+                    human_states_path
+                );
                 combined_states.extend(states);
             }
         }
@@ -356,7 +378,11 @@ fn main() {
 
     if !combined_states.is_empty() {
         // Sắp xếp giảm dần theo Q-value và lấy top 2000
-        combined_states.sort_unstable_by(|a, b| b.q_value.partial_cmp(&a.q_value).unwrap_or(std::cmp::Ordering::Equal));
+        combined_states.sort_unstable_by(|a, b| {
+            b.q_value
+                .partial_cmp(&a.q_value)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         if combined_states.len() > 2000 {
             combined_states.truncate(2000);
         }
@@ -393,7 +419,9 @@ fn main() {
                     match k.trim() {
                         // Khi có file alphazero_iter_<n>.bin thì ưu tiên số đó (đã gán ở trên).
                         // Meta chỉ giúp khi chưa dùng file iteration (fallback alphazero_latest/best).
-                        "iteration" if start_iter == 0 => start_iter = v.trim().parse::<usize>().unwrap_or(0),
+                        "iteration" if start_iter == 0 => {
+                            start_iter = v.trim().parse::<usize>().unwrap_or(0)
+                        }
                         "all_time_best_match_score" if all_time_best_match_score == 0 => {
                             all_time_best_match_score = v.trim().parse::<usize>().unwrap_or(0)
                         }
@@ -418,24 +446,36 @@ fn main() {
     println!(" - Train Epochs / Iter: {}", config.train_epochs_per_iter);
     let buffer_capacity = config.replay_buffer_capacity.unwrap_or(200_000);
     println!(" - Replay Buffer Capacity: {} samples", buffer_capacity);
-    println!(" - Warm-up (train sau ≥ 20%): ≥ {} samples", ((buffer_capacity as f32) * 0.20) as usize);
-    println!(" - Dirichlet Alpha: {} | Dirichlet Eps: {}", config.mcts_config.dirichlet_alpha, config.mcts_config.dirichlet_eps);
+    println!(
+        " - Warm-up (train sau ≥ 20%): ≥ {} samples",
+        ((buffer_capacity as f32) * 0.20) as usize
+    );
+    println!(
+        " - Dirichlet Alpha: {} | Dirichlet Eps: {}",
+        config.mcts_config.dirichlet_alpha, config.mcts_config.dirichlet_eps
+    );
     println!(" - Learning Rate: {}", config.lr);
-    println!(" - Exploration theo entropy từng turn: {}", if config.mcts_config.explore_by_entropy { "BẬT" } else { "TẮT" });
+    println!(
+        " - Exploration theo entropy từng turn: {}",
+        if config.mcts_config.explore_by_entropy {
+            "BẬT"
+        } else {
+            "TẮT"
+        }
+    );
     if iter_max != usize::MAX {
         println!(" - Iteration Max: {}", iter_max);
     }
-    println!(" - Bắt đầu từ Iteration #{} (tiếp tục từ checkpoint)", start_iter + 1);
+    println!(
+        " - Bắt đầu từ Iteration #{} (tiếp tục từ checkpoint)",
+        start_iter + 1
+    );
     println!("============================================================\n");
 
     // 6. Tạo GPU NN Executor SAU KHI load checkpoint (dùng đúng weights đã train)
     let gpu_executor = gpu_engine.as_ref().map(|g| {
         println!("[GPU NN] Khởi tạo GpuNNExecutor với persistent weight buffers...");
-        let exec = GpuNNExecutor::new(
-            Arc::clone(&g.device),
-            Arc::clone(&g.queue),
-            &pipeline.model,
-        );
+        let exec = GpuNNExecutor::new(Arc::clone(&g.device), Arc::clone(&g.queue), &pipeline.model);
         println!("[GPU NN] Đã upload {} weights matrices lên GPU VRAM!", 32);
         exec
     });
@@ -470,7 +510,8 @@ fn main() {
         // Tự động load và gộp human_expert_states.json vào pool trước khi Refresh Q
         if Path::new(&human_states_path).exists() {
             if let Ok(content) = fs::read_to_string(&human_states_path) {
-                if let Ok(human_states) = serde_json::from_str::<Vec<MaxScoreStateRecord>>(&content) {
+                if let Ok(human_states) = serde_json::from_str::<Vec<MaxScoreStateRecord>>(&content)
+                {
                     for h_st in human_states {
                         pipeline.add_high_q_state(h_st.q_value, h_st.remaining_tiles, &h_st.moves);
                     }
@@ -540,9 +581,15 @@ fn main() {
         // Lưu model theo iteration: alphazero_iter_<n>.bin
         let iter_model_path = format!("{}/alphazero_iter_{}.bin", model_dir, iteration);
         if let Err(e) = pipeline.model.save_to_file(&iter_model_path) {
-            println!("[Save Error] Không thể lưu model iteration {}: {:?}", iteration, e);
+            println!(
+                "[Save Error] Không thể lưu model iteration {}: {:?}",
+                iteration, e
+            );
         } else {
-            println!("[Checkpoint] Đã lưu model iteration {} vào `{}`", iteration, iter_model_path);
+            println!(
+                "[Checkpoint] Đã lưu model iteration {} vào `{}`",
+                iteration, iter_model_path
+            );
         }
 
         if let Err(e) = pipeline.replay_buffer.save_to_file(&buffer_path) {
