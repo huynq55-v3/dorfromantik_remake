@@ -1189,9 +1189,8 @@ impl AlphaZeroPipeline {
             return (0.0, 0.0, 0.0);
         }
 
-        // Quy mô mẫu huấn luyện mỗi iteration:
-        // Lấy kết hợp mẫu mới sinh ra và các mẫu chất lượng cao trong quá khứ qua PER
-        let target_samples = (self.last_new_samples * 3).max(25_000);
+        // Số lượng sample train mỗi iteration bằng đúng 1/5 dung lượng Replay Buffer (Buffer Refresh Ratio = 20%)
+        let target_samples = self.replay_buffer.capacity / 5;
         let m = target_samples.min(buf_len);
         let num_batches = (m / self.config.batch_size).max(1);
         let total_epochs = self.config.train_epochs_per_iter;

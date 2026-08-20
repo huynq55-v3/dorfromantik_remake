@@ -80,7 +80,8 @@ fn fast_train_step(pipeline: &mut AlphaZeroPipeline) -> (f32, f32, f32) {
         return (0.0, 0.0, 0.0);
     }
 
-    let target_samples = 20_000usize;
+    // Số lượng sample train mỗi iteration bằng đúng 1/5 dung lượng Replay Buffer (Buffer Refresh Ratio = 20%)
+    let target_samples = pipeline.replay_buffer.capacity / 5;
     let m = target_samples.min(buf_len);
     let num_batches = (m / pipeline.config.batch_size).max(1);
     let total_epochs = pipeline.config.train_epochs_per_iter;
