@@ -1050,7 +1050,12 @@ impl MCTSSearch {
         Vec<crate::env::GraphObservation>,
         Vec<usize>,
     ) {
-        let sim_results: Vec<(Option<DorfromantikEnv>, Vec<usize>, Vec<f32>)> = range
+        // HỢP NHẤT SINGLE-PASS RAYON: Duyệt cây MCTS + Step + Trích xuất GraphObservation trong 1 lần duy nhất!
+        // Cắt giảm 50% Thread Synchronization Barrier, giúp CPU ăn tải 100% không còn bị khựng.
+        let fused_results: Vec<(
+            (Option<DorfromantikEnv>, Vec<usize>, Vec<f32>),
+            Option<(usize, crate::env::GraphObservation)>,
+        )> = range
             .clone()
             .into_par_iter()
             .map(|i| {
@@ -1107,52 +1112,35 @@ impl MCTSSearch {
                         }
                     }
 
-                    (Some(sim_env), node_path, rewards)
-                } else {
-                    (None, Vec::new(), Vec::new())
-                }
-            })
-            .collect();
-
-        // Song song hóa phần trích xuất GraphObservation cho các lá cần expand.
-        // (Cực kỳ nặng: quét candidate + group queries ~400k lần/turn, trước đây chạy TUẦN TỰ.)
-        // filter_map của Rayon giữ nguyên thứ tự -> eval_indices/eval_leaf_obs vẫn align với GPU.
-        let eval_pairs: Vec<(usize, crate::env::GraphObservation)> = range
-            .clone()
-            .into_par_iter()
-            .filter_map(|i| {
-                // `i` là chỉ số tuyệt đối (range có thể bắt đầu từ mid). sim_results là [range.len()].
-                let local = i - range.start;
-                match &sim_results[local].0 {
-                    Some(ref sim_env) => {
-                        if let Some(ref root) = roots[i] {
-                            let mut curr = root;
-                            for &idx in &sim_results[local].1 {
-                                if idx < curr.children.len() {
-                                    curr = &curr.children[idx].1;
-                                } else {
-                                    break;
-                                }
-                            }
-                            if !curr.is_terminal && !curr.is_expanded {
-                                let leaf_obs = sim_env.extract_graph_observation();
-                                if !leaf_obs.valid_actions.is_empty() {
-                                    return Some((i, leaf_obs));
-                                }
-                            }
+                    // Kiểm tra và trích xuất GraphObservation NGAY TẠI CHỖ (Không Fork-Join lần 2):
+                    let maybe_obs = if !curr.is_terminal && !curr.is_expanded {
+                        let leaf_obs = sim_env.extract_graph_observation();
+                        if !leaf_obs.valid_actions.is_empty() {
+                            Some((i, leaf_obs))
+                        } else {
+                            None
                         }
+                    } else {
                         None
-                    }
-                    None => None,
+                    };
+
+                    ((Some(sim_env), node_path, rewards), maybe_obs)
+                } else {
+                    ((None, Vec::new(), Vec::new()), None)
                 }
             })
             .collect();
 
-        let mut eval_indices = Vec::with_capacity(eval_pairs.len());
-        let mut eval_leaf_obs = Vec::with_capacity(eval_pairs.len());
-        for (i, leaf_obs) in eval_pairs {
-            eval_indices.push(i);
-            eval_leaf_obs.push(leaf_obs);
+        let mut sim_results = Vec::with_capacity(fused_results.len());
+        let mut eval_indices = Vec::new();
+        let mut eval_leaf_obs = Vec::new();
+
+        for (sim_res, maybe_obs) in fused_results {
+            sim_results.push(sim_res);
+            if let Some((i, leaf_obs)) = maybe_obs {
+                eval_indices.push(i);
+                eval_leaf_obs.push(leaf_obs);
+            }
         }
 
         (sim_results, eval_leaf_obs, eval_indices)
