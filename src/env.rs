@@ -306,11 +306,10 @@ impl DorfromantikEnv {
             crate::quest_manager::initialize_active_quest_tile(front_tile, &self.board, &mut self.quest_manager);
         }
 
-        // Kiểm tra điều kiện kết thúc (dùng has_valid_action để tránh dựng toàn bộ valid-actions
-        // vốn chỉ được dùng để check rỗng -> giảm đáng kể chi phí step trong MCTS).
+        // Kiểm tra điều kiện kết thúc: chỉ check cạn cọc bài hoặc chạm mốc tile_limit.
+        // Tránh gọi has_valid_action() quét HashSet toàn bộ bàn cờ hàng triệu lần trong MCTS simulations.
         let done = self.score_manager.remaining_tiles == 0
-            || self.placed_count >= self.tile_limit
-            || !self.has_valid_action();
+            || self.placed_count >= self.tile_limit;
 
         StepResult {
             reward,
