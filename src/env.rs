@@ -525,8 +525,8 @@ impl DorfromantikEnv {
             let effective_remaining_tiles = self.score_manager.remaining_tiles.min(tiles_left_in_game);
             feature[node_feat::EFFECTIVE_REMAINING_TILES] = effective_remaining_tiles as f32;
 
-            // 25: Điểm số hiện tại chia 10 (đơn vị cơ sở của game)
-            feature[node_feat::CURRENT_SCORE_DIV_10] = (self.score_manager.total_score as f32) / 10.0;
+            // 25: Đã bỏ điểm hiện tại, giữ = 0.0 theo chuẩn Markov AlphaZero
+            feature[node_feat::CURRENT_SCORE_DIV_10] = 0.0;
 
             // 27..33: Upcoming Tile 1 Features
             if let Some(t1) = tile_1 {
