@@ -16,6 +16,7 @@ wgpu = "24.0"
 pollster = "0.4"
 bytemuck = { version = "1.14", features = ["derive"] }
 mimalloc = "0.1"
+bincode = "1.3"
 
 [[bin]]
 name = "simulator"
@@ -52,6 +53,10 @@ path = "bin/human_expert_play.rs"
 [[bin]]
 name = "evolve_heuristic"
 path = "bin/evolve_heuristic.rs"
+
+[[bin]]
+name = "gen_dataset_real_score"
+path = "bin/gen_dataset_real_score.rs"
 
 [profile.release]
 opt-level = 3

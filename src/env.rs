@@ -42,7 +42,7 @@ pub mod action_feat {
 }
 
 /// Hành động đặt tile trong môi trường RL
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Action {
     pub q: i32,
     pub r: i32,
@@ -65,7 +65,7 @@ pub struct StepResult {
 pub struct GraphObservation {
     /// Danh sách vị trí tọa độ của tất cả các node trong đồ thị (Placed + Candidates)
     pub node_positions: Vec<(i32, i32)>,
-    /// Tensor đặc trưng của các node: [N, 40]
+    /// Tensor đặc trưng của các node: [N, 70]
     pub node_features: Vec<[f32; 70]>,
     /// Danh sách các cạnh nối giữa các node kề nhau: Vec<(from_idx, to_idx)>
     pub edge_index: Vec<(usize, usize)>,
