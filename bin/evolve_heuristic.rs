@@ -6,10 +6,10 @@ use std::fs;
 use std::path::Path;
 use std::time::Instant;
 
-use dorfromantik_remake::board::{get_neighbor_pos, opposite_direction};
+use dorfromantik_remake::board::{get_neighbor_pos, opposite_direction, FulfillmentStatus};
 use dorfromantik_remake::env::{Action, DorfromantikEnv};
 use dorfromantik_remake::score_manager::is_matching_edge;
-use dorfromantik_remake::tile::GeneratedTile;
+use dorfromantik_remake::tile::{EqualityComparison, GeneratedTile};
 
 /// Vector 10 Trọng Số Heuristic Tinh Hoa
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,15 +30,15 @@ impl Default for HeuristicWeights {
     fn default() -> Self {
         Self {
             w_fit: 1.0,
-            w_perfect: 15.0,
-            w_quest_completed: 40.0,
-            w_mismatch_penalty: -1.5,
-            w_pocket_created: 8.0,
-            w_quest_progress: 0.8,
-            w_quest_overflow: -50.0,
-            w_open_edges: 1.2,
-            w_stack_health: 2.5,
-            w_preview_match: 1.0,
+            w_perfect: 20.0,
+            w_quest_completed: 60.0,
+            w_mismatch_penalty: -2.5,
+            w_pocket_created: 12.0,
+            w_quest_progress: 1.5,
+            w_quest_overflow: -100.0,
+            w_open_edges: 2.0,
+            w_stack_health: 3.0,
+            w_preview_match: 1.5,
         }
     }
 }
@@ -167,15 +167,29 @@ pub fn evaluate_action(env: &DorfromantikEnv, action: Action, weights: &Heuristi
         }
     }
 
-    // 6. Quest progress: số element kết nối vào quest
-    let f_quest_progress = if let GeneratedTile::Quest { .. } = current_tile {
-        5.0
-    } else {
-        0.0
-    };
+    // 6 & 7: Đo đạc chính xác Quest Progress và Quest Overflow Penalty
+    let mut f_quest_progress = 0.0f32;
+    let mut f_quest_overflow = 0.0f32;
 
-    // 7. Quest overflow penalty
-    let f_quest_overflow = 0.0f32;
+    for (pos, pt) in &temp_env.board.placed_tiles {
+        if let GeneratedTile::Quest { quest_data, .. } = &pt.tile {
+            if pt.quest_status == Some(FulfillmentStatus::Incomplete) {
+                let gt = quest_data.primary_group_type();
+                let current_ext_count = temp_env.board.get_quest_external_count(*pos, gt);
+                let target = quest_data.target_count;
+
+                if current_ext_count > 0 && target > 0 {
+                    if current_ext_count <= target {
+                        // Tăng tỷ lệ hoàn thành
+                        f_quest_progress += (current_ext_count as f32) / (target as f32) * 10.0;
+                    } else if quest_data.equality == EqualityComparison::Exactly {
+                        // Vượt quá quest dấu bằng
+                        f_quest_overflow += (current_ext_count - target) as f32;
+                    }
+                }
+            }
+        }
+    }
 
     // 8. Open edges health
     let f_open_edges = (6.0 - neighbor_count as f32).max(0.0);
@@ -211,27 +225,74 @@ pub fn evaluate_action(env: &DorfromantikEnv, action: Action, weights: &Heuristi
         + weights.w_preview_match * f_preview
 }
 
-/// Cho 1 cá thể trọng số tự chơi trọn vẹn 1 ván game
-pub fn play_game(seed: i32, stack: usize, limit: usize, weights: &HeuristicWeights) -> (usize, usize) {
-    let mut env = DorfromantikEnv::new(seed, stack, limit);
+/// Chạy Beam Search 2-Step Lookahead để chọn nước đi tối ưu (nhìn trước 2 tiles)
+pub fn select_best_action_beam(env: &DorfromantikEnv, weights: &HeuristicWeights, beam_width: usize) -> Action {
+    let valid_actions = env.get_valid_actions();
+    if valid_actions.len() <= 1 {
+        return valid_actions.get(0).copied().unwrap_or(Action { q: 0, r: 0, rotation: 0 });
+    }
 
-    while !env.is_game_over() {
-        let valid_actions = env.get_valid_actions();
-        if valid_actions.is_empty() {
-            break;
+    // Bước 1: Đánh giá tất cả các nước đi tầng 1 và chọn top K nhánh tốt nhất
+    let mut scored_step1: Vec<(Action, f32, DorfromantikEnv)> = valid_actions
+        .into_iter()
+        .map(|act| {
+            let score1 = evaluate_action(env, act, weights);
+            let mut next_env = env.clone();
+            let _ = next_env.step(act);
+            (act, score1, next_env)
+        })
+        .collect();
+
+    scored_step1.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let candidates: Vec<(Action, f32, DorfromantikEnv)> = scored_step1.into_iter().take(beam_width).collect();
+
+    let mut best_action = candidates[0].0;
+    let mut best_total_score = f32::NEG_INFINITY;
+
+    // Bước 2: Duyệt nhánh tầng 2 (Tile #2) cho từng nhánh top K
+    for (act1, score1, env2) in candidates {
+        if env2.is_game_over() {
+            if score1 > best_total_score {
+                best_total_score = score1;
+                best_action = act1;
+            }
+            continue;
         }
 
-        let mut best_action = valid_actions[0];
-        let mut best_score = f32::NEG_INFINITY;
+        let valid_actions_step2 = env2.get_valid_actions();
+        if valid_actions_step2.is_empty() {
+            if score1 > best_total_score {
+                best_total_score = score1;
+                best_action = act1;
+            }
+            continue;
+        }
 
-        for &act in &valid_actions {
-            let score = evaluate_action(&env, act, weights);
-            if score > best_score {
-                best_score = score;
-                best_action = act;
+        let mut max_score2 = f32::NEG_INFINITY;
+        for &act2 in &valid_actions_step2 {
+            let score2 = evaluate_action(&env2, act2, weights);
+            if score2 > max_score2 {
+                max_score2 = score2;
             }
         }
 
+        let total_score = score1 + 0.85 * max_score2;
+        if total_score > best_total_score {
+            best_total_score = total_score;
+            best_action = act1;
+        }
+    }
+
+    best_action
+}
+
+/// Cho 1 cá thể trọng số tự chơi trọn vẹn 1 ván game với Beam Search Lookahead
+pub fn play_game(seed: i32, stack: usize, limit: usize, weights: &HeuristicWeights) -> (usize, usize) {
+    let mut env = DorfromantikEnv::new(seed, stack, limit);
+    let beam_width = 4; // Giữ top 4 nhánh tốt nhất ở mỗi lượt (siêu nhanh)
+
+    while !env.is_game_over() {
+        let best_action = select_best_action_beam(&env, weights, beam_width);
         let res = env.step(best_action);
         if res.done {
             break;
@@ -262,23 +323,23 @@ fn load_game_config() -> (i32, usize, usize) {
 
 fn main() {
     let (target_seed, initial_stack, tile_limit) = load_game_config();
-    let population_size = 64;
+    let population_size = 32;
     let generations = 100;
-    let top_k = 8;
+    let top_k = 6;
 
     println!("============================================================");
-    println!(">>> BỘ TỐI ƯU TIẾN HÓA DI TRUYỀN HEURISTIC (GENETIC OPTIMIZER) <<<");
+    println!(">>> BỘ TỐI ƯU TIẾN HÓA HEURISTIC (BEAM SEARCH LOOKAHEAD) <<<");
     println!(" - Seed Mục Tiêu: {}", target_seed);
     println!(" - Tile Stack / Limit: {} / {}", initial_stack, tile_limit);
     println!(" - Kích thước Quần Thể (Population): {} cá thể", population_size);
     println!(" - Số Thế Hệ (Generations): {}", generations);
     println!(" - Chọn lọc Top-K: {} cá thể tinh hoa / thế hệ", top_k);
+    println!(" - Beam Width Lookahead: 4 nhánh / turn");
     println!("============================================================\n");
 
     let weights_path = "models/best_heuristic_weights.json";
     let mut population: Vec<HeuristicWeights> = Vec::with_capacity(population_size);
 
-    // Khởi tạo quần thể: nạp từ file cũ (nếu có), còn lại sinh đột biến
     if Path::new(weights_path).exists() {
         if let Ok(content) = fs::read_to_string(weights_path) {
             if let Ok(w) = serde_json::from_str::<HeuristicWeights>(&content) {
@@ -297,7 +358,6 @@ fn main() {
     }
 
     let mut global_best_score = 0usize;
-    let mut global_best_weights = population[0].clone();
 
     for gen in 1..=generations {
         let start_time = Instant::now();
@@ -322,7 +382,7 @@ fn main() {
 
         if best_gen_score > global_best_score {
             global_best_score = best_gen_score;
-            global_best_weights = sorted_results[0].2.clone();
+            let global_best_weights = sorted_results[0].2.clone();
             if let Ok(json_str) = serde_json::to_string_pretty(&global_best_weights) {
                 let _ = fs::write(weights_path, json_str);
             }
