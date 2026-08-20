@@ -464,10 +464,9 @@ impl MCTSSearch {
         }
 
         // 2. Chạy N lượt MCTS Simulations (Double-Buffering Pipelined nếu có GPU executor)
-        // Atomics đo chi phí clone vs step trong traversal (only nếu DORFO_PERF).
         let clone_ns = std::sync::atomic::AtomicU64::new(0);
         let step_ns = std::sync::atomic::AtomicU64::new(0);
-        let perf = std::env::var("DORFO_PERF").is_ok();
+        let perf = true; // BẬT CỜ CHẨN ĐOÁN HIỆU NĂNG ĐO LƯỜNG CHI TIẾT
         if let Some(gpu) = gpu_exec {
             if perf {
                 use std::io::Write;
