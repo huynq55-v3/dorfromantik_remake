@@ -6,7 +6,6 @@ use std::io::BufReader;
 use std::path::Path;
 use std::time::Instant;
 
-use dorfromantik_remake::alphazero::AlphaZeroSample;
 use dorfromantik_remake::env::{Action, GraphObservation};
 use dorfromantik_remake::nn::{HexGNNModel, HIDDEN_DIM, NODE_FEAT_DIM};
 
@@ -59,15 +58,47 @@ pub struct RealScoreSample {
     pub placed_count: usize,
 }
 
-/// Dạng đồ thị rút gọn chỉ phục vụ Value Head (Bỏ hoàn toàn Action Features thừa -> Tăng tốc 500x!)
+/// Dạng đồ thị rút gọn chỉ phục vụ Value Head
 pub struct ValueGraph {
     pub node_features: Vec<[f32; 70]>,
     pub edge_index: Vec<(usize, usize)>,
     pub target_val: f32,
 }
 
-/// Forward & Backward siêu tốc chỉ dành riêng cho Value Head trên Disjoint Graphs
-pub fn train_value_batch(model: &HexGNNModel, batch: &[&ValueGraph], lr: f32) -> (HexGNNModel, f32) {
+/// CSR format cho Graph Adjacency giúp CPU quét bộ nhớ cực nhanh
+struct CsrGraph {
+    pub offsets: Vec<usize>,
+    pub targets: Vec<usize>,
+}
+
+impl CsrGraph {
+    pub fn from_edges(n_nodes: usize, edges: &[(usize, usize)]) -> Self {
+        let mut counts = vec![0usize; n_nodes];
+        for &(u, _) in edges {
+            if u < n_nodes {
+                counts[u] += 1;
+            }
+        }
+        let mut offsets = Vec::with_capacity(n_nodes + 1);
+        offsets.push(0);
+        for c in &counts {
+            offsets.push(offsets.last().unwrap() + c);
+        }
+        let mut targets = vec![0usize; edges.len()];
+        let mut current_pos = offsets.clone();
+        for &(u, v) in edges {
+            if u < n_nodes {
+                let p = current_pos[u];
+                targets[p] = v;
+                current_pos[u] += 1;
+            }
+        }
+        Self { offsets, targets }
+    }
+}
+
+/// Forward & Backward siêu tối ưu hóa SIMD / Cache-friendly
+pub fn train_value_batch_fast(model: &HexGNNModel, batch: &[&ValueGraph]) -> (HexGNNModel, f32) {
     let b_count = batch.len();
     let mut total_nodes = 0usize;
     let mut node_offsets = Vec::with_capacity(b_count);
@@ -96,14 +127,7 @@ pub fn train_value_batch(model: &HexGNNModel, batch: &[&ValueGraph], lr: f32) ->
         }
     }
 
-    let mut neighbor_count = vec![0usize; total_nodes];
-    for &(u, _) in &combined_edges {
-        if u < total_nodes {
-            neighbor_count[u] += 1;
-        }
-    }
-
-    let mut neigh_accum = vec![0.0f32; total_nodes * HIDDEN_DIM];
+    let csr = CsrGraph::from_edges(total_nodes, &combined_edges);
     let n_layers = model.layers.len();
     let mut h_pres = Vec::with_capacity(n_layers);
     let mut h_vals = Vec::with_capacity(n_layers);
@@ -115,39 +139,27 @@ pub fn train_value_batch(model: &HexGNNModel, batch: &[&ValueGraph], lr: f32) ->
         let has_residual = li > 0;
         let out_dim = HIDDEN_DIM;
 
-        let neigh = if li == 0 {
-            let mut n0 = vec![0.0f32; total_nodes * NODE_FEAT_DIM];
-            for &(u, v) in &combined_edges {
-                if u < total_nodes && v < total_nodes {
-                    for i in 0..NODE_FEAT_DIM {
-                        n0[u * NODE_FEAT_DIM + i] += x_flat[v * NODE_FEAT_DIM + i];
+        // Neighbor aggregation tối ưu bằng CSR
+        let mut neigh = vec![0.0f32; total_nodes * curr_dim];
+        for u in 0..total_nodes {
+            let start = csr.offsets[u];
+            let end = csr.offsets[u + 1];
+            let count = end - start;
+            if count > 0 {
+                let inv = 1.0 / count as f32;
+                let u_off = u * curr_dim;
+                for idx in start..end {
+                    let v = csr.targets[idx];
+                    let v_off = v * curr_dim;
+                    for d in 0..curr_dim {
+                        neigh[u_off + d] += h_curr[v_off + d];
                     }
                 }
-            }
-            for u in 0..total_nodes {
-                let c = neighbor_count[u].max(1) as f32;
-                for i in 0..NODE_FEAT_DIM {
-                    n0[u * NODE_FEAT_DIM + i] /= c;
+                for d in 0..curr_dim {
+                    neigh[u_off + d] *= inv;
                 }
             }
-            n0
-        } else {
-            neigh_accum.fill(0.0);
-            for &(u, v) in &combined_edges {
-                if u < total_nodes && v < total_nodes {
-                    for i in 0..HIDDEN_DIM {
-                        neigh_accum[u * HIDDEN_DIM + i] += h_curr[v * HIDDEN_DIM + i];
-                    }
-                }
-            }
-            for u in 0..total_nodes {
-                let c = neighbor_count[u].max(1) as f32;
-                for i in 0..HIDDEN_DIM {
-                    neigh_accum[u * HIDDEN_DIM + i] /= c;
-                }
-            }
-            neigh_accum.clone()
-        };
+        }
 
         let y_s = layer.w_self.forward(&h_curr, total_nodes * curr_dim);
         let y_n = layer.w_neigh.forward(&neigh, total_nodes * curr_dim);
@@ -193,7 +205,7 @@ pub fn train_value_batch(model: &HexGNNModel, batch: &[&ValueGraph], lr: f32) ->
     }
     let all_values = model.w_val2.forward(&val_relu, b_count * HIDDEN_DIM);
 
-    // Value Huber Loss & Backward
+    // Value Huber Loss
     let mut total_val_loss = 0.0f32;
     let mut val_grads = vec![0.0f32; b_count];
 
@@ -250,7 +262,7 @@ pub fn train_value_batch(model: &HexGNNModel, batch: &[&ValueGraph], lr: f32) ->
         }
     }
 
-    // 2. Backprop qua các tầng GNN
+    // 2. Backprop qua các tầng GNN với vòng lặp Cache-Locality tối ưu hóa SIMD
     let mut d_h_curr = d_h_final;
     for li in (0..n_layers).rev() {
         let has_residual = li > 0;
@@ -269,29 +281,51 @@ pub fn train_value_batch(model: &HexGNNModel, batch: &[&ValueGraph], lr: f32) ->
         let mut d_neigh = vec![0.0f32; total_nodes * out_dim];
         let h_in = if has_residual { &h_vals[li - 1] } else { &x_flat };
 
-        for u in 0..total_nodes {
-            for o in 0..out_dim {
+        // Tối ưu hóa thứ tự vòng lặp: quét liên tục theo mảng bộ nhớ (Row-Major Contiguous Memory)
+        for o in 0..out_dim {
+            let w_off = o * in_dim;
+            let mut bias_accum = 0.0f32;
+
+            for u in 0..total_nodes {
                 let g = d_relu[u * out_dim + o];
-                grad_layer.w_self.bias[o] += g;
-                grad_layer.w_neigh.bias[o] += g;
-                let w_off = o * in_dim;
-                for i in 0..in_dim {
-                    grad_layer.w_self.weight[w_off + i] += g * h_in[u * in_dim + i];
-                    if has_residual {
-                        d_h_prev[u * out_dim + i] += g * layer.w_self.weight[w_off + i];
+                if g != 0.0 {
+                    bias_accum += g;
+                    let u_in_off = u * in_dim;
+                    let u_out_off = u * out_dim;
+
+                    // Vòng lặp trong cùng liên tục (CPU auto-vectorize AVX2 8 floats cùng lúc)
+                    for i in 0..in_dim {
+                        grad_layer.w_self.weight[w_off + i] += g * h_in[u_in_off + i];
+                        grad_layer.w_neigh.weight[w_off + i] += g * neighs[li][u_in_off + i];
                     }
-                    grad_layer.w_neigh.weight[w_off + i] += g * neighs[li][u * in_dim + i];
-                    d_neigh[u * out_dim + i] += g * layer.w_neigh.weight[w_off + i];
+
+                    if has_residual {
+                        for i in 0..out_dim {
+                            d_h_prev[u_out_off + i] += g * layer.w_self.weight[w_off + i];
+                            d_neigh[u_out_off + i] += g * layer.w_neigh.weight[w_off + i];
+                        }
+                    }
                 }
             }
+
+            grad_layer.w_self.bias[o] += bias_accum;
+            grad_layer.w_neigh.bias[o] += bias_accum;
         }
 
         if has_residual {
-            for &(u, v) in &combined_edges {
-                if u < total_nodes && v < total_nodes {
-                    let count_u = neighbor_count[u].max(1) as f32;
-                    for i in 0..out_dim {
-                        d_h_prev[v * out_dim + i] += d_neigh[u * out_dim + i] / count_u;
+            for u in 0..total_nodes {
+                let start = csr.offsets[u];
+                let end = csr.offsets[u + 1];
+                let count = end - start;
+                if count > 0 {
+                    let inv = 1.0 / count as f32;
+                    let u_off = u * out_dim;
+                    for idx in start..end {
+                        let v = csr.targets[idx];
+                        let v_off = v * out_dim;
+                        for d in 0..out_dim {
+                            d_h_prev[v_off + d] += d_neigh[u_off + d] * inv;
+                        }
                     }
                 }
             }
@@ -311,7 +345,7 @@ fn main() {
     }
 
     println!("============================================================");
-    println!(">>> HUẤN LUYỆN GNN PURE VALUE DISJOINT (SIÊU TỐC ĐỘ) <<<");
+    println!(">>> HUẤN LUYỆN GNN PURE VALUE SIMD / CSR (SIÊU TỐC ĐỘ) <<<");
     println!(" - Đang nạp dataset từ: {}...", dataset_path);
     println!("============================================================\n");
 
@@ -342,7 +376,7 @@ fn main() {
 
     println!(" - Số Epochs: {}", epochs);
     println!(" - Batch Size: {} ({} batches / epoch)", batch_size, num_batches);
-    println!(" - Tốc độ: Chạy Pure Value Disjoint Backprop siêu mượt!\n");
+    println!(" - Tối ưu: CSR Graph + Contiguous Loop Tiling + SIMD\n");
 
     let mut indices: Vec<usize> = (0..n_samples).collect();
     let mut rng = rand::thread_rng();
@@ -363,7 +397,7 @@ fn main() {
                 .par_chunks(chunk_size)
                 .map(|chunk| {
                     let chunk_samples: Vec<&ValueGraph> = chunk.iter().map(|&idx| &value_graphs[idx]).collect();
-                    train_value_batch(&model, &chunk_samples, lr)
+                    train_value_batch_fast(&model, &chunk_samples)
                 })
                 .reduce(
                     || (HexGNNModel::new_zero(), 0.0f32),
