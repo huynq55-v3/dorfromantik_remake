@@ -49,6 +49,10 @@ path = "bin/train_offline.rs"
 name = "human_expert_play"
 path = "bin/human_expert_play.rs"
 
+[[bin]]
+name = "evolve_heuristic"
+path = "bin/evolve_heuristic.rs"
+
 [profile.release]
 opt-level = 3
 lto = "thin"
