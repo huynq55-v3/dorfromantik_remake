@@ -6,7 +6,8 @@ use crate::env::GraphObservation;
 /// GEMM dims: số chiều input (k) và output (n) được truyền động qua uniform, nên layer-1 (k=40,
 /// n=128) và các layer 2-4 (k=n=128) đều tái sử dụng cùng một pipeline.
 
-/// WGSL GEMM Shader: Y[row, col] = X[row, :] · W[col, :]^T + B[col], optional ReLU
+/// WGSL Tiled GEMM Shader với Workgroup Shared Memory (Tối ưu băng thông VRAM gấp 16 lần):
+/// Y[row, col] = X[row, :] · W[col, :]^T + B[col], optional ReLU
 const GEMM_SHADER: &str = r#"
 struct Dims { m: u32, k: u32, n: u32, relu: u32 };
 
@@ -16,17 +17,52 @@ struct Dims { m: u32, k: u32, n: u32, relu: u32 };
 @group(0) @binding(3) var<storage, read>      b:    array<f32>;
 @group(0) @binding(4) var<storage, read_write> y:   array<f32>;
 
+var<workgroup> tile_x: array<array<f32, 16>, 16>;
+var<workgroup> tile_w: array<array<f32, 16>, 16>;
+
 @compute @workgroup_size(16, 16)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>
+) {
     let row = gid.x;
     let col = gid.y;
-    if (row >= dims.m || col >= dims.n) { return; }
-    var acc: f32 = b[col];
-    for (var k: u32 = 0u; k < dims.k; k = k + 1u) {
-        acc = acc + x[row * dims.k + k] * w[col * dims.k + k];
+    let lr = lid.x;
+    let lc = lid.y;
+
+    var acc: f32 = 0.0;
+    let num_tiles = (dims.k + 15u) / 16u;
+
+    for (var t: u32 = 0u; t < num_tiles; t = t + 1u) {
+        let x_col = t * 16u + lc;
+        if (row < dims.m && x_col < dims.k) {
+            tile_x[lr][lc] = x[row * dims.k + x_col];
+        } else {
+            tile_x[lr][lc] = 0.0;
+        }
+
+        let w_k = t * 16u + lr;
+        if (col < dims.n && w_k < dims.k) {
+            tile_w[lr][lc] = w[col * dims.k + w_k];
+        } else {
+            tile_w[lr][lc] = 0.0;
+        }
+
+        workgroupBarrier();
+
+        for (var i: u32 = 0u; i < 16u; i = i + 1u) {
+            acc = acc + tile_x[lr][i] * tile_w[i][lc];
+        }
+
+        workgroupBarrier();
     }
-    if (dims.relu == 1u && acc < 0.0) { acc = 0.0; }
-    y[row * dims.n + col] = acc;
+
+    if (row < dims.m && col < dims.n) {
+        acc = acc + b[col];
+        if (dims.relu == 1u && acc < 0.0) { acc = 0.0; }
+        y[row * dims.n + col] = acc;
+    }
 }
 "#;
 
