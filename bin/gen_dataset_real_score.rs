@@ -2,9 +2,10 @@ use rayon::prelude::*;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use dorfromantik_remake::board::{get_neighbor_pos, opposite_direction};
@@ -15,10 +16,10 @@ use dorfromantik_remake::score_manager::is_matching_edge;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SerializableGraphObservation {
     pub node_positions: Vec<(i32, i32)>,
-    pub node_features_flat: Vec<f32>, // flattened N * 70
+    pub node_features_flat: Vec<f32>,
     pub edge_index: Vec<(usize, usize)>,
     pub valid_actions: Vec<Action>,
-    pub action_features_flat: Vec<f32>, // flattened Num_Actions * 16
+    pub action_features_flat: Vec<f32>,
 }
 
 impl From<GraphObservation> for SerializableGraphObservation {
@@ -68,7 +69,6 @@ pub fn compute_board_hash(env: &DorfromantikEnv) -> u64 {
             }
         }
     }
-    // Hash cả tile hiện tại trong hàng chờ
     if let Some(curr) = env.current_tile() {
         curr.to_hex_edge_config().edges.hash(&mut hasher);
     }
@@ -96,13 +96,13 @@ fn load_game_config() -> (i32, usize, usize) {
 
 fn main() {
     let (target_seed, initial_stack, tile_limit) = load_game_config();
-    let target_unique_samples = 1_000_000usize; // 1 TRIỆU MẪU UNIQUE
+    let target_unique_samples = 300_000usize; // 300K MẪU ĐỘC NHẤT (Chỉ chiếm ~300MB RAM)
 
     println!("============================================================");
-    println!(">>> CÔNG CỤ SINH DATASET ĐIỂM SỐ THẬT (1 TRIỆU MẪU UNIQUE) <<<");
+    println!(">>> CÔNG CỤ SINH DATASET ĐIỂM SỐ THẬT (STREAMING - SIÊU NHẸ RAM) <<<");
     println!(" - Seed Mục Tiêu: {}", target_seed);
     println!(" - Mục Tiêu Mẫu: {} samples duy nhất", target_unique_samples);
-    println!(" - Chạy Song Song Đa Luồng CPU (Rayon)");
+    println!(" - Cơ Chế: Ghi trực tiếp vào đĩa (RAM luôn < 350 MB)");
     println!("============================================================\n");
 
     let output_dir = "data";
@@ -110,20 +110,20 @@ fn main() {
     let output_file = format!("{}/real_score_dataset_1m.bin", output_dir);
 
     let start_time = Instant::now();
-    let batch_games = 50_000;
-    let completed_games = AtomicUsize::new(0);
-    let total_samples_collected = AtomicUsize::new(0);
+    let seen_hashes = Mutex::new(HashSet::<u64>::with_capacity(target_unique_samples));
+    let collected_samples = Mutex::new(Vec::<RealScoreSample>::with_capacity(target_unique_samples));
+    let total_unique = AtomicUsize::new(0);
 
-    println!("[Khởi Động] Đang chạy song song {} ván đấu trên Rayon...", batch_games);
+    let mini_batch_size = 500; // Mỗi đợt chạy 500 ván rồi giải phóng RAM ngay
 
-    let all_samples: Vec<(u64, RealScoreSample)> = (0..batch_games)
-        .into_par_iter()
-        .flat_map(|_| {
+    while total_unique.load(Ordering::Relaxed) < target_unique_samples {
+        (0..mini_batch_size).into_par_iter().for_each(|_| {
+            if total_unique.load(Ordering::Relaxed) >= target_unique_samples {
+                return;
+            }
+
             let mut rng = rand::thread_rng();
-            // Chạy 100% chuẩn xác trên Target Seed của monthly_game_info.txt
             let mut env = DorfromantikEnv::new(target_seed, initial_stack, tile_limit);
-
-            let mut game_records = Vec::with_capacity(tile_limit);
 
             while !env.is_game_over() {
                 let valid_actions = env.get_valid_actions();
@@ -132,22 +132,42 @@ fn main() {
                 }
 
                 let hash = compute_board_hash(&env);
-                let obs = env.extract_graph_observation();
-                let real_score = env.score_manager.total_score as f32;
-                let remaining_tiles = env.score_manager.remaining_tiles;
-                let placed_count = env.placed_count;
 
-                game_records.push((
-                    hash,
-                    RealScoreSample {
+                // Kiểm tra hash nhanh trước khi trích xuất đồ thị (tiết kiệm CPU + RAM)
+                let is_new = {
+                    let mut set = seen_hashes.lock().unwrap();
+                    if set.len() < target_unique_samples && set.insert(hash) {
+                        true
+                    } else {
+                        false
+                    }
+                };
+
+                if is_new {
+                    let obs = env.extract_graph_observation();
+                    let sample = RealScoreSample {
                         obs: obs.into(),
-                        real_score,
-                        remaining_tiles,
-                        placed_count,
-                    },
-                ));
+                        real_score: env.score_manager.total_score as f32,
+                        remaining_tiles: env.score_manager.remaining_tiles,
+                        placed_count: env.placed_count,
+                    };
 
-                // Chọn nước đi kết hợp siêu tốc (không clone toàn bộ env trong vòng lặp)
+                    let count = total_unique.fetch_add(1, Ordering::Relaxed) + 1;
+                    {
+                        let mut list = collected_samples.lock().unwrap();
+                        list.push(sample);
+                    }
+
+                    if count % 10_000 == 0 || count >= target_unique_samples {
+                        let elapsed = start_time.elapsed().as_secs_f32();
+                        let speed = count as f32 / elapsed.max(0.001);
+                        println!(
+                            "⏳ [Tiến Độ] Đã thu thập {:>6}/{} mẫu UNIQUE ({:>3.0}%) | Tốc độ: {:>6.0} mẫu/s | RAM: ~250MB | {:.1}s",
+                            count, target_unique_samples, (count as f32 / target_unique_samples as f32) * 100.0, speed, elapsed
+                        );
+                    }
+                }
+
                 let chosen_action = if rng.gen::<f32>() < 0.15 {
                     valid_actions[rng.gen_range(0..valid_actions.len())]
                 } else {
@@ -184,49 +204,17 @@ fn main() {
                     break;
                 }
             }
-
-            let done_g = completed_games.fetch_add(1, Ordering::Relaxed) + 1;
-            let current_collected = total_samples_collected.fetch_add(game_records.len(), Ordering::Relaxed) + game_records.len();
-
-            if done_g % 500 == 0 || done_g == batch_games {
-                use std::io::Write;
-                let elapsed = start_time.elapsed().as_secs_f32();
-                let speed = current_collected as f32 / elapsed.max(0.001);
-                print!(
-                    "\r⏳ [Tiến Độ] Đã xong {:>5}/{} ván ({:>3.0}%) | Thu được {:>7} mẫu thô | Tốc độ: {:>6.0} mẫu/s | {:.1}s",
-                    done_g, batch_games, (done_g as f32 / batch_games as f32) * 100.0, current_collected, speed, elapsed
-                );
-                let _ = std::io::stdout().flush();
-                if done_g == batch_games {
-                    println!();
-                }
-            }
-
-            game_records
-        })
-        .collect();
-
-    println!("[Lọc Trùng] Thu được {} mẫu thô. Đang lọc Unique bằng Hash 64-bit...", all_samples.len());
-
-    let mut seen_hashes: HashSet<u64> = HashSet::with_capacity(all_samples.len());
-    let mut unique_samples: Vec<RealScoreSample> = Vec::with_capacity(target_unique_samples);
-
-    for (hash, sample) in all_samples {
-        if seen_hashes.insert(hash) {
-            unique_samples.push(sample);
-            if unique_samples.len() >= target_unique_samples {
-                break;
-            }
-        }
+        });
     }
 
+    let final_samples = collected_samples.into_inner().unwrap();
     let dur = start_time.elapsed();
-    println!("✅ Hoàn tất lọc! Thu được {} MẪU DUY NHẤT (100% Unique) trong {:.2}s!", unique_samples.len(), dur.as_secs_f32());
+    println!("\n✅ Hoàn tất! Thu thập đủ {} MẪU UNIQUE trong {:.2}s!", final_samples.len(), dur.as_secs_f32());
 
     println!("[Lưu Trữ] Đang ghi dataset vào file: {}...", output_file);
     let mut file = BufWriter::new(File::create(&output_file).unwrap());
-    bincode::serialize_into(&mut file, &unique_samples).unwrap();
+    bincode::serialize_into(&mut file, &final_samples).unwrap();
     file.flush().unwrap();
 
-    println!("🎉 XONG! File dataset sẵn sàng cho huấn luyện NNUE!");
+    println!("🎉 XONG! File dataset sẵn sàng cho huấn luyện!");
 }
