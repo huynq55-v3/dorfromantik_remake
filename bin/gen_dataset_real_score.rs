@@ -245,15 +245,15 @@ fn main() {
                 }
             }
 
-            // GÁN TỔNG ĐIỂM CUỐI VÁN CHO TẤT CẢ CÁC TRẠNG THÁI TRONG VÁN
-            let final_game_score = env.score_manager.total_score as f32;
+            // GÁN TỔNG ĐIỂM CUỐI VÁN CHIA 10 (ĐƠN VỊ CƠ SỞ CỦA GAME)
+            let final_game_score_div_10 = (env.score_manager.total_score as f32) / 10.0;
 
             if !episode_observations.is_empty() {
                 let mut local_samples = Vec::with_capacity(episode_observations.len());
                 for (obs, rem, placed) in episode_observations {
                     local_samples.push(RealScoreSample {
                         obs: obs.into(),
-                        real_score: final_game_score,
+                        real_score: final_game_score_div_10, // Lưu trực tiếp điểm gốc chia 10 (ví dụ 650.0)
                         remaining_tiles: rem,
                         placed_count: placed,
                     });

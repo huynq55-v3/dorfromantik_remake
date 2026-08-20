@@ -12,12 +12,14 @@ pub mod node_feat {
     pub const IS_CANDIDATE: usize = 1;
     pub const EDGE_TERRAIN_START: usize = 2;   // 6 edges
     pub const OPEN_EDGE_START: usize = 8;      // 6 flags
+    pub const EFFECTIVE_REMAINING_TILES: usize = 14; // Số tile thực sự còn lại (min giữa cọc bài và giới hạn game)
     pub const GROUP_OPEN_EDGES: usize = 15;
     pub const QUEST_ACTIVE: usize = 16;
     pub const QUEST_GROUP_TYPE_START: usize = 17; // 5 groups
     pub const QUEST_EQUALITY_MORE: usize = 22;
     pub const QUEST_EQUALITY_EXACTLY: usize = 23;
     pub const QUEST_REMAINING: usize = 24;
+    pub const CURRENT_SCORE_DIV_10: usize = 25; // Điểm số hiện tại chia 10 (đơn vị gốc của game)
     pub const UPCOMING_TILE1_START: usize = 27;   // 6 edges
     pub const UPCOMING_TILE2_START: usize = 33;   // 6 edges
     pub const STEP_RATIO: usize = 39;
@@ -519,6 +521,14 @@ impl DorfromantikEnv {
                 }
             }
 
+            // 14: Số tile THỰC SỰ CÒN LẠI (Tính chuẩn xác: min(cọc bài, tile_limit - placed_count))
+            let tiles_left_in_game = self.tile_limit.saturating_sub(self.placed_count);
+            let effective_remaining_tiles = self.score_manager.remaining_tiles.min(tiles_left_in_game);
+            feature[node_feat::EFFECTIVE_REMAINING_TILES] = effective_remaining_tiles as f32;
+
+            // 25: Điểm số hiện tại chia 10 (đơn vị cơ sở của game)
+            feature[node_feat::CURRENT_SCORE_DIV_10] = (self.score_manager.total_score as f32) / 10.0;
+
             // 27..33: Upcoming Tile 1 Features
             if let Some(t1) = tile_1 {
                 let cfg = t1.to_hex_edge_config();
@@ -535,8 +545,8 @@ impl DorfromantikEnv {
                 }
             }
 
-            // 39: Step ratio
-            feature[node_feat::STEP_RATIO] = (self.placed_count as f32 / self.tile_limit as f32).clamp(0.0, 1.0);
+            // 39: Step ratio (placed_count / tile_limit)
+            feature[node_feat::STEP_RATIO] = (self.placed_count as f32 / self.tile_limit.max(1) as f32).clamp(0.0, 1.0);
 
             node_features.push(feature);
         }
