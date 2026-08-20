@@ -64,23 +64,27 @@ impl Linear {
         }
     }
 
-    /// Linear Forward: Y = X * W^T + b
+    /// Linear Forward: Y = X * W^T + b (Tối ưu hóa bằng matrixmultiply SGEMM / AVX2 FMA)
     pub fn forward(&self, input: &[f32], input_len: usize) -> Vec<f32> {
-        let batch_size = input_len / self.in_features;
-        let mut output = vec![0.0f32; batch_size * self.out_features];
+        let m = input_len / self.in_features; // batch_size
+        let k = self.in_features;
+        let n = self.out_features;
+        
+        let mut output = Vec::with_capacity(m * n);
+        for _ in 0..m {
+            output.extend_from_slice(&self.bias);
+        }
 
-        for b in 0..batch_size {
-            let in_offset = b * self.in_features;
-            let out_offset = b * self.out_features;
-
-            for o in 0..self.out_features {
-                let mut sum = self.bias[o];
-                let w_offset = o * self.in_features;
-                for i in 0..self.in_features {
-                    sum += input[in_offset + i] * self.weight[w_offset + i];
-                }
-                output[out_offset + o] = sum;
-            }
+        unsafe {
+            matrixmultiply::sgemm(
+                m, k, n,
+                1.0,
+                input.as_ptr(), k as isize, 1,          // X: [m x k] row-major (stride_row=k, stride_col=1)
+                self.weight.as_ptr(), 1, k as isize,    // W^T: W is [n x k] row-major, so W^T has (stride_row=1, stride_col=k)
+                1.0,
+                output.as_mut_ptr(), n as isize, 1,     // Y: [m x n] row-major (stride_row=n, stride_col=1)
+            );
+            output.set_len(m * n);
         }
         output
     }
