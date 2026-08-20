@@ -7,7 +7,9 @@ use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+use dorfromantik_remake::board::{get_neighbor_pos, opposite_direction};
 use dorfromantik_remake::env::{Action, DorfromantikEnv, GraphObservation};
+use dorfromantik_remake::score_manager::is_matching_edge;
 
 /// Dạng Serializable chuẩn cho GraphObservation
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,16 +147,30 @@ fn main() {
                     },
                 ));
 
-                // Chọn nước đi kết hợp (90% chọn nước đi tốt nhất, 10% chọn ngẫu nhiên để đa dạng thế cờ)
-                let chosen_action = if rng.gen::<f32>() < 0.10 {
+                // Chọn nước đi kết hợp siêu tốc (không clone toàn bộ env trong vòng lặp)
+                let chosen_action = if rng.gen::<f32>() < 0.15 {
                     valid_actions[rng.gen_range(0..valid_actions.len())]
                 } else {
                     let mut best_act = valid_actions[0];
                     let mut max_sc = -1000.0f32;
+                    let curr_tile = env.current_tile().unwrap();
+                    let curr_cfg = curr_tile.to_hex_edge_config();
+
                     for &act in &valid_actions {
-                        let mut temp = env.clone();
-                        let r = temp.step(act);
-                        let sc = r.breakdown.fit_score as f32 + (r.breakdown.perfect_count * 60) as f32;
+                        let mut cfg = curr_cfg;
+                        cfg.rotate(act.rotation);
+                        let mut match_count = 0;
+                        for dir in 0..6 {
+                            let n_pos = get_neighbor_pos(act.q, act.r, dir);
+                            if let Some(neighbor) = env.board.placed_tiles.get(&n_pos) {
+                                let my_edge = cfg.edges[dir];
+                                let n_edge = neighbor.edge_config.edges[opposite_direction(dir)];
+                                if is_matching_edge(my_edge, n_edge) {
+                                    match_count += 1;
+                                }
+                            }
+                        }
+                        let sc = match_count as f32 * 10.0;
                         if sc > max_sc {
                             max_sc = sc;
                             best_act = act;
@@ -172,13 +188,18 @@ fn main() {
             let done_g = completed_games.fetch_add(1, Ordering::Relaxed) + 1;
             let current_collected = total_samples_collected.fetch_add(game_records.len(), Ordering::Relaxed) + game_records.len();
 
-            if done_g % 2_500 == 0 || done_g == batch_games {
+            if done_g % 500 == 0 || done_g == batch_games {
+                use std::io::Write;
                 let elapsed = start_time.elapsed().as_secs_f32();
-                let speed = current_collected as f32 / elapsed;
-                println!(
-                    "⏳ [Tiến Độ] Đã xong {:>5}/{} ván ({:>3.0}%) | Thu được {:>7} mẫu thô | Tốc độ: {:>6.0} mẫu/s | {:.1}s",
+                let speed = current_collected as f32 / elapsed.max(0.001);
+                print!(
+                    "\r⏳ [Tiến Độ] Đã xong {:>5}/{} ván ({:>3.0}%) | Thu được {:>7} mẫu thô | Tốc độ: {:>6.0} mẫu/s | {:.1}s",
                     done_g, batch_games, (done_g as f32 / batch_games as f32) * 100.0, current_collected, speed, elapsed
                 );
+                let _ = std::io::stdout().flush();
+                if done_g == batch_games {
+                    println!();
+                }
             }
 
             game_records
