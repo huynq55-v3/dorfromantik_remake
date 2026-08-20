@@ -1,12 +1,11 @@
 use rayon::prelude::*;
+use std::env as std_env;
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
 
-use dorfromantik_remake::board::{get_neighbor_pos, opposite_direction};
 use dorfromantik_remake::env::{Action, DorfromantikEnv};
 use dorfromantik_remake::nn::HexGNNModel;
-use dorfromantik_remake::score_manager::is_matching_edge;
 
 fn load_monthly_game_config() -> (i32, usize, usize) {
     let mut seed = -2093096630;
@@ -28,7 +27,7 @@ fn load_monthly_game_config() -> (i32, usize, usize) {
     (seed, initial_stack, tile_limit)
 }
 
-/// Đánh giá thế cờ bằng mạng GNN Value Head thuần
+/// Đánh giá trạng thái đồ thị trực tiếp bằng mạng GNN Value Head
 fn evaluate_state_gnn(model: &HexGNNModel, env: &DorfromantikEnv) -> f32 {
     let obs = env.extract_graph_observation();
     let (_, val) = model.forward(
@@ -38,74 +37,58 @@ fn evaluate_state_gnn(model: &HexGNNModel, env: &DorfromantikEnv) -> f32 {
         &obs.valid_actions,
         &obs.action_features,
     );
-    // Scale ngược lại về điểm thật (x 100.0)
-    val * 100.0
+    val * 100.0 // Scaled về điểm thực
 }
 
-/// Chọn nước đi tốt nhất bằng 2-Step Beam Search được hướng dẫn bởi mạng GNN Value Model
-fn select_best_action_gnn_beam(model: &HexGNNModel, env: &DorfromantikEnv, beam_width: usize) -> Action {
+/// Chọn nước đi tối ưu bằng GNN Value Head:
+/// - Nếu beam_limit == 0: ĐÁNH GIÁ 100% TẤT CẢ CÁC NƯỚC ĐI HỢP LỆ (Không lọc thô, để GNN tự nhìn nhận toàn bộ!)
+/// - Nếu depth == 1: 1-Step Direct GNN Evaluation
+/// - Nếu depth == 2: 2-Step Lookahead GNN Evaluation
+pub fn select_best_action_gnn_beam(
+    env: &DorfromantikEnv,
+    model: &HexGNNModel,
+    depth: usize,
+    beam_limit: usize,
+) -> (Action, f32) {
     let valid_actions = env.get_valid_actions();
     if valid_actions.len() <= 1 {
-        return valid_actions[0];
+        let act = valid_actions.get(0).copied().unwrap_or(Action { q: 0, r: 0, rotation: 0 });
+        return (act, 0.0);
     }
 
-    // BƯỚC 1: Lọc nhanh top ứng viên tiềm năng nhất ở Step 1
-    let curr_tile = env.current_tile().unwrap();
-    let curr_cfg = curr_tile.to_hex_edge_config();
+    let actions_to_evaluate: Vec<Action> = if beam_limit == 0 || beam_limit >= valid_actions.len() {
+        valid_actions.clone() // 100% TẤT CẢ CÁC NƯỚC ĐI!
+    } else {
+        valid_actions.iter().copied().take(beam_limit).collect()
+    };
 
-    let mut scored_actions: Vec<(f32, Action)> = valid_actions
-        .iter()
-        .map(|&act| {
-            let mut cfg = curr_cfg;
-            cfg.rotate(act.rotation);
-            let mut match_count = 0;
-            for dir in 0..6 {
-                let n_pos = get_neighbor_pos(act.q, act.r, dir);
-                if let Some(neighbor) = env.board.placed_tiles.get(&n_pos) {
-                    let my_edge = cfg.edges[dir];
-                    let n_edge = neighbor.edge_config.edges[opposite_direction(dir)];
-                    if is_matching_edge(my_edge, n_edge) {
-                        match_count += 1;
-                    }
-                }
-            }
-            (match_count as f32, act)
-        })
-        .collect();
-
-    // Sắp xếp giảm dần theo số cạnh khớp
-    scored_actions.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    let top_candidates: Vec<Action> = scored_actions.into_iter().take(beam_width).map(|(_, a)| a).collect();
-
-    // BƯỚC 2: Chạy song song Rayon đánh giá sâu 2 bước bằng mạng GNN Value Head
-    let evaluated: Vec<(f32, Action)> = top_candidates
+    // Duyệt song song trên Rayon để nạp vào GNN
+    let evaluated: Vec<(f32, Action)> = actions_to_evaluate
         .par_iter()
         .map(|&act1| {
             let mut env1 = env.clone();
-            let res1 = env1.step(act1);
-            let score1 = (res1.breakdown.fit_score + res1.breakdown.perfect_count * 60) as f32;
+            let _ = env1.step(act1);
 
-            if env1.is_game_over() {
-                return (score1, act1);
+            if env1.is_game_over() || depth == 1 {
+                let gnn_val = evaluate_state_gnn(model, &env1);
+                return (gnn_val, act1);
             }
 
+            // Nếu depth == 2: Xem tiếp nước đi tối ưu của lượt sau
             let valid_actions2 = env1.get_valid_actions();
             if valid_actions2.is_empty() {
                 let gnn_val = evaluate_state_gnn(model, &env1);
-                return (score1 + gnn_val, act1);
+                return (gnn_val, act1);
             }
 
-            // Ở step 2, tìm nước đi tiếp theo có GNN Value Head đánh giá cao nhất
             let mut max_step2_eval = f32::NEG_INFINITY;
             for &act2 in &valid_actions2 {
                 let mut env2 = env1.clone();
-                let res2 = env2.step(act2);
-                let immediate_score = (res2.breakdown.fit_score + res2.breakdown.perfect_count * 60) as f32;
-                let gnn_val = evaluate_state_gnn(model, &env2);
+                let _ = env2.step(act2);
+                let gnn_val2 = evaluate_state_gnn(model, &env2);
 
-                let total_eval = score1 + immediate_score + gnn_val;
-                if total_eval > max_step2_eval {
-                    max_step2_eval = total_eval;
+                if gnn_val2 > max_step2_eval {
+                    max_step2_eval = gnn_val2;
                 }
             }
 
@@ -116,19 +99,34 @@ fn select_best_action_gnn_beam(model: &HexGNNModel, env: &DorfromantikEnv, beam_
     evaluated
         .into_iter()
         .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(_, a)| a)
-        .unwrap_or(valid_actions[0])
+        .unwrap_or((0.0, valid_actions[0]))
+        .swap_tuple()
+}
+
+trait SwapTuple {
+    fn swap_tuple(self) -> (Action, f32);
+}
+impl SwapTuple for (f32, Action) {
+    fn swap_tuple(self) -> (Action, f32) {
+        (self.1, self.0)
+    }
 }
 
 fn main() {
     let (target_seed, initial_stack, tile_limit) = load_monthly_game_config();
     let model_path = "models/nnue_real_score_model.bin";
+    let args: Vec<String> = std_env::args().collect();
+
+    let depth: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let beam_limit: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0); // 0 = 100% tất cả các nước
 
     println!("============================================================");
-    println!(">>> CHƠI THỬ NGHIỆM VỚI MẠNG GNN VALUE HEAD + BEAM SEARCH <<<");
-    println!(" - Seed Mục Tiêu: {}", target_seed);
-    println!(" - Tile Limit: {} tiles", tile_limit);
-    println!(" - Nạp Model: {}", model_path);
+    println!(">>> CHƠI THỬ TỰ ĐỘNG VỚI GNN VALUE TIÊN TRI TƯƠNG LAI <<<");
+    println!(" - Seed Mục Tiêu : {}", target_seed);
+    println!(" - Tile Limit    : {} tiles", tile_limit);
+    println!(" - Độ Sâu (Depth): {} Tầng Lookahead", depth);
+    println!(" - Nước Đi Xét   : {}", if beam_limit == 0 { "100% TẤT CẢ CÁC NƯỚC HỢP LỆ (Không lọc thô)" } else { "Top giới hạn" });
+    println!(" - Nạp Model     : {}", model_path);
     println!("============================================================\n");
 
     let model = if Path::new(model_path).exists() {
@@ -141,7 +139,6 @@ fn main() {
 
     let mut env = DorfromantikEnv::new(target_seed, initial_stack, tile_limit);
     let start_time = Instant::now();
-    let beam_width = 12; // Khám phá 12 nhánh tốt nhất mỗi lượt
 
     println!("🎮 BẮT ĐẦU VÁN CHƠI TỰ ĐỘNG...\n");
 
@@ -151,15 +148,13 @@ fn main() {
         let step_start = Instant::now();
         let old_score = env.score_manager.total_score;
 
-        // AI GNN Beam Search chọn nước đi
-        let best_act = select_best_action_gnn_beam(&model, &env, beam_width);
+        let (best_act, gnn_eval) = select_best_action_gnn_beam(&env, &model, depth, beam_limit);
         let res = env.step(best_act);
 
-        let gnn_val = evaluate_state_gnn(&model, &env);
         let earned = env.score_manager.total_score.saturating_sub(old_score);
 
         println!(
-            "Turn {:>3} | Placed: {:>3}/{} | Action: ({:>2}, {:>2}, rot:{}) | Fit: {:>2} | +{:>3} pts | Tổng Điểm: {:>5} | GNN Eval: {:>6.1} | {:.2}s",
+            "Turn {:>3} | Placed: {:>3}/{} | Action: ({:>2}, {:>2}, rot:{}) | Fit: {:>2} | +{:>3} pts | Tổng Điểm: {:>5} | Cọc: {:>2} | GNN Tiên Tri: {:>6.1} | {:.2}s",
             turn,
             env.placed_count,
             tile_limit,
@@ -169,7 +164,8 @@ fn main() {
             res.breakdown.fit_score,
             earned,
             env.score_manager.total_score,
-            gnn_val,
+            env.score_manager.remaining_tiles,
+            gnn_eval,
             step_start.elapsed().as_secs_f32()
         );
 
