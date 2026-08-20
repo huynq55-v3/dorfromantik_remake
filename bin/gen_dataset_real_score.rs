@@ -1,6 +1,6 @@
-use rayon::prelude::*;
 use rand::Rng;
 use rand_distr::{Distribution, Normal};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
@@ -93,9 +93,21 @@ fn load_game_config() -> (i32, usize, usize) {
         for line in content.lines() {
             if let Some((k, v)) = line.split_once('=') {
                 match k.trim() {
-                    "REAL_TILE_SEED" => if let Ok(s) = v.trim().parse() { seed = s; },
-                    "ACTIVE_TileStackHeight" => if let Ok(s) = v.trim().parse() { stack = s; },
-                    "ACTIVE_TileLimit" => if let Ok(s) = v.trim().parse() { limit = s; },
+                    "REAL_TILE_SEED" => {
+                        if let Ok(s) = v.trim().parse() {
+                            seed = s;
+                        }
+                    }
+                    "ACTIVE_TileStackHeight" => {
+                        if let Ok(s) = v.trim().parse() {
+                            stack = s;
+                        }
+                    }
+                    "ACTIVE_TileLimit" => {
+                        if let Ok(s) = v.trim().parse() {
+                            limit = s;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -105,7 +117,7 @@ fn load_game_config() -> (i32, usize, usize) {
 }
 
 fn load_best_weights() -> HeuristicWeights {
-    let path = "models/heuristic_best_weights.json";
+    let path = "models/best_heuristic_weights.json";
     if Path::new(path).exists() {
         if let Ok(content) = fs::read_to_string(path) {
             if let Ok(w) = serde_json::from_str::<HeuristicWeights>(&content) {
@@ -118,7 +130,11 @@ fn load_best_weights() -> HeuristicWeights {
 
 /// Đánh giá nhanh nước đi trực tiếp trên bảng không clone `env` (Siêu Tốc)
 #[inline(always)]
-pub fn evaluate_action_inplace(env: &DorfromantikEnv, act: Action, weights: &HeuristicWeights) -> f32 {
+pub fn evaluate_action_inplace(
+    env: &DorfromantikEnv,
+    act: Action,
+    weights: &HeuristicWeights,
+) -> f32 {
     let curr_tile = match env.current_tile() {
         Some(t) => t,
         None => return 0.0,
@@ -148,7 +164,11 @@ pub fn evaluate_action_inplace(env: &DorfromantikEnv, act: Action, weights: &Heu
         }
     }
 
-    let f_perfect = if neighbor_count == 6 && matched_edges == 6 { 1.0 } else { 0.0 };
+    let f_perfect = if neighbor_count == 6 && matched_edges == 6 {
+        1.0
+    } else {
+        0.0
+    };
     let f_open_edges = (6.0 - neighbor_count as f32).max(0.0);
 
     // Tính điểm tổng hợp nhanh
@@ -190,7 +210,10 @@ fn main() {
     println!("============================================================");
     println!(">>> BỘ SINH DATASET 1M MẪU SIÊU TỐC & DISK STREAMING (RAM < 200MB) <<<");
     println!(" - Seed Mục Tiêu : {}", target_seed);
-    println!(" - Mục Tiêu Mẫu  : {} samples độc nhất (100% Unique)", target_unique_samples);
+    println!(
+        " - Mục Tiêu Mẫu  : {} samples độc nhất (100% Unique)",
+        target_unique_samples
+    );
     println!(" - Bộ Nhớ RAM    : Khóa cứng < 200MB (Stream ghi đĩa liên tục)");
     println!("============================================================\n");
 
@@ -204,7 +227,11 @@ fn main() {
     let start_time = Instant::now();
     let seen_hashes = Mutex::new(HashSet::<u64>::with_capacity(target_unique_samples));
     let disk_writer = Mutex::new(BufWriter::new(
-        OpenOptions::new().create(true).append(true).open(&output_file).unwrap()
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&output_file)
+            .unwrap(),
     ));
     let total_unique = AtomicUsize::new(0);
 
@@ -313,6 +340,13 @@ fn main() {
     }
 
     let dur = start_time.elapsed();
-    println!("\n✅ Hoàn tất! Sinh xong {} MẪU UNIQUE trong {:.2}s!", target_unique_samples, dur.as_secs_f32());
-    println!("🎉 File dataset lưu tại: {} (RAM sử dụng luôn < 150MB)", output_file);
+    println!(
+        "\n✅ Hoàn tất! Sinh xong {} MẪU UNIQUE trong {:.2}s!",
+        target_unique_samples,
+        dur.as_secs_f32()
+    );
+    println!(
+        "🎉 File dataset lưu tại: {} (RAM sử dụng luôn < 150MB)",
+        output_file
+    );
 }

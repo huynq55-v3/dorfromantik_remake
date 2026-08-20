@@ -32,26 +32,6 @@ name = "train_alphazero_gpu"
 path = "bin/train_alphazero_gpu.rs"
 
 [[bin]]
-name = "train_alphazero_fast"
-path = "bin/train_alphazero_fast.rs"
-
-[[bin]]
-name = "gen_replay"
-path = "bin/gen_replay.rs"
-
-[[bin]]
-name = "fix_replay_buffer"
-path = "bin/fix_replay_buffer.rs"
-
-[[bin]]
-name = "train_offline"
-path = "bin/train_offline.rs"
-
-[[bin]]
-name = "human_expert_play"
-path = "bin/human_expert_play.rs"
-
-[[bin]]
 name = "evolve_heuristic"
 path = "bin/evolve_heuristic.rs"
 

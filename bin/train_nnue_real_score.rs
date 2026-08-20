@@ -26,7 +26,9 @@ impl SerializableGraphObservation {
             let start = i * 70;
             let end = start + 70;
             let mut arr = [0.0f32; 70];
-            arr.copy_from_slice(&self.node_features_flat[start..end]);
+            if end <= self.node_features_flat.len() {
+                arr.copy_from_slice(&self.node_features_flat[start..end]);
+            }
             node_features.push(arr);
         }
 
@@ -36,7 +38,9 @@ impl SerializableGraphObservation {
             let start = i * 16;
             let end = start + 16;
             let mut arr = [0.0f32; 16];
-            arr.copy_from_slice(&self.action_features_flat[start..end]);
+            if end <= self.action_features_flat.len() {
+                arr.copy_from_slice(&self.action_features_flat[start..end]);
+            }
             action_features.push(arr);
         }
 
@@ -392,12 +396,14 @@ fn main() {
 
     let mut value_graphs = Vec::new();
     while let Ok(sample) = bincode::deserialize_from::<_, RealScoreSample>(&mut reader) {
-        let obs = sample.obs.to_graph_observation();
-        value_graphs.push(ValueGraph {
-            node_features: obs.node_features,
-            edge_index: obs.edge_index,
-            target_val: sample.real_score / 100.0,
-        });
+        if !sample.obs.node_positions.is_empty() && sample.obs.node_features_flat.len() >= sample.obs.node_positions.len() * 70 {
+            let obs = sample.obs.to_graph_observation();
+            value_graphs.push(ValueGraph {
+                node_features: obs.node_features,
+                edge_index: obs.edge_index,
+                target_val: sample.real_score / 100.0,
+            });
+        }
     }
 
     let n_samples = value_graphs.len();
