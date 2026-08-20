@@ -487,10 +487,12 @@ impl DorfromantikEnv {
             } else {
                 // CANDIDATE NODE FEATURES (Đặc trưng ô trống ứng viên)
                 // 2..8: Terrain của các ô đã đặt vây quanh
+                let mut neighbors = [None; 6];
                 for dir in 0..6 {
                     let n_pos = get_neighbor_pos(pos.0, pos.1, dir);
                     if let Some(n_tile) = placed.get(&n_pos) {
                         let opp_dir = (dir + 3) % 6;
+                        neighbors[dir] = Some((opp_dir, n_tile));
                         let edge_type = n_tile.edge_config.edges[opp_dir];
                         feature[node_feat::EDGE_TERRAIN_START + dir] = (edge_type as usize as f32) / 7.0;
                     }
@@ -500,20 +502,24 @@ impl DorfromantikEnv {
                 if let Some(curr) = tile_curr {
                     let curr_cfg = curr.to_hex_edge_config();
                     for rot in 0..6 {
-                        if self.board.can_place_tile(pos.0, pos.1, curr, rot) {
-                            let mut perfect_matches = 0;
-                            for dir in 0..6 {
-                                let n_pos = get_neighbor_pos(pos.0, pos.1, dir);
-                                if let Some(n_tile) = placed.get(&n_pos) {
-                                    let opp_dir = (dir + 3) % 6;
-                                    let n_edge = n_tile.edge_config.edges[opp_dir];
-                                    let c_edge = curr_cfg.edge_at(dir, rot);
+                        let mut can_place = true;
+                        let mut perfect_matches = 0;
 
-                                    if c_edge == n_edge || (c_edge.to_group_type().is_some() && c_edge.to_group_type() == n_edge.to_group_type()) {
-                                        perfect_matches += 1;
-                                    }
+                        for dir in 0..6 {
+                            if let Some((opp_dir, n_tile)) = neighbors[dir] {
+                                let my_edge = curr_cfg.edge_at(dir, rot);
+                                let neighbor_edge = n_tile.edge_config.edges[opp_dir];
+                                if !my_edge.is_compatible_with(neighbor_edge) {
+                                    can_place = false;
+                                    break;
+                                }
+                                if my_edge == neighbor_edge || (my_edge.to_group_type().is_some() && my_edge.to_group_type() == neighbor_edge.to_group_type()) {
+                                    perfect_matches += 1;
                                 }
                             }
+                        }
+
+                        if can_place {
                             feature[node_feat::OPEN_EDGE_START + rot] = (perfect_matches as f32) / 6.0;
                         }
                     }
@@ -568,7 +574,6 @@ impl DorfromantikEnv {
             let curr_cfg = curr.to_hex_edge_config();
             let is_quest_tile = if matches!(curr, GeneratedTile::Quest { .. }) { 1.0 } else { 0.0 };
 
-            // Quest info của tile SẮP ĐẶT: equality (MoreThan/Exactly) + con số bubble ban đầu.
             let mut curr_equality_more = 0.0f32;
             let mut curr_remaining = 0.0f32;
             if let GeneratedTile::Quest { quest_data, .. } = curr {
@@ -616,7 +621,7 @@ impl DorfromantikEnv {
                 feat[action_feat::CURR_EQUALITY_MORE] = curr_equality_more;
                 feat[action_feat::IS_QUEST_TILE] = is_quest_tile;
                 feat[action_feat::ROTATION] = act.rotation as f32 / 6.0;
-                feat[action_feat::POS_Q] = 0.0; // Bỏ tọa độ tuyệt đối để giữ tính bất biến tịnh tiến
+                feat[action_feat::POS_Q] = 0.0;
                 feat[action_feat::POS_R] = 0.0;
 
                 action_features.push(feat);
