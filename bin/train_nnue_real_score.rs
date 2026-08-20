@@ -1,5 +1,5 @@
-use rayon::prelude::*;
 use rand::seq::SliceRandom;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{BufReader, Seek, SeekFrom};
@@ -195,7 +195,8 @@ pub fn train_value_batch_blas(model: &HexGNNModel, batch: &[ValueGraph]) -> (Hex
             let inv_n = 1.0 / n_nodes as f32;
             for u in 0..n_nodes {
                 for d in 0..HIDDEN_DIM {
-                    mean_h_batch[i * HIDDEN_DIM + d] += h_final[(offset + u) * HIDDEN_DIM + d] * inv_n;
+                    mean_h_batch[i * HIDDEN_DIM + d] +=
+                        h_final[(offset + u) * HIDDEN_DIM + d] * inv_n;
                 }
             }
         }
@@ -204,7 +205,11 @@ pub fn train_value_batch_blas(model: &HexGNNModel, batch: &[ValueGraph]) -> (Hex
     let val_hidden = model.w_val1.forward(&mean_h_batch, b_count * HIDDEN_DIM);
     let mut val_relu = vec![0.0f32; b_count * HIDDEN_DIM];
     for i in 0..b_count * HIDDEN_DIM {
-        val_relu[i] = if val_hidden[i] > 0.0 { val_hidden[i] } else { 0.0 };
+        val_relu[i] = if val_hidden[i] > 0.0 {
+            val_hidden[i]
+        } else {
+            0.0
+        };
     }
     let all_values = model.w_val2.forward(&val_relu, b_count * HIDDEN_DIM);
 
@@ -239,26 +244,46 @@ pub fn train_value_batch_blas(model: &HexGNNModel, batch: &[ValueGraph]) -> (Hex
 
     let mut d_val_hidden = vec![0.0f32; b_count * HIDDEN_DIM];
     for i in 0..b_count {
-        d_val_hidden[i] = if val_hidden[i] > 0.0 { d_val_relu[i] } else { 0.0 };
+        d_val_hidden[i] = if val_hidden[i] > 0.0 {
+            d_val_relu[i]
+        } else {
+            0.0
+        };
     }
 
     let mut d_mean_h = vec![0.0f32; b_count * HIDDEN_DIM];
     unsafe {
         matrixmultiply::sgemm(
-            HIDDEN_DIM, b_count, HIDDEN_DIM,
+            HIDDEN_DIM,
+            b_count,
+            HIDDEN_DIM,
             1.0,
-            d_val_hidden.as_ptr(), 1, HIDDEN_DIM as isize,
-            mean_h_batch.as_ptr(), HIDDEN_DIM as isize, 1,
+            d_val_hidden.as_ptr(),
+            1,
+            HIDDEN_DIM as isize,
+            mean_h_batch.as_ptr(),
+            HIDDEN_DIM as isize,
+            1,
             1.0,
-            grads.w_val1.weight.as_mut_ptr(), HIDDEN_DIM as isize, 1,
+            grads.w_val1.weight.as_mut_ptr(),
+            HIDDEN_DIM as isize,
+            1,
         );
         matrixmultiply::sgemm(
-            b_count, HIDDEN_DIM, HIDDEN_DIM,
+            b_count,
+            HIDDEN_DIM,
+            HIDDEN_DIM,
             1.0,
-            d_val_hidden.as_ptr(), HIDDEN_DIM as isize, 1,
-            model.w_val1.weight.as_ptr(), HIDDEN_DIM as isize, 1,
+            d_val_hidden.as_ptr(),
+            HIDDEN_DIM as isize,
+            1,
+            model.w_val1.weight.as_ptr(),
+            HIDDEN_DIM as isize,
+            1,
             0.0,
-            d_mean_h.as_mut_ptr(), HIDDEN_DIM as isize, 1,
+            d_mean_h.as_mut_ptr(),
+            HIDDEN_DIM as isize,
+            1,
         );
     }
     for i in 0..b_count {
@@ -275,7 +300,8 @@ pub fn train_value_batch_blas(model: &HexGNNModel, batch: &[ValueGraph]) -> (Hex
             let inv_n = 1.0 / n_nodes as f32;
             for u in 0..n_nodes {
                 for d in 0..HIDDEN_DIM {
-                    d_h_final[(offset + u) * HIDDEN_DIM + d] += d_mean_h[i * HIDDEN_DIM + d] * inv_n;
+                    d_h_final[(offset + u) * HIDDEN_DIM + d] +=
+                        d_mean_h[i * HIDDEN_DIM + d] * inv_n;
                 }
             }
         }
@@ -292,10 +318,18 @@ pub fn train_value_batch_blas(model: &HexGNNModel, batch: &[ValueGraph]) -> (Hex
 
         let mut d_relu = vec![0.0f32; total_nodes * out_dim];
         for i in 0..total_nodes * out_dim {
-            d_relu[i] = if h_pres[li][i] > 0.0 { d_h_curr[i] } else { 0.0 };
+            d_relu[i] = if h_pres[li][i] > 0.0 {
+                d_h_curr[i]
+            } else {
+                0.0
+            };
         }
 
-        let h_in = if has_residual { &h_vals[li - 1] } else { &x_flat };
+        let h_in = if has_residual {
+            &h_vals[li - 1]
+        } else {
+            &x_flat
+        };
 
         for u in 0..total_nodes {
             for o in 0..out_dim {
@@ -307,20 +341,36 @@ pub fn train_value_batch_blas(model: &HexGNNModel, batch: &[ValueGraph]) -> (Hex
 
         unsafe {
             matrixmultiply::sgemm(
-                out_dim, total_nodes, in_dim,
+                out_dim,
+                total_nodes,
+                in_dim,
                 1.0,
-                d_relu.as_ptr(), 1, out_dim as isize,
-                h_in.as_ptr(), in_dim as isize, 1,
+                d_relu.as_ptr(),
+                1,
+                out_dim as isize,
+                h_in.as_ptr(),
+                in_dim as isize,
+                1,
                 1.0,
-                grad_layer.w_self.weight.as_mut_ptr(), in_dim as isize, 1,
+                grad_layer.w_self.weight.as_mut_ptr(),
+                in_dim as isize,
+                1,
             );
             matrixmultiply::sgemm(
-                out_dim, total_nodes, in_dim,
+                out_dim,
+                total_nodes,
+                in_dim,
                 1.0,
-                d_relu.as_ptr(), 1, out_dim as isize,
-                neighs[li].as_ptr(), in_dim as isize, 1,
+                d_relu.as_ptr(),
+                1,
+                out_dim as isize,
+                neighs[li].as_ptr(),
+                in_dim as isize,
+                1,
                 1.0,
-                grad_layer.w_neigh.weight.as_mut_ptr(), in_dim as isize, 1,
+                grad_layer.w_neigh.weight.as_mut_ptr(),
+                in_dim as isize,
+                1,
             );
         }
 
@@ -330,20 +380,36 @@ pub fn train_value_batch_blas(model: &HexGNNModel, batch: &[ValueGraph]) -> (Hex
 
             unsafe {
                 matrixmultiply::sgemm(
-                    total_nodes, out_dim, in_dim,
+                    total_nodes,
+                    out_dim,
+                    in_dim,
                     1.0,
-                    d_relu.as_ptr(), out_dim as isize, 1,
-                    layer.w_self.weight.as_ptr(), in_dim as isize, 1,
+                    d_relu.as_ptr(),
+                    out_dim as isize,
+                    1,
+                    layer.w_self.weight.as_ptr(),
+                    in_dim as isize,
+                    1,
                     1.0,
-                    d_h_prev.as_mut_ptr(), in_dim as isize, 1,
+                    d_h_prev.as_mut_ptr(),
+                    in_dim as isize,
+                    1,
                 );
                 matrixmultiply::sgemm(
-                    total_nodes, out_dim, in_dim,
+                    total_nodes,
+                    out_dim,
+                    in_dim,
                     1.0,
-                    d_relu.as_ptr(), out_dim as isize, 1,
-                    layer.w_neigh.weight.as_ptr(), in_dim as isize, 1,
+                    d_relu.as_ptr(),
+                    out_dim as isize,
+                    1,
+                    layer.w_neigh.weight.as_ptr(),
+                    in_dim as isize,
+                    1,
                     0.0,
-                    d_neigh.as_mut_ptr(), in_dim as isize, 1,
+                    d_neigh.as_mut_ptr(),
+                    in_dim as isize,
+                    1,
                 );
             }
 
@@ -374,7 +440,9 @@ fn main() {
     let dataset_path = "data/real_score_dataset_1m.bin";
     if !Path::new(dataset_path).exists() {
         eprintln!("❌ Chưa tìm thấy file dataset: {}", dataset_path);
-        eprintln!("👉 Hãy chạy lệnh sinh dataset trước: cargo run --release --bin gen_dataset_real_score");
+        eprintln!(
+            "👉 Hãy chạy lệnh sinh dataset trước: cargo run --release --bin gen_dataset_real_score"
+        );
         return;
     }
 
@@ -386,7 +454,7 @@ fn main() {
 
     let mut model = HexGNNModel::new();
     let lr = 0.0005;
-    let epochs = 5;
+    let epochs = 5; // 5 EPOCHS ĐỂ HỘI TỤ SÂU
     let batch_size = 1024;
     let chunk_samples_limit = 50_000usize; // Mỗi lần chỉ nạp 50k mẫu vào RAM (~150MB)
 
@@ -397,21 +465,22 @@ fn main() {
 
         let mut total_val_loss = 0.0f32;
         let mut total_trained = 0usize;
-        let mut chunk_id = 0;
 
         loop {
-            chunk_id += 1;
             let mut chunk_graphs = Vec::with_capacity(chunk_samples_limit);
 
             while chunk_graphs.len() < chunk_samples_limit {
                 match bincode::deserialize_from::<_, RealScoreSample>(&mut reader) {
                     Ok(sample) => {
-                        if !sample.obs.node_positions.is_empty() && sample.obs.node_features_flat.len() >= sample.obs.node_positions.len() * 70 {
+                        if !sample.obs.node_positions.is_empty()
+                            && sample.obs.node_features_flat.len()
+                                >= sample.obs.node_positions.len() * 70
+                        {
                             let obs = sample.obs.to_graph_observation();
                             chunk_graphs.push(ValueGraph {
                                 node_features: obs.node_features,
                                 edge_index: obs.edge_index,
-                                target_val: sample.real_score / 100.0,
+                                target_val: sample.real_score / 1000.0, // CHUẨN HÓA / 1000.0 (5.0 -> 7.5)
                             });
                         }
                     }
@@ -437,13 +506,14 @@ fn main() {
                 let (mut batch_grads, batch_val_loss) = batch_indices
                     .par_chunks(micro_chunk)
                     .map(|idx_slice| {
-                        let sub_batch: Vec<ValueGraph> = idx_slice.iter().map(|&i| {
-                            ValueGraph {
+                        let sub_batch: Vec<ValueGraph> = idx_slice
+                            .iter()
+                            .map(|&i| ValueGraph {
                                 node_features: chunk_graphs[i].node_features.clone(),
                                 edge_index: chunk_graphs[i].edge_index.clone(),
                                 target_val: chunk_graphs[i].target_val,
-                            }
-                        }).collect();
+                            })
+                            .collect();
                         train_value_batch_blas(&model, &sub_batch)
                     })
                     .reduce(
