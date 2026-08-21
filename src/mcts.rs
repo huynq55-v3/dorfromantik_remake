@@ -108,6 +108,20 @@ enum LeafEval {
     PendingEval,
 }
 
+#[derive(Clone)]
+enum IndexedLeafEval {
+    Terminal,
+    StoredValue(f32),
+    PendingExpand(usize),
+}
+
+struct IndexedSimPath {
+    node_path: Vec<usize>,
+    rewards: Vec<f32>,
+    leaf_eval: IndexedLeafEval,
+}
+
+
 impl MCTSSearch {
     pub fn new(config: MCTSConfig) -> Self {
         Self { config }
@@ -463,7 +477,14 @@ impl MCTSSearch {
             roots.push(Some(root));
         }
 
-        // 2. Chạy N lượt MCTS Simulations (Double-Buffering Pipelined nếu có GPU executor)
+        // 2. Chạy N lượt MCTS Simulations (Multi-Virtual-Loss Double-Buffering Pipelined nếu có GPU executor)
+        let k_vloss = std::env::var("DORFO_VLOSS_K")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(4)
+            .max(1);
+        let num_rounds = (self.config.n_simulations + k_vloss - 1) / k_vloss;
+
         let clone_ns = std::sync::atomic::AtomicU64::new(0);
         let step_ns = std::sync::atomic::AtomicU64::new(0);
         let ucb_ns = std::sync::atomic::AtomicU64::new(0);
@@ -472,7 +493,11 @@ impl MCTSSearch {
         if let Some(gpu) = gpu_exec {
             if perf {
                 use std::io::Write;
-                let _ = writeln!(std::io::stdout(), "[PERF] mode=GPU batch={} rounds={}", b_count, self.config.n_simulations);
+                let _ = writeln!(
+                    std::io::stdout(),
+                    "[PERF] mode=GPU batch={} rounds={} vloss_k={}",
+                    b_count, self.config.n_simulations, k_vloss
+                );
                 let _ = std::io::stdout().flush();
             }
             let mut t_trav_total = std::time::Duration::ZERO;
@@ -485,17 +510,46 @@ impl MCTSSearch {
                 let range_a = 0..mid;
                 let range_b = mid..b_count;
 
-                // Khởi động: CPU duyệt UCB Group A và gửi lệnh GPU Async vào Slot 0
-                let (mut sim_res_a, mut leaf_obs_a, mut leaf_idx_a) =
-                    self.run_sim_traversal_range(range_a.clone(), &roots, all_envs, active_indices, &q_mins, &q_maxs, &clone_ns, &step_ns, &ucb_ns, &obs_ns);
-                let leaf_refs_a: Vec<&crate::env::GraphObservation> = leaf_obs_a.iter().collect();
-                let mut pending_a = gpu.forward_batch_gpu_async_slot(0, &leaf_refs_a);
+                // Khởi động: CPU duyệt UCB Group A cho round 0 và gửi lệnh GPU Async vào Slot 0
+                let init_k = self.config.n_simulations.min(k_vloss);
+                let (mut sim_res_a, mut leaf_obs_a) = self.run_sim_traversal_range(
+                    range_a.clone(),
+                    &mut roots,
+                    all_envs,
+                    active_indices,
+                    &q_mins,
+                    &q_maxs,
+                    init_k,
+                    &clone_ns,
+                    &step_ns,
+                    &ucb_ns,
+                    &obs_ns,
+                );
+                let mut pending_a = if !leaf_obs_a.is_empty() {
+                    let leaf_refs_a: Vec<&crate::env::GraphObservation> = leaf_obs_a.iter().collect();
+                    gpu.forward_batch_gpu_async_slot(0, &leaf_refs_a)
+                } else {
+                    None
+                };
 
-                for _ in 0..self.config.n_simulations {
+                for r in 0..num_rounds {
+                    let this_k = (self.config.n_simulations - r * k_vloss).min(k_vloss);
+
                     // CPU chạy Rayon MCTS Traversal cho Group B trong lúc GPU đang tính Slot 0!
                     let ts = std::time::Instant::now();
-                    let (sim_res_b, leaf_obs_b, leaf_idx_b) =
-                        self.run_sim_traversal_range(range_b.clone(), &roots, all_envs, active_indices, &q_mins, &q_maxs, &clone_ns, &step_ns, &ucb_ns, &obs_ns);
+                    let (sim_res_b, leaf_obs_b) = self.run_sim_traversal_range(
+                        range_b.clone(),
+                        &mut roots,
+                        all_envs,
+                        active_indices,
+                        &q_mins,
+                        &q_maxs,
+                        this_k,
+                        &clone_ns,
+                        &step_ns,
+                        &ucb_ns,
+                        &obs_ns,
+                    );
                     t_trav_total += ts.elapsed();
 
                     // Nhận kết quả GPU Group A (Slot 0)
@@ -507,61 +561,103 @@ impl MCTSSearch {
                     };
                     t_gpu_total += tg.elapsed();
 
-                    // Gửi ngay lệnh GPU Async cho Group B vào Slot 1
-                    let leaf_refs_b: Vec<&crate::env::GraphObservation> = leaf_obs_b.iter().collect();
-                    let pending_b = gpu.forward_batch_gpu_async_slot(1, &leaf_refs_b);
+                    // Gửi ngay lệnh GPU Async cho Group B vào Slot 1 (Early Skip nếu không có lá)
+                    let pending_b = if !leaf_obs_b.is_empty() {
+                        let leaf_refs_b: Vec<&crate::env::GraphObservation> = leaf_obs_b.iter().collect();
+                        gpu.forward_batch_gpu_async_slot(1, &leaf_refs_b)
+                    } else {
+                        None
+                    };
 
                     // CPU Backprop cho Group A
                     let tsb = std::time::Instant::now();
-                    self.run_sim_backprop_range(range_a.clone(), sim_res_a, leaf_obs_a, leaf_idx_a, &results_a, &mut roots, &mut q_mins, &mut q_maxs);
+                    self.run_sim_backprop_range(range_a.clone(), &sim_res_a, &leaf_obs_a, &results_a, &mut roots, &mut q_mins, &mut q_maxs);
                     t_bp_total += tsb.elapsed();
 
-                    // CPU chạy Rayon MCTS Traversal cho Group A (lượt kế tiếp) trong lúc GPU đang tính Slot 1!
-                    let ts = std::time::Instant::now();
-                    let (next_sim_res_a, next_leaf_obs_a, next_leaf_idx_a) =
-                        self.run_sim_traversal_range(range_a.clone(), &roots, all_envs, active_indices, &q_mins, &q_maxs, &clone_ns, &step_ns, &ucb_ns, &obs_ns);
-                    t_trav_total += ts.elapsed();
+                    // Nếu còn round tiếp theo, CPU chạy Traversal Group A trong lúc GPU đang tính Slot 1
+                    if r + 1 < num_rounds {
+                        let next_k = (self.config.n_simulations - (r + 1) * k_vloss).min(k_vloss);
+                        let ts = std::time::Instant::now();
+                        let (next_sim_res_a, next_leaf_obs_a) = self.run_sim_traversal_range(
+                            range_a.clone(),
+                            &mut roots,
+                            all_envs,
+                            active_indices,
+                            &q_mins,
+                            &q_maxs,
+                            next_k,
+                            &clone_ns,
+                            &step_ns,
+                            &ucb_ns,
+                            &obs_ns,
+                        );
+                        t_trav_total += ts.elapsed();
 
-                    // Nhận kết quả GPU Group B (Slot 1)
-                    let tg = std::time::Instant::now();
-                    let results_b = if let Some(p_b) = pending_b {
-                        p_b.wait(&gpu.device)
+                        // Nhận kết quả GPU Group B (Slot 1)
+                        let tg = std::time::Instant::now();
+                        let results_b = if let Some(p_b) = pending_b {
+                            p_b.wait(&gpu.device)
+                        } else {
+                            Vec::new()
+                        };
+                        t_gpu_total += tg.elapsed();
+
+                        // Gửi ngay lệnh GPU Async cho Group A vào Slot 0 lượt kế tiếp
+                        pending_a = if !next_leaf_obs_a.is_empty() {
+                            let next_leaf_refs_a: Vec<&crate::env::GraphObservation> = next_leaf_obs_a.iter().collect();
+                            gpu.forward_batch_gpu_async_slot(0, &next_leaf_refs_a)
+                        } else {
+                            None
+                        };
+
+                        // CPU Backprop cho Group B
+                        let tsb = std::time::Instant::now();
+                        self.run_sim_backprop_range(range_b.clone(), &sim_res_b, &leaf_obs_b, &results_b, &mut roots, &mut q_mins, &mut q_maxs);
+                        t_bp_total += tsb.elapsed();
+
+                        sim_res_a = next_sim_res_a;
+                        leaf_obs_a = next_leaf_obs_a;
                     } else {
-                        Vec::new()
-                    };
-                    t_gpu_total += tg.elapsed();
+                        // Lượt cuối: nhận kết quả GPU Group B và Backprop Group B
+                        let tg = std::time::Instant::now();
+                        let results_b = if let Some(p_b) = pending_b {
+                            p_b.wait(&gpu.device)
+                        } else {
+                            Vec::new()
+                        };
+                        t_gpu_total += tg.elapsed();
 
-                    // Gửi ngay lệnh GPU Async cho Group A vào Slot 0 lượt kế tiếp
-                    let next_leaf_refs_a: Vec<&crate::env::GraphObservation> = next_leaf_obs_a.iter().collect();
-                    pending_a = gpu.forward_batch_gpu_async_slot(0, &next_leaf_refs_a);
+                        let tsb = std::time::Instant::now();
+                        self.run_sim_backprop_range(range_b.clone(), &sim_res_b, &leaf_obs_b, &results_b, &mut roots, &mut q_mins, &mut q_maxs);
+                        t_bp_total += tsb.elapsed();
 
-                    // CPU Backprop cho Group B
-                    let tsb = std::time::Instant::now();
-                    self.run_sim_backprop_range(range_b.clone(), sim_res_b, leaf_obs_b, leaf_idx_b, &results_b, &mut roots, &mut q_mins, &mut q_maxs);
-                    t_bp_total += tsb.elapsed();
-
-                    sim_res_a = next_sim_res_a;
-                    leaf_obs_a = next_leaf_obs_a;
-                    leaf_idx_a = next_leaf_idx_a;
-                }
-
-                // Dọn dẹp pending Group A còn sót lại lượt cuối
-                if let Some(p_a) = pending_a {
-                    let tg = std::time::Instant::now();
-                    let results_a = p_a.wait(&gpu.device);
-                    t_gpu_total += tg.elapsed();
-                    let tsb = std::time::Instant::now();
-                    self.run_sim_backprop_range(range_a, sim_res_a, leaf_obs_a, leaf_idx_a, &results_a, &mut roots, &mut q_mins, &mut q_maxs);
-                    t_bp_total += tsb.elapsed();
+                        pending_a = None;
+                    }
                 }
             } else {
                 // Fallback đơn lẻ nếu b_count < 4
-                for _ in 0..self.config.n_simulations {
-                    let (sim_res, leaf_obs, leaf_idx) =
-                        self.run_sim_traversal_range(0..b_count, &roots, all_envs, active_indices, &q_mins, &q_maxs, &clone_ns, &step_ns, &ucb_ns, &obs_ns);
-                    let leaf_refs: Vec<&crate::env::GraphObservation> = leaf_obs.iter().collect();
-                    let results = gpu.forward_batch_gpu(&leaf_refs);
-                    self.run_sim_backprop_range(0..b_count, sim_res, leaf_obs, leaf_idx, &results, &mut roots, &mut q_mins, &mut q_maxs);
+                for r in 0..num_rounds {
+                    let this_k = (self.config.n_simulations - r * k_vloss).min(k_vloss);
+                    let (sim_res, leaf_obs) = self.run_sim_traversal_range(
+                        0..b_count,
+                        &mut roots,
+                        all_envs,
+                        active_indices,
+                        &q_mins,
+                        &q_maxs,
+                        this_k,
+                        &clone_ns,
+                        &step_ns,
+                        &ucb_ns,
+                        &obs_ns,
+                    );
+                    let results = if !leaf_obs.is_empty() {
+                        let leaf_refs: Vec<&crate::env::GraphObservation> = leaf_obs.iter().collect();
+                        gpu.forward_batch_gpu(&leaf_refs)
+                    } else {
+                        Vec::new()
+                    };
+                    self.run_sim_backprop_range(0..b_count, &sim_res, &leaf_obs, &results, &mut roots, &mut q_mins, &mut q_maxs);
                 }
             }
             if perf {
@@ -569,8 +665,8 @@ impl MCTSSearch {
                 let wall = t_search0.elapsed().as_secs_f64();
                 let _ = writeln!(
                     std::io::stdout(),
-                    "[PERF] search_batch_indexed mode=GPU rounds={} wall={:.3}s trav={:.3}s gpu_wait={:.3}s backprop={:.3}s | clone={:.3}s ucb={:.3}s step={:.3}s obs_ext={:.3}s",
-                    self.config.n_simulations, wall,
+                    "[PERF] search_batch_indexed mode=GPU rounds={} vloss_k={} wall={:.3}s trav={:.3}s gpu_wait={:.3}s backprop={:.3}s | clone={:.3}s ucb={:.3}s step={:.3}s obs_ext={:.3}s",
+                    self.config.n_simulations, k_vloss, wall,
                     t_trav_total.as_secs_f64(),
                     t_gpu_total.as_secs_f64(),
                     t_bp_total.as_secs_f64(),
@@ -586,15 +682,31 @@ impl MCTSSearch {
             let t_search0 = std::time::Instant::now();
             let mut t_trav_total = std::time::Duration::ZERO;
             let mut t_bp_total = std::time::Duration::ZERO;
-            for _ in 0..self.config.n_simulations {
+            for r in 0..num_rounds {
+                let this_k = (self.config.n_simulations - r * k_vloss).min(k_vloss);
                 let ts = std::time::Instant::now();
-                let (sim_res, leaf_obs, leaf_idx) =
-                    self.run_sim_traversal_range(0..b_count, &roots, all_envs, active_indices, &q_mins, &q_maxs, &clone_ns, &step_ns, &ucb_ns, &obs_ns);
+                let (sim_res, leaf_obs) = self.run_sim_traversal_range(
+                    0..b_count,
+                    &mut roots,
+                    all_envs,
+                    active_indices,
+                    &q_mins,
+                    &q_maxs,
+                    this_k,
+                    &clone_ns,
+                    &step_ns,
+                    &ucb_ns,
+                    &obs_ns,
+                );
                 t_trav_total += ts.elapsed();
-                let leaf_refs: Vec<&crate::env::GraphObservation> = leaf_obs.iter().collect();
-                let results = model.forward_batch(&leaf_refs);
+                let results = if !leaf_obs.is_empty() {
+                    let leaf_refs: Vec<&crate::env::GraphObservation> = leaf_obs.iter().collect();
+                    model.forward_batch(&leaf_refs)
+                } else {
+                    Vec::new()
+                };
                 let tsb = std::time::Instant::now();
-                self.run_sim_backprop_range(0..b_count, sim_res, leaf_obs, leaf_idx, &results, &mut roots, &mut q_mins, &mut q_maxs);
+                self.run_sim_backprop_range(0..b_count, &sim_res, &leaf_obs, &results, &mut roots, &mut q_mins, &mut q_maxs);
                 t_bp_total += tsb.elapsed();
             }
             if perf {
@@ -602,8 +714,8 @@ impl MCTSSearch {
                 let wall = t_search0.elapsed().as_secs_f64();
                 let _ = writeln!(
                     std::io::stdout(),
-                    "[PERF] search_batch_indexed mode=CPU rounds={} wall={:.3}s trav={:.3}s nn+backprop={:.3}s",
-                    self.config.n_simulations, wall, t_trav_total.as_secs_f64(), t_bp_total.as_secs_f64(),
+                    "[PERF] search_batch_indexed mode=CPU rounds={} vloss_k={} wall={:.3}s trav={:.3}s nn+backprop={:.3}s",
+                    self.config.n_simulations, k_vloss, wall, t_trav_total.as_secs_f64(), t_bp_total.as_secs_f64(),
                 );
                 let _ = std::io::stdout().flush();
             }
@@ -1041,216 +1153,233 @@ impl MCTSSearch {
     fn run_sim_traversal_range(
         &self,
         range: std::ops::Range<usize>,
-        roots: &[Option<MCTSNode>],
+        roots: &mut [Option<MCTSNode>],
         all_envs: &[DorfromantikEnv],
         active_indices: &[usize],
         q_mins: &[f32],
         q_maxs: &[f32],
+        k_sims: usize,
         clone_ns: &std::sync::atomic::AtomicU64,
         step_ns: &std::sync::atomic::AtomicU64,
         ucb_ns: &std::sync::atomic::AtomicU64,
         obs_ns: &std::sync::atomic::AtomicU64,
     ) -> (
-        Vec<(Option<DorfromantikEnv>, Vec<usize>, Vec<f32>)>,
+        Vec<Vec<IndexedSimPath>>,
         Vec<crate::env::GraphObservation>,
-        Vec<usize>,
     ) {
-        // HỢP NHẤT SINGLE-PASS RAYON: Duyệt cây MCTS + Step + Trích xuất GraphObservation trong 1 lần duy nhất!
-        // Cắt giảm 50% Thread Synchronization Barrier, giúp CPU ăn tải 100% không còn bị khựng.
-        let fused_results: Vec<(
-            (Option<DorfromantikEnv>, Vec<usize>, Vec<f32>),
-            Option<(usize, crate::env::GraphObservation)>,
-        )> = range
-            .clone()
-            .into_par_iter()
-            .map(|i| {
-                if let Some(ref root) = roots[i] {
-                    let env_idx = active_indices[i];
-                    let t0 = std::time::Instant::now();
-                    let mut sim_env = all_envs[env_idx].clone();
-                    clone_ns.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-                    let mut node_path = Vec::new();
-                    let mut rewards = Vec::new();
+        const VLOSS: f32 = 3.0;
+        let range_len = range.len();
+        let roots_slice = &mut roots[range.clone()];
+        let q_mins_slice = &q_mins[range.clone()];
+        let q_maxs_slice = &q_maxs[range.clone()];
+        let active_slice = &active_indices[range];
 
-                    let mut curr: &MCTSNode = root;
-                    let q_min = q_mins[i];
-                    let q_max = q_maxs[i];
+        let env_results: Vec<(Vec<IndexedSimPath>, Vec<crate::env::GraphObservation>)> = roots_slice
+            .par_iter_mut()
+            .zip(q_mins_slice.par_iter())
+            .zip(q_maxs_slice.par_iter())
+            .zip(active_slice.par_iter())
+            .map(|(((root_opt, &q_min), &q_max), &env_idx)| {
+                if let Some(ref mut root) = root_opt {
+                    let mut env_paths = Vec::with_capacity(k_sims);
+                    let mut env_leaf_obs = Vec::new();
 
-                    while curr.is_expanded && !curr.children.is_empty() && !curr.is_terminal {
-                        let t_ucb0 = std::time::Instant::now();
-                        let total_n = curr.children.iter().map(|(_, c)| c.visit_count).sum::<u32>() as f32;
-                        let sqrt_n = total_n.sqrt();
+                    for _ in 0..k_sims {
+                        let t0 = std::time::Instant::now();
+                        let mut sim_env = all_envs[env_idx].clone();
+                        clone_ns.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
 
-                        let mut best_idx = 0;
-                        let mut best_ucb = f32::NEG_INFINITY;
+                        let mut node_path = Vec::new();
+                        let mut rewards = Vec::new();
+                        let mut curr: &MCTSNode = root;
 
-                        for (idx, (_, child)) in curr.children.iter().enumerate() {
-                            let q_val = if child.visit_count > 0 {
-                                let q = child.q_value();
-                                if q_max > q_min + 1e-6 {
-                                    (q - q_min) / (q_max - q_min)
+                        while curr.is_expanded && !curr.children.is_empty() && !curr.is_terminal {
+                            let t_ucb0 = std::time::Instant::now();
+                            let total_n = curr.children.iter().map(|(_, c)| c.visit_count).sum::<u32>() as f32;
+                            let sqrt_n = total_n.sqrt();
+
+                            let mut best_idx = 0;
+                            let mut best_ucb = f32::NEG_INFINITY;
+
+                            for (idx, (_, child)) in curr.children.iter().enumerate() {
+                                let q_val = if child.visit_count > 0 {
+                                    let q = child.q_value();
+                                    if q_max > q_min + 1e-6 {
+                                        (q - q_min) / (q_max - q_min)
+                                    } else {
+                                        0.5
+                                    }
                                 } else {
-                                    0.5
-                                }
-                            } else {
-                                0.0
-                            };
+                                    0.0
+                                };
 
-                            let ucb = q_val + self.config.c_puct * child.prior * sqrt_n / (1.0 + child.visit_count as f32);
-                            if ucb > best_ucb {
-                                best_ucb = ucb;
-                                best_idx = idx;
+                                let ucb = q_val + self.config.c_puct * child.prior * sqrt_n / (1.0 + child.visit_count as f32);
+                                if ucb > best_ucb {
+                                    best_ucb = ucb;
+                                    best_idx = idx;
+                                }
+                            }
+                            ucb_ns.fetch_add(t_ucb0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+
+                            let (chosen_action, _) = curr.children[best_idx];
+                            let ts = std::time::Instant::now();
+                            let res = sim_env.step(chosen_action);
+                            step_ns.fetch_add(ts.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                            let scaled_r = res.reward * 0.01;
+
+                            node_path.push(best_idx);
+                            rewards.push(scaled_r);
+
+                            curr = &curr.children[best_idx].1;
+                            if res.done {
+                                break;
                             }
                         }
-                        ucb_ns.fetch_add(t_ucb0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
 
-                        let (chosen_action, _) = curr.children[best_idx];
-                        let ts = std::time::Instant::now();
-                        let res = sim_env.step(chosen_action);
-                        step_ns.fetch_add(ts.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-                        let scaled_r = res.reward * 0.01;
+                        let t_obs0 = std::time::Instant::now();
+                        let leaf_eval = if curr.is_terminal {
+                            IndexedLeafEval::Terminal
+                        } else if !curr.is_expanded {
+                            let leaf_obs = sim_env.extract_graph_observation();
+                            if leaf_obs.valid_actions.is_empty() {
+                                IndexedLeafEval::Terminal
+                            } else {
+                                let local_obs_idx = env_leaf_obs.len();
+                                env_leaf_obs.push(leaf_obs);
+                                IndexedLeafEval::PendingExpand(local_obs_idx)
+                            }
+                        } else {
+                            IndexedLeafEval::StoredValue(curr.q_value())
+                        };
+                        obs_ns.fetch_add(t_obs0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
 
-                        node_path.push(best_idx);
-                        rewards.push(scaled_r);
+                        Self::apply_virtual_loss(root, &node_path, VLOSS);
 
-                        curr = &curr.children[best_idx].1;
-                        if res.done {
-                            break;
-                        }
+                        env_paths.push(IndexedSimPath {
+                            node_path,
+                            rewards,
+                            leaf_eval,
+                        });
                     }
 
-                    // Kiểm tra và trích xuất GraphObservation NGAY TẠI CHỖ (Không Fork-Join lần 2):
-                    let t_obs0 = std::time::Instant::now();
-                    let maybe_obs = if !curr.is_terminal && !curr.is_expanded {
-                        let leaf_obs = sim_env.extract_graph_observation();
-                        if !leaf_obs.valid_actions.is_empty() {
-                            Some((i, leaf_obs))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-                    obs_ns.fetch_add(t_obs0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-
-                    ((Some(sim_env), node_path, rewards), maybe_obs)
+                    (env_paths, env_leaf_obs)
                 } else {
-                    ((None, Vec::new(), Vec::new()), None)
+                    (Vec::new(), Vec::new())
                 }
             })
             .collect();
 
-        let mut sim_results = Vec::with_capacity(fused_results.len());
-        let mut eval_indices = Vec::new();
-        let mut eval_leaf_obs = Vec::new();
+        let mut all_leaf_obs = Vec::new();
+        let mut adjusted_group_paths = Vec::with_capacity(range_len);
 
-        for (sim_res, maybe_obs) in fused_results {
-            sim_results.push(sim_res);
-            if let Some((i, leaf_obs)) = maybe_obs {
-                eval_indices.push(i);
-                eval_leaf_obs.push(leaf_obs);
+        for (mut paths, env_obs) in env_results {
+            let global_offset = all_leaf_obs.len();
+            for path in &mut paths {
+                if let IndexedLeafEval::PendingExpand(ref mut local_idx) = path.leaf_eval {
+                    *local_idx += global_offset;
+                }
             }
+            all_leaf_obs.extend(env_obs);
+            adjusted_group_paths.push(paths);
         }
 
-        (sim_results, eval_leaf_obs, eval_indices)
+        (adjusted_group_paths, all_leaf_obs)
     }
 
     fn run_sim_backprop_range(
         &self,
         range: std::ops::Range<usize>,
-        sim_results: Vec<(Option<DorfromantikEnv>, Vec<usize>, Vec<f32>)>,
-        eval_leaf_obs: Vec<crate::env::GraphObservation>,
-        eval_indices: Vec<usize>,
+        group_paths: &[Vec<IndexedSimPath>],
+        eval_leaf_obs: &[crate::env::GraphObservation],
         gpu_results: &[(Vec<f32>, f32)],
         roots: &mut [Option<MCTSNode>],
         q_mins: &mut [f32],
         q_maxs: &mut [f32],
     ) {
-        let b_count = roots.len();
-        let mut leaf_eval_results: Vec<Option<(Vec<f32>, f32)>> = vec![None; b_count];
-        let mut leaf_eval_obs_map: Vec<Option<crate::env::GraphObservation>> = (0..b_count).map(|_| None).collect();
+        const VLOSS: f32 = 3.0;
+        let roots_slice = &mut roots[range.clone()];
+        let q_mins_slice = &mut q_mins[range.clone()];
+        let q_maxs_slice = &mut q_maxs[range];
 
-        for (pos, &idx) in eval_indices.iter().enumerate() {
-            if pos < gpu_results.len() {
-                leaf_eval_results[idx] = Some(gpu_results[pos].clone());
-                leaf_eval_obs_map[idx] = Some(eval_leaf_obs[pos].clone());
-            }
-        }
-
-        let range_s = range.clone();
-        let roots_slice = &mut roots[range_s.clone()];
-        let q_mins_slice = &mut q_mins[range_s.clone()];
-        let q_maxs_slice = &mut q_maxs[range_s.clone()];
-        let leaf_eval_results_slice = &mut leaf_eval_results[range_s.clone()];
-        let leaf_eval_obs_map_slice = &mut leaf_eval_obs_map[range_s];
-
-        sim_results
-            .into_par_iter()
+        group_paths
+            .par_iter()
             .zip(roots_slice.par_iter_mut())
             .zip(q_mins_slice.par_iter_mut())
             .zip(q_maxs_slice.par_iter_mut())
-            .zip(leaf_eval_results_slice.par_iter_mut())
-            .zip(leaf_eval_obs_map_slice.par_iter_mut())
-            .for_each(
-                |((((((sim_env_opt, node_path, rewards), root_opt), q_min), q_max), leaf_eval_res), leaf_eval_obs)| {
-            if sim_env_opt.is_some() {
+            .for_each(|(((paths, root_opt), q_min), q_max)| {
                 if let Some(ref mut root) = root_opt {
-                    let mut curr = &mut *root;
-                    for &idx in &node_path {
-                        if idx < curr.children.len() {
-                            curr = &mut curr.children[idx].1;
-                        } else {
-                            break;
+                    for path in paths {
+                        let mut curr = &mut *root;
+                        for &idx in &path.node_path {
+                            if idx < curr.children.len() {
+                                curr = &mut curr.children[idx].1;
+                            } else {
+                                break;
+                            }
                         }
-                    }
 
-                    let leaf_value = if curr.is_terminal {
-                        0.0
-                    } else if let (Some((leaf_logits, val)), Some(obs)) = (leaf_eval_res.as_ref(), leaf_eval_obs.as_ref()) {
-                        let l_max = leaf_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                        let l_exps: Vec<f32> = leaf_logits.iter().map(|l| (l - l_max).exp()).collect();
-                        let l_sum: f32 = l_exps.iter().sum::<f32>().max(1e-8);
-                        let l_probs: Vec<f32> = l_exps.iter().map(|e| e / l_sum).collect();
+                        let leaf_value = match path.leaf_eval {
+                            IndexedLeafEval::Terminal => {
+                                curr.is_terminal = true;
+                                0.0
+                            }
+                            IndexedLeafEval::PendingExpand(global_obs_idx) => {
+                                if !curr.is_expanded && global_obs_idx < eval_leaf_obs.len() && global_obs_idx < gpu_results.len() {
+                                    let (leaf_logits, val) = &gpu_results[global_obs_idx];
+                                    let obs = &eval_leaf_obs[global_obs_idx];
 
-                        curr.is_expanded = true;
-                        curr.children = obs.valid_actions
-                            .iter()
-                            .zip(l_probs.iter())
-                            .map(|(&act, &p)| (act, MCTSNode::new(p)))
-                            .collect();
+                                    let l_max = leaf_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                                    let l_exps: Vec<f32> = leaf_logits.iter().map(|l| (l - l_max).exp()).collect();
+                                    let l_sum: f32 = l_exps.iter().sum::<f32>().max(1e-8);
+                                    let l_probs: Vec<f32> = l_exps.iter().map(|e| e / l_sum).collect();
 
-                        *val
-                    } else {
-                        curr.q_value()
-                    };
+                                    curr.is_expanded = true;
+                                    curr.children = obs.valid_actions
+                                        .iter()
+                                        .zip(l_probs.iter())
+                                        .map(|(&act, &p)| (act, MCTSNode::new(p)))
+                                        .collect();
 
-                    let mut g = leaf_value;
-                    let depth = node_path.len();
-                    let mut returns = vec![0.0f32; depth];
-                    for d in (0..depth).rev() {
-                        g = rewards[d] + self.config.gamma * g;
-                        returns[d] = g;
-                    }
+                                    *val
+                                } else {
+                                    curr.q_value()
+                                }
+                            }
+                            IndexedLeafEval::StoredValue(v) => v,
+                        };
 
-                    let mut trav = &mut *root;
-                    trav.visit_count += 1;
-                    trav.total_value += g;
+                        let mut g = leaf_value;
+                        let depth = path.node_path.len();
+                        let mut returns = vec![0.0f32; depth];
+                        for d in (0..depth).rev() {
+                            g = path.rewards[d] + self.config.gamma * g;
+                            returns[d] = g;
+                        }
 
-                    for d in 0..depth {
-                        let child_idx = node_path[d];
-                        if child_idx < trav.children.len() {
-                            trav = &mut trav.children[child_idx].1;
-                            trav.visit_count += 1;
-                            trav.total_value += returns[d];
+                        root.visit_count += 1;
+                        root.total_value += g;
+                        let rq = root.q_value();
+                        if rq < *q_min { *q_min = rq; }
+                        if rq > *q_max { *q_max = rq; }
 
-                            let q = trav.q_value();
-                            if q < *q_min { *q_min = q; }
-                            if q > *q_max { *q_max = q; }
+                        let mut trav = &mut *root;
+                        for d in 0..depth {
+                            let child_idx = path.node_path[d];
+                            if child_idx < trav.children.len() {
+                                trav = &mut trav.children[child_idx].1;
+                                trav.visit_count = trav.visit_count.saturating_sub(1);
+                                trav.total_value += VLOSS;
+                                trav.visit_count += 1;
+                                trav.total_value += returns[d];
+
+                                let q = trav.q_value();
+                                if q < *q_min { *q_min = q; }
+                                if q > *q_max { *q_max = q; }
+                            }
                         }
                     }
                 }
-            }
-        });
+            });
     }
 }
 
@@ -1304,4 +1433,26 @@ mod tests {
         assert!(!add3);
         assert_eq!(t3, 0.2);
     }
+
+    #[test]
+    fn test_search_batch_indexed_virtual_loss() {
+        let env1 = DorfromantikEnv::new(42, 10, 5);
+        let env2 = DorfromantikEnv::new(43, 10, 5);
+        let envs = vec![env1, env2];
+        let model = HexGNNModel::new();
+        let mcts = MCTSSearch::new(MCTSConfig {
+            n_simulations: 20,
+            ..MCTSConfig::default()
+        });
+
+        let active_indices = vec![0, 1];
+        let results = mcts.search_batch_indexed(&envs, &active_indices, &model, None, false, 0.0);
+        assert_eq!(results.len(), 2);
+        for (pi, chosen_idx, act, _val, obs) in results {
+            assert_eq!(pi.len(), obs.valid_actions.len());
+            assert!(chosen_idx < obs.valid_actions.len());
+            assert_eq!(act, obs.valid_actions[chosen_idx]);
+        }
+    }
 }
+

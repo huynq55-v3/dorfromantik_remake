@@ -3,84 +3,30 @@ use rayon::prelude::*;
 use crate::nn::{HexGNNModel, HIDDEN_DIM, ACTION_FEAT_DIM, NODE_FEAT_DIM};
 use crate::env::GraphObservation;
 
-/// GEMM dims: số chiều input (k) và output (n) được truyền động qua uniform, nên layer-1 (k=40,
-/// n=128) và các layer 2-4 (k=n=128) đều tái sử dụng cùng một pipeline.
-
-/// WGSL Tiled GEMM Shader với Workgroup Shared Memory (Tối ưu băng thông VRAM gấp 16 lần):
-/// Y[row, col] = X[row, :] · W[col, :]^T + B[col], optional ReLU
-const GEMM_SHADER: &str = r#"
-struct Dims { m: u32, k: u32, n: u32, relu: u32 };
-
-@group(0) @binding(0) var<uniform>            dims: Dims;
-@group(0) @binding(1) var<storage, read>      x:    array<f32>;
-@group(0) @binding(2) var<storage, read>      w:    array<f32>;
-@group(0) @binding(3) var<storage, read>      b:    array<f32>;
-@group(0) @binding(4) var<storage, read_write> y:   array<f32>;
-
-var<workgroup> tile_x: array<array<f32, 16>, 16>;
-var<workgroup> tile_w: array<array<f32, 16>, 16>;
-
-@compute @workgroup_size(16, 16)
-fn main(
-    @builtin(global_invocation_id) gid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(workgroup_id) wid: vec3<u32>
-) {
-    let row = gid.x;
-    let col = gid.y;
-    let lr = lid.x;
-    let lc = lid.y;
-
-    var acc: f32 = 0.0;
-    let num_tiles = (dims.k + 15u) / 16u;
-
-    for (var t: u32 = 0u; t < num_tiles; t = t + 1u) {
-        let x_col = t * 16u + lc;
-        if (row < dims.m && x_col < dims.k) {
-            tile_x[lr][lc] = x[row * dims.k + x_col];
-        } else {
-            tile_x[lr][lc] = 0.0;
-        }
-
-        let w_k = t * 16u + lr;
-        if (col < dims.n && w_k < dims.k) {
-            tile_w[lr][lc] = w[col * dims.k + w_k];
-        } else {
-            tile_w[lr][lc] = 0.0;
-        }
-
-        workgroupBarrier();
-
-        for (var i: u32 = 0u; i < 16u; i = i + 1u) {
-            acc = acc + tile_x[lr][i] * tile_w[i][lc];
-        }
-
-        workgroupBarrier();
-    }
-
-    if (row < dims.m && col < dims.n) {
-        acc = acc + b[col];
-        if (dims.relu == 1u && acc < 0.0) { acc = 0.0; }
-        y[row * dims.n + col] = acc;
-    }
-}
-"#;
-
 /// WGSL CSR Aggregation Shader: h_out[u, d] = mean_{v in N(u)} h_in[v, d]
 const AGG_CSR_SHADER: &str = r#"
-struct AggCsrDims { n_nodes: u32, dim: u32, _p1: u32, _p2: u32 };
+struct AllUniforms {
+    total_nodes: u32,
+    total_actions: u32,
+    batch: u32,
+    hidden_dim: u32,
+    node_feat_dim: u32,
+    action_dim: u32,
+    _pad0: u32,
+    _pad1: u32,
+};
 
-@group(0) @binding(0) var<uniform>          dims:    AggCsrDims;
+@group(0) @binding(0) var<uniform>          dims:    AllUniforms;
 @group(0) @binding(1) var<storage, read>    h_in:    array<f32>;
 @group(0) @binding(2) var<storage, read>    offsets: array<u32>;
 @group(0) @binding(3) var<storage, read>    targets: array<u32>;
 @group(0) @binding(4) var<storage, read_write> h_out:  array<f32>;
 
 @compute @workgroup_size(16, 16)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main_l1(@builtin(global_invocation_id) gid: vec3<u32>) {
     let node = gid.x;
     let feat = gid.y;
-    if (node >= dims.n_nodes || feat >= dims.dim) { return; }
+    if (node >= dims.total_nodes || feat >= dims.node_feat_dim) { return; }
 
     let start = offsets[node];
     let end   = offsets[node + 1u];
@@ -89,48 +35,182 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var sum: f32 = 0.0;
     for (var i: u32 = start; i < end; i = i + 1u) {
         let v = targets[i];
-        sum = sum + h_in[v * dims.dim + feat];
+        sum = sum + h_in[v * dims.node_feat_dim + feat];
     }
 
     let inv = select(1.0 / f32(count), 0.0, count == 0u);
-    h_out[node * dims.dim + feat] = sum * inv;
+    h_out[node * dims.node_feat_dim + feat] = sum * inv;
+}
+
+@compute @workgroup_size(16, 16)
+fn main_ln(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let node = gid.x;
+    let feat = gid.y;
+    if (node >= dims.total_nodes || feat >= dims.hidden_dim) { return; }
+
+    let start = offsets[node];
+    let end   = offsets[node + 1u];
+    let count = end - start;
+
+    var sum: f32 = 0.0;
+    for (var i: u32 = start; i < end; i = i + 1u) {
+        let v = targets[i];
+        sum = sum + h_in[v * dims.hidden_dim + feat];
+    }
+
+    let inv = select(1.0 / f32(count), 0.0, count == 0u);
+    h_out[node * dims.hidden_dim + feat] = sum * inv;
 }
 "#;
 
-/// WGSL Combine Shader: h_out = relu(ys + yn) [+ h_prev if residual]
-const COMBINE_SHADER: &str = r#"
-struct CombineDims { n_nodes: u32, dim: u32, residual: u32, _p1: u32 };
+/// WGSL Fused GNN Layer Shader:
+/// Tính đồng thời:
+///   Y_self  = X · W_self^T + B_self
+///   Y_neigh = Neigh · W_neigh^T + B_neigh
+///   H_out   = ReLU(Y_self + Y_neigh) [+ H_prev if residual]
+const FUSED_GNN_LAYER_SHADER: &str = r#"
+struct AllUniforms {
+    total_nodes: u32,
+    total_actions: u32,
+    batch: u32,
+    hidden_dim: u32,
+    node_feat_dim: u32,
+    action_dim: u32,
+    _pad0: u32,
+    _pad1: u32,
+};
 
-@group(0) @binding(0) var<uniform>          dims:   CombineDims;
-@group(0) @binding(1) var<storage, read>    ys:     array<f32>;
-@group(0) @binding(2) var<storage, read>    yn:     array<f32>;
-@group(0) @binding(3) var<storage, read>    h_prev: array<f32>;
-@group(0) @binding(4) var<storage, read_write> h_out: array<f32>;
+@group(0) @binding(0) var<uniform>            dims:    AllUniforms;
+@group(0) @binding(1) var<storage, read>      x:       array<f32>;
+@group(0) @binding(2) var<storage, read>      neigh:   array<f32>;
+@group(0) @binding(3) var<storage, read>      w_self:  array<f32>;
+@group(0) @binding(4) var<storage, read>      b_self:  array<f32>;
+@group(0) @binding(5) var<storage, read>      w_neigh: array<f32>;
+@group(0) @binding(6) var<storage, read>      b_neigh: array<f32>;
+@group(0) @binding(7) var<storage, read>      h_prev:  array<f32>;
+@group(0) @binding(8) var<storage, read_write> h_out:   array<f32>;
+
+var<workgroup> tile_x:  array<array<f32, 16>, 16>;
+var<workgroup> tile_n:  array<array<f32, 16>, 16>;
+var<workgroup> tile_ws: array<array<f32, 16>, 16>;
+var<workgroup> tile_wn: array<array<f32, 16>, 16>;
 
 @compute @workgroup_size(16, 16)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let node = gid.x;
-    let feat = gid.y;
-    if (node >= dims.n_nodes || feat >= dims.dim) { return; }
+fn main_l1(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>
+) {
+    let row = gid.x;
+    let col = gid.y;
+    let lr = lid.x;
+    let lc = lid.y;
 
-    let i = node * dims.dim + feat;
-    let sum = ys[i] + yn[i];
-    let relu = max(sum, 0.0);
-    if (dims.residual == 1u) {
-        h_out[i] = relu + h_prev[i];
-    } else {
-        h_out[i] = relu;
+    var acc_s: f32 = 0.0;
+    var acc_n: f32 = 0.0;
+    let in_k = dims.node_feat_dim;
+    let num_tiles = (in_k + 15u) / 16u;
+
+    for (var t: u32 = 0u; t < num_tiles; t = t + 1u) {
+        let x_col = t * 16u + lc;
+        if (row < dims.total_nodes && x_col < in_k) {
+            tile_x[lr][lc] = x[row * in_k + x_col];
+            tile_n[lr][lc] = neigh[row * in_k + x_col];
+        } else {
+            tile_x[lr][lc] = 0.0;
+            tile_n[lr][lc] = 0.0;
+        }
+
+        let w_k = t * 16u + lr;
+        if (col < dims.hidden_dim && w_k < in_k) {
+            tile_ws[lr][lc] = w_self[col * in_k + w_k];
+            tile_wn[lr][lc] = w_neigh[col * in_k + w_k];
+        } else {
+            tile_ws[lr][lc] = 0.0;
+            tile_wn[lr][lc] = 0.0;
+        }
+
+        workgroupBarrier();
+
+        for (var i: u32 = 0u; i < 16u; i = i + 1u) {
+            acc_s = acc_s + tile_x[lr][i] * tile_ws[i][lc];
+            acc_n = acc_n + tile_n[lr][i] * tile_wn[i][lc];
+        }
+
+        workgroupBarrier();
+    }
+
+    if (row < dims.total_nodes && col < dims.hidden_dim) {
+        let total = (acc_s + b_self[col]) + (acc_n + b_neigh[col]);
+        h_out[row * dims.hidden_dim + col] = max(total, 0.0);
+    }
+}
+
+@compute @workgroup_size(16, 16)
+fn main_ln(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>
+) {
+    let row = gid.x;
+    let col = gid.y;
+    let lr = lid.x;
+    let lc = lid.y;
+
+    var acc_s: f32 = 0.0;
+    var acc_n: f32 = 0.0;
+    let in_k = dims.hidden_dim;
+    let num_tiles = (in_k + 15u) / 16u;
+
+    for (var t: u32 = 0u; t < num_tiles; t = t + 1u) {
+        let x_col = t * 16u + lc;
+        if (row < dims.total_nodes && x_col < in_k) {
+            tile_x[lr][lc] = x[row * in_k + x_col];
+            tile_n[lr][lc] = neigh[row * in_k + x_col];
+        } else {
+            tile_x[lr][lc] = 0.0;
+            tile_n[lr][lc] = 0.0;
+        }
+
+        let w_k = t * 16u + lr;
+        if (col < dims.hidden_dim && w_k < in_k) {
+            tile_ws[lr][lc] = w_self[col * in_k + w_k];
+            tile_wn[lr][lc] = w_neigh[col * in_k + w_k];
+        } else {
+            tile_ws[lr][lc] = 0.0;
+            tile_wn[lr][lc] = 0.0;
+        }
+
+        workgroupBarrier();
+
+        for (var i: u32 = 0u; i < 16u; i = i + 1u) {
+            acc_s = acc_s + tile_x[lr][i] * tile_ws[i][lc];
+            acc_n = acc_n + tile_n[lr][i] * tile_wn[i][lc];
+        }
+
+        workgroupBarrier();
+    }
+
+    if (row < dims.total_nodes && col < dims.hidden_dim) {
+        let total = (acc_s + b_self[col]) + (acc_n + b_neigh[col]);
+        let relu = max(total, 0.0);
+        h_out[row * dims.hidden_dim + col] = relu + h_prev[row * dims.hidden_dim + col];
     }
 }
 "#;
 
-/// WGSL Action Head Gather Shader:
-/// Gộp hN[u] (HIDDEN_DIM dims) + action_features (ACTION_FEAT_DIM dims) -> act_in (HIDDEN+ACTION dims).
-/// Kích thước hidden & action được truyền qua uniform dims để linh hoạt.
+/// WGSL Action Head Gather Shader
 const GATHER_ACT_SHADER: &str = r#"
-struct GatherDims { total_actions: u32, hidden_dim: u32, action_dim: u32, _p3: u32 };
+struct AllUniforms {
+    total_nodes: u32,
+    total_actions: u32,
+    batch: u32,
+    hidden_dim: u32,
+    node_feat_dim: u32,
+    action_dim: u32,
+    _pad0: u32,
+    _pad1: u32,
+};
 
-@group(0) @binding(0) var<uniform>          dims:        GatherDims;
+@group(0) @binding(0) var<uniform>          dims:        AllUniforms;
 @group(0) @binding(1) var<storage, read>    hN:          array<f32>;
 @group(0) @binding(2) var<storage, read>    act_node_u:  array<u32>;
 @group(0) @binding(3) var<storage, read>    act_feat:    array<f32>;
@@ -154,12 +234,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-/// WGSL Value Head Mean Pool Shader:
-/// Gom hN theo node_offsets -> val_in (HIDDEN_DIM dims per env). Kích thước hidden truyền qua uniform.
+/// WGSL Value Head Mean Pool Shader
 const MEAN_POOL_VAL_SHADER: &str = r#"
-struct PoolDims { batch: u32, hidden_dim: u32, _p2: u32, _p3: u32 };
+struct AllUniforms {
+    total_nodes: u32,
+    total_actions: u32,
+    batch: u32,
+    hidden_dim: u32,
+    node_feat_dim: u32,
+    action_dim: u32,
+    _pad0: u32,
+    _pad1: u32,
+};
 
-@group(0) @binding(0) var<uniform>          dims:         PoolDims;
+@group(0) @binding(0) var<uniform>          dims:         AllUniforms;
 @group(0) @binding(1) var<storage, read>    hN:           array<f32>;
 @group(0) @binding(2) var<storage, read>    node_offsets: array<u32>;
 @group(0) @binding(3) var<storage, read_write> val_in:    array<f32>;
@@ -184,33 +272,151 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-#[repr(C)]
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct GemmDims { m: u32, k: u32, n: u32, relu: u32 }
+/// WGSL Head MLPs GEMM Shader
+const HEADS_SHADER: &str = r#"
+struct AllUniforms {
+    total_nodes: u32,
+    total_actions: u32,
+    batch: u32,
+    hidden_dim: u32,
+    node_feat_dim: u32,
+    action_dim: u32,
+    _pad0: u32,
+    _pad1: u32,
+};
+
+@group(0) @binding(0) var<uniform>            dims: AllUniforms;
+@group(0) @binding(1) var<storage, read>      x:    array<f32>;
+@group(0) @binding(2) var<storage, read>      w:    array<f32>;
+@group(0) @binding(3) var<storage, read>      b:    array<f32>;
+@group(0) @binding(4) var<storage, read_write> y:   array<f32>;
+
+var<workgroup> tile_x: array<array<f32, 16>, 16>;
+var<workgroup> tile_w: array<array<f32, 16>, 16>;
+
+@compute @workgroup_size(16, 16)
+fn main_act1(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = gid.x;
+    let col = gid.y;
+    let lr = lid.x;
+    let lc = lid.y;
+    let m = dims.total_actions;
+    let k = dims.hidden_dim + dims.action_dim;
+    let n = dims.hidden_dim;
+
+    var acc: f32 = 0.0;
+    let num_tiles = (k + 15u) / 16u;
+    for (var t: u32 = 0u; t < num_tiles; t = t + 1u) {
+        let x_col = t * 16u + lc;
+        if (row < m && x_col < k) { tile_x[lr][lc] = x[row * k + x_col]; } else { tile_x[lr][lc] = 0.0; }
+        let w_k = t * 16u + lr;
+        if (col < n && w_k < k) { tile_w[lr][lc] = w[col * k + w_k]; } else { tile_w[lr][lc] = 0.0; }
+        workgroupBarrier();
+        for (var i: u32 = 0u; i < 16u; i = i + 1u) { acc = acc + tile_x[lr][i] * tile_w[i][lc]; }
+        workgroupBarrier();
+    }
+    if (row < m && col < n) {
+        y[row * n + col] = max(acc + b[col], 0.0);
+    }
+}
+
+@compute @workgroup_size(16, 16)
+fn main_act2(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = gid.x;
+    let col = gid.y;
+    let lr = lid.x;
+    let lc = lid.y;
+    let m = dims.total_actions;
+    let k = dims.hidden_dim;
+    let n = 1u;
+
+    var acc: f32 = 0.0;
+    let num_tiles = (k + 15u) / 16u;
+    for (var t: u32 = 0u; t < num_tiles; t = t + 1u) {
+        let x_col = t * 16u + lc;
+        if (row < m && x_col < k) { tile_x[lr][lc] = x[row * k + x_col]; } else { tile_x[lr][lc] = 0.0; }
+        let w_k = t * 16u + lr;
+        if (col < n && w_k < k) { tile_w[lr][lc] = w[col * k + w_k]; } else { tile_w[lr][lc] = 0.0; }
+        workgroupBarrier();
+        for (var i: u32 = 0u; i < 16u; i = i + 1u) { acc = acc + tile_x[lr][i] * tile_w[i][lc]; }
+        workgroupBarrier();
+    }
+    if (row < m && col < n) {
+        y[row * n + col] = acc + b[col];
+    }
+}
+
+@compute @workgroup_size(16, 16)
+fn main_val1(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = gid.x;
+    let col = gid.y;
+    let lr = lid.x;
+    let lc = lid.y;
+    let m = dims.batch;
+    let k = dims.hidden_dim;
+    let n = dims.hidden_dim;
+
+    var acc: f32 = 0.0;
+    let num_tiles = (k + 15u) / 16u;
+    for (var t: u32 = 0u; t < num_tiles; t = t + 1u) {
+        let x_col = t * 16u + lc;
+        if (row < m && x_col < k) { tile_x[lr][lc] = x[row * k + x_col]; } else { tile_x[lr][lc] = 0.0; }
+        let w_k = t * 16u + lr;
+        if (col < n && w_k < k) { tile_w[lr][lc] = w[col * k + w_k]; } else { tile_w[lr][lc] = 0.0; }
+        workgroupBarrier();
+        for (var i: u32 = 0u; i < 16u; i = i + 1u) { acc = acc + tile_x[lr][i] * tile_w[i][lc]; }
+        workgroupBarrier();
+    }
+    if (row < m && col < n) {
+        y[row * n + col] = max(acc + b[col], 0.0);
+    }
+}
+
+@compute @workgroup_size(16, 16)
+fn main_val2(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = gid.x;
+    let col = gid.y;
+    let lr = lid.x;
+    let lc = lid.y;
+    let m = dims.batch;
+    let k = dims.hidden_dim;
+    let n = 1u;
+
+    var acc: f32 = 0.0;
+    let num_tiles = (k + 15u) / 16u;
+    for (var t: u32 = 0u; t < num_tiles; t = t + 1u) {
+        let x_col = t * 16u + lc;
+        if (row < m && x_col < k) { tile_x[lr][lc] = x[row * k + x_col]; } else { tile_x[lr][lc] = 0.0; }
+        let w_k = t * 16u + lr;
+        if (col < n && w_k < k) { tile_w[lr][lc] = w[col * k + w_k]; } else { tile_w[lr][lc] = 0.0; }
+        workgroupBarrier();
+        for (var i: u32 = 0u; i < 16u; i = i + 1u) { acc = acc + tile_x[lr][i] * tile_w[i][lc]; }
+        workgroupBarrier();
+    }
+    if (row < m && col < n) {
+        y[row * n + col] = acc + b[col];
+    }
+}
+"#;
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct AggCsrDims { n_nodes: u32, dim: u32, _p1: u32, _p2: u32 }
-
-#[repr(C)]
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct CombineDims { n_nodes: u32, dim: u32, residual: u32, _p1: u32 }
-
-#[repr(C)]
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct GatherDims { total_actions: u32, hidden_dim: u32, action_dim: u32, _p3: u32 }
-
-#[repr(C)]
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct PoolDims { batch: u32, hidden_dim: u32, _p2: u32, _p3: u32 }
+pub struct AllUniforms {
+    pub total_nodes: u32,
+    pub total_actions: u32,
+    pub batch: u32,
+    pub hidden_dim: u32,
+    pub node_feat_dim: u32,
+    pub action_dim: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+}
 
 const MAX_NODES: usize = 131_072;
 const MAX_EDGES: usize = 1_048_576;
 const MAX_ACTIONS: usize = 131_072;
 const MAX_BATCH: usize = 2_048;
-const ACT_IN_DIM: usize = HIDDEN_DIM + ACTION_FEAT_DIM; // 144
 
-/// Kế hoạch thực thi GPU chưa hoàn tất chờ Readback (Async Non-blocking Handle)
 pub struct PendingGpuResult {
     staging_act: Arc<wgpu::Buffer>,
     staging_val: Arc<wgpu::Buffer>,
@@ -249,7 +455,6 @@ impl PendingGpuResult {
     }
 }
 
-/// Tập hợp toàn bộ Persistent VRAM Buffers & Pre-baked BindGroups cho 1 Slot (Group A hoặc Group B)
 struct GpuSlot {
     h0: wgpu::Buffer,
     csr_offsets: wgpu::Buffer,
@@ -263,52 +468,19 @@ struct GpuSlot {
     staging_act: Arc<wgpu::Buffer>,
     staging_val: Arc<wgpu::Buffer>,
 
-    u_agg1: wgpu::Buffer,
-    u_gemm_s1: wgpu::Buffer,
-    u_gemm_n1: wgpu::Buffer,
-    u_comb1: wgpu::Buffer,
-
-    u_agg2: wgpu::Buffer,
-    u_gemm_s2: wgpu::Buffer,
-    u_gemm_n2: wgpu::Buffer,
-    u_comb2: wgpu::Buffer,
-
-    u_agg3: wgpu::Buffer,
-    u_gemm_s3: wgpu::Buffer,
-    u_gemm_n3: wgpu::Buffer,
-    u_comb3: wgpu::Buffer,
-
-    u_agg4: wgpu::Buffer,
-    u_gemm_s4: wgpu::Buffer,
-    u_gemm_n4: wgpu::Buffer,
-    u_comb4: wgpu::Buffer,
-
-    u_gather: wgpu::Buffer,
-    u_pool: wgpu::Buffer,
-    u_act1: wgpu::Buffer,
-    u_val1: wgpu::Buffer,
-    u_act2: wgpu::Buffer,
-    u_val2: wgpu::Buffer,
+    uniforms: wgpu::Buffer,
 
     bg_agg1: wgpu::BindGroup,
-    bg_gemm_s1: wgpu::BindGroup,
-    bg_gemm_n1: wgpu::BindGroup,
-    bg_comb1: wgpu::BindGroup,
+    bg_fused1: wgpu::BindGroup,
 
     bg_agg2: wgpu::BindGroup,
-    bg_gemm_s2: wgpu::BindGroup,
-    bg_gemm_n2: wgpu::BindGroup,
-    bg_comb2: wgpu::BindGroup,
+    bg_fused2: wgpu::BindGroup,
 
     bg_agg3: wgpu::BindGroup,
-    bg_gemm_s3: wgpu::BindGroup,
-    bg_gemm_n3: wgpu::BindGroup,
-    bg_comb3: wgpu::BindGroup,
+    bg_fused3: wgpu::BindGroup,
 
     bg_agg4: wgpu::BindGroup,
-    bg_gemm_s4: wgpu::BindGroup,
-    bg_gemm_n4: wgpu::BindGroup,
-    bg_comb4: wgpu::BindGroup,
+    bg_fused4: wgpu::BindGroup,
 
     bg_gather: wgpu::BindGroup,
     bg_pool: wgpu::BindGroup,
@@ -318,19 +490,22 @@ struct GpuSlot {
     bg_val2: wgpu::BindGroup,
 }
 
-/// Zero-Allocation Pre-allocated GPU Neural Network Engine (True Double-Buffering Multi-Stream)
 pub struct GpuNNExecutor {
     pub device: Arc<wgpu::Device>,
     pub queue:  Arc<wgpu::Queue>,
-    gemm_pipeline:     wgpu::ComputePipeline,
-    agg_pipeline:      wgpu::ComputePipeline,
-    combine_pipeline:  wgpu::ComputePipeline,
+    agg_l1_pipeline:   wgpu::ComputePipeline,
+    agg_ln_pipeline:   wgpu::ComputePipeline,
+    fused_l1_pipeline: wgpu::ComputePipeline,
+    fused_ln_pipeline: wgpu::ComputePipeline,
     gather_pipeline:   wgpu::ComputePipeline,
     pool_pipeline:     wgpu::ComputePipeline,
+    act1_pipeline:     wgpu::ComputePipeline,
+    act2_pipeline:     wgpu::ComputePipeline,
+    val1_pipeline:     wgpu::ComputePipeline,
+    val2_pipeline:     wgpu::ComputePipeline,
 
     slots: [GpuSlot; 2],
 
-    // Persistent Weights (VRAM)
     w_self1: wgpu::Buffer, b_self1: wgpu::Buffer,
     w_neigh1: wgpu::Buffer, b_neigh1: wgpu::Buffer,
     w_self2: wgpu::Buffer, b_self2: wgpu::Buffer,
@@ -411,25 +586,6 @@ impl GpuNNExecutor {
     }
 
     pub fn new(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>, model: &HexGNNModel) -> Self {
-        let gemm_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("GEMM"), source: wgpu::ShaderSource::Wgsl(GEMM_SHADER.into()),
-        });
-        let gemm_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("GEMM BGL"),
-            entries: &[
-                Self::bgl_uniform(0), Self::bgl_storage_ro(1),
-                Self::bgl_storage_ro(2), Self::bgl_storage_ro(3),
-                Self::bgl_storage_rw(4),
-            ],
-        });
-        let gemm_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None, bind_group_layouts: &[&gemm_layout], push_constant_ranges: &[],
-        });
-        let gemm_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("GEMM Pipeline"), layout: Some(&gemm_pl),
-            module: &gemm_shader, entry_point: Some("main"), compilation_options: Default::default(), cache: None,
-        });
-
         let agg_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Agg CSR"), source: wgpu::ShaderSource::Wgsl(AGG_CSR_SHADER.into()),
         });
@@ -444,28 +600,38 @@ impl GpuNNExecutor {
         let agg_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None, bind_group_layouts: &[&agg_layout], push_constant_ranges: &[],
         });
-        let agg_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Agg CSR Pipeline"), layout: Some(&agg_pl),
-            module: &agg_shader, entry_point: Some("main"), compilation_options: Default::default(), cache: None,
+        let agg_l1_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Agg L1 Pipeline"), layout: Some(&agg_pl),
+            module: &agg_shader, entry_point: Some("main_l1"), compilation_options: Default::default(), cache: None,
+        });
+        let agg_ln_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Agg LN Pipeline"), layout: Some(&agg_pl),
+            module: &agg_shader, entry_point: Some("main_ln"), compilation_options: Default::default(), cache: None,
         });
 
-        let combine_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Combine"), source: wgpu::ShaderSource::Wgsl(COMBINE_SHADER.into()),
+        let fused_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Fused GNN Layer"), source: wgpu::ShaderSource::Wgsl(FUSED_GNN_LAYER_SHADER.into()),
         });
-        let combine_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Combine BGL"),
+        let fused_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Fused GNN Layer BGL"),
             entries: &[
-                Self::bgl_uniform(0), Self::bgl_storage_ro(1),
-                Self::bgl_storage_ro(2), Self::bgl_storage_ro(3),
-                Self::bgl_storage_rw(4),
+                Self::bgl_uniform(0),
+                Self::bgl_storage_ro(1), Self::bgl_storage_ro(2),
+                Self::bgl_storage_ro(3), Self::bgl_storage_ro(4),
+                Self::bgl_storage_ro(5), Self::bgl_storage_ro(6),
+                Self::bgl_storage_ro(7), Self::bgl_storage_rw(8),
             ],
         });
-        let combine_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None, bind_group_layouts: &[&combine_layout], push_constant_ranges: &[],
+        let fused_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None, bind_group_layouts: &[&fused_layout], push_constant_ranges: &[],
         });
-        let combine_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Combine Pipeline"), layout: Some(&combine_pl),
-            module: &combine_shader, entry_point: Some("main"), compilation_options: Default::default(), cache: None,
+        let fused_l1_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Fused L1 Pipeline"), layout: Some(&fused_pl),
+            module: &fused_shader, entry_point: Some("main_l1"), compilation_options: Default::default(), cache: None,
+        });
+        let fused_ln_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Fused LN Pipeline"), layout: Some(&fused_pl),
+            module: &fused_shader, entry_point: Some("main_ln"), compilation_options: Default::default(), cache: None,
         });
 
         let gather_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -505,6 +671,37 @@ impl GpuNNExecutor {
             module: &pool_shader, entry_point: Some("main"), compilation_options: Default::default(), cache: None,
         });
 
+        let heads_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Heads Shader"), source: wgpu::ShaderSource::Wgsl(HEADS_SHADER.into()),
+        });
+        let heads_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Heads BGL"),
+            entries: &[
+                Self::bgl_uniform(0), Self::bgl_storage_ro(1),
+                Self::bgl_storage_ro(2), Self::bgl_storage_ro(3),
+                Self::bgl_storage_rw(4),
+            ],
+        });
+        let heads_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None, bind_group_layouts: &[&heads_layout], push_constant_ranges: &[],
+        });
+        let act1_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Act1 Pipeline"), layout: Some(&heads_pl),
+            module: &heads_shader, entry_point: Some("main_act1"), compilation_options: Default::default(), cache: None,
+        });
+        let act2_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Act2 Pipeline"), layout: Some(&heads_pl),
+            module: &heads_shader, entry_point: Some("main_act2"), compilation_options: Default::default(), cache: None,
+        });
+        let val1_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Val1 Pipeline"), layout: Some(&heads_pl),
+            module: &heads_shader, entry_point: Some("main_val1"), compilation_options: Default::default(), cache: None,
+        });
+        let val2_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Val2 Pipeline"), layout: Some(&heads_pl),
+            module: &heads_shader, entry_point: Some("main_val2"), compilation_options: Default::default(), cache: None,
+        });
+
         macro_rules! wb { ($slice:expr) => { Self::make_weight_buf(&device, $slice) } }
         let w_self1  = wb!(&model.layers[0].w_self.weight);  let b_self1  = wb!(&model.layers[0].w_self.bias);
         let w_neigh1 = wb!(&model.layers[0].w_neigh.weight); let b_neigh1 = wb!(&model.layers[0].w_neigh.bias);
@@ -520,7 +717,6 @@ impl GpuNNExecutor {
         let w_val2   = wb!(&model.w_val2.weight);   let b_val2   = wb!(&model.w_val2.bias);
 
         let make_slot = || {
-            // h0: node features (NODE_FEAT_DIM). h1..h4: HIDDEN_DIM.
             let h0 = Self::create_storage(&device, MAX_NODES * NODE_FEAT_DIM * 4);
             let h1 = Self::create_storage(&device, MAX_NODES * HIDDEN_DIM * 4);
             let h2 = Self::create_storage(&device, MAX_NODES * HIDDEN_DIM * 4);
@@ -532,16 +728,13 @@ impl GpuNNExecutor {
             let agg2 = Self::create_storage(&device, MAX_NODES * HIDDEN_DIM * 4);
             let agg3 = Self::create_storage(&device, MAX_NODES * HIDDEN_DIM * 4);
 
-            let ys = Self::create_storage(&device, MAX_NODES * HIDDEN_DIM * 4);
-            let yn = Self::create_storage(&device, MAX_NODES * HIDDEN_DIM * 4);
-
             let csr_offsets = Self::create_storage(&device, (MAX_NODES + 1) * 4);
             let csr_targets = Self::create_storage(&device, MAX_EDGES * 4);
             let act_node_u  = Self::create_storage(&device, MAX_ACTIONS * 4);
             let act_feat    = Self::create_storage(&device, MAX_ACTIONS * ACTION_FEAT_DIM * 4);
             let node_offsets = Self::create_storage(&device, (MAX_BATCH + 1) * 4);
 
-            let act_in = Self::create_storage(&device, MAX_ACTIONS * ACT_IN_DIM * 4);
+            let act_in = Self::create_storage(&device, MAX_ACTIONS * (HIDDEN_DIM + ACTION_FEAT_DIM) * 4);
             let val_in = Self::create_storage(&device, MAX_BATCH * HIDDEN_DIM * 4);
             let act_h  = Self::create_storage(&device, MAX_ACTIONS * HIDDEN_DIM * 4);
             let val_h  = Self::create_storage(&device, MAX_BATCH * HIDDEN_DIM * 4);
@@ -551,32 +744,7 @@ impl GpuNNExecutor {
             let staging_act = Self::create_staging(&device, MAX_ACTIONS * 4);
             let staging_val = Self::create_staging(&device, MAX_BATCH * 4);
 
-            let u_agg1 = Self::create_uniform(&device, 16);
-            let u_gemm_s1 = Self::create_uniform(&device, 16);
-            let u_gemm_n1 = Self::create_uniform(&device, 16);
-            let u_comb1 = Self::create_uniform(&device, 16);
-
-            let u_agg2 = Self::create_uniform(&device, 16);
-            let u_gemm_s2 = Self::create_uniform(&device, 16);
-            let u_gemm_n2 = Self::create_uniform(&device, 16);
-            let u_comb2 = Self::create_uniform(&device, 16);
-
-            let u_agg3 = Self::create_uniform(&device, 16);
-            let u_gemm_s3 = Self::create_uniform(&device, 16);
-            let u_gemm_n3 = Self::create_uniform(&device, 16);
-            let u_comb3 = Self::create_uniform(&device, 16);
-
-            let u_agg4 = Self::create_uniform(&device, 16);
-            let u_gemm_s4 = Self::create_uniform(&device, 16);
-            let u_gemm_n4 = Self::create_uniform(&device, 16);
-            let u_comb4 = Self::create_uniform(&device, 16);
-
-            let u_gather = Self::create_uniform(&device, 16);
-            let u_pool = Self::create_uniform(&device, 16);
-            let u_act1 = Self::create_uniform(&device, 16);
-            let u_val1 = Self::create_uniform(&device, 16);
-            let u_act2 = Self::create_uniform(&device, 16);
-            let u_val2 = Self::create_uniform(&device, 16);
+            let uniforms = Self::create_uniform(&device, std::mem::size_of::<AllUniforms>());
 
             macro_rules! bg_5 {
                 ($layout:expr, $b0:expr, $b1:expr, $b2:expr, $b3:expr, $b4:expr) => {
@@ -588,6 +756,25 @@ impl GpuNNExecutor {
                             wgpu::BindGroupEntry { binding: 2, resource: $b2.as_entire_binding() },
                             wgpu::BindGroupEntry { binding: 3, resource: $b3.as_entire_binding() },
                             wgpu::BindGroupEntry { binding: 4, resource: $b4.as_entire_binding() },
+                        ],
+                    })
+                }
+            }
+
+            macro_rules! bg_9 {
+                ($layout:expr, $b0:expr, $b1:expr, $b2:expr, $b3:expr, $b4:expr, $b5:expr, $b6:expr, $b7:expr, $b8:expr) => {
+                    device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None, layout: $layout,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: $b0.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 1, resource: $b1.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 2, resource: $b2.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 3, resource: $b3.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 4, resource: $b4.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 5, resource: $b5.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 6, resource: $b6.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 7, resource: $b7.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 8, resource: $b8.as_entire_binding() },
                         ],
                     })
                 }
@@ -607,46 +794,33 @@ impl GpuNNExecutor {
                 }
             }
 
-            let bg_agg1    = bg_5!(&agg_layout, &u_agg1, &h0, &csr_offsets, &csr_targets, &agg0);
-            let bg_gemm_s1 = bg_5!(&gemm_layout, &u_gemm_s1, &h0, &w_self1, &b_self1, &ys);
-            let bg_gemm_n1 = bg_5!(&gemm_layout, &u_gemm_n1, &agg0, &w_neigh1, &b_neigh1, &yn);
-            let bg_comb1   = bg_5!(&combine_layout, &u_comb1, &ys, &yn, &h0, &h1);
+            let bg_agg1   = bg_5!(&agg_layout, &uniforms, &h0, &csr_offsets, &csr_targets, &agg0);
+            let bg_fused1 = bg_9!(&fused_layout, &uniforms, &h0, &agg0, &w_self1, &b_self1, &w_neigh1, &b_neigh1, &h0, &h1);
 
-            let bg_agg2    = bg_5!(&agg_layout, &u_agg2, &h1, &csr_offsets, &csr_targets, &agg1);
-            let bg_gemm_s2 = bg_5!(&gemm_layout, &u_gemm_s2, &h1, &w_self2, &b_self2, &ys);
-            let bg_gemm_n2 = bg_5!(&gemm_layout, &u_gemm_n2, &agg1, &w_neigh2, &b_neigh2, &yn);
-            let bg_comb2   = bg_5!(&combine_layout, &u_comb2, &ys, &yn, &h1, &h2);
+            let bg_agg2   = bg_5!(&agg_layout, &uniforms, &h1, &csr_offsets, &csr_targets, &agg1);
+            let bg_fused2 = bg_9!(&fused_layout, &uniforms, &h1, &agg1, &w_self2, &b_self2, &w_neigh2, &b_neigh2, &h1, &h2);
 
-            let bg_agg3    = bg_5!(&agg_layout, &u_agg3, &h2, &csr_offsets, &csr_targets, &agg2);
-            let bg_gemm_s3 = bg_5!(&gemm_layout, &u_gemm_s3, &h2, &w_self3, &b_self3, &ys);
-            let bg_gemm_n3 = bg_5!(&gemm_layout, &u_gemm_n3, &agg2, &w_neigh3, &b_neigh3, &yn);
-            let bg_comb3   = bg_5!(&combine_layout, &u_comb3, &ys, &yn, &h2, &h3);
+            let bg_agg3   = bg_5!(&agg_layout, &uniforms, &h2, &csr_offsets, &csr_targets, &agg2);
+            let bg_fused3 = bg_9!(&fused_layout, &uniforms, &h2, &agg2, &w_self3, &b_self3, &w_neigh3, &b_neigh3, &h2, &h3);
 
-            let bg_agg4    = bg_5!(&agg_layout, &u_agg4, &h3, &csr_offsets, &csr_targets, &agg3);
-            let bg_gemm_s4 = bg_5!(&gemm_layout, &u_gemm_s4, &h3, &w_self4, &b_self4, &ys);
-            let bg_gemm_n4 = bg_5!(&gemm_layout, &u_gemm_n4, &agg3, &w_neigh4, &b_neigh4, &yn);
-            let bg_comb4   = bg_5!(&combine_layout, &u_comb4, &ys, &yn, &h3, &h4);
+            let bg_agg4   = bg_5!(&agg_layout, &uniforms, &h3, &csr_offsets, &csr_targets, &agg3);
+            let bg_fused4 = bg_9!(&fused_layout, &uniforms, &h3, &agg3, &w_self4, &b_self4, &w_neigh4, &b_neigh4, &h3, &h4);
 
-            let bg_gather  = bg_5!(&gather_layout, &u_gather, &h4, &act_node_u, &act_feat, &act_in);
-            let bg_pool    = bg_4!(&pool_layout, &u_pool, &h4, &node_offsets, &val_in);
+            let bg_gather = bg_5!(&gather_layout, &uniforms, &h4, &act_node_u, &act_feat, &act_in);
+            let bg_pool   = bg_4!(&pool_layout, &uniforms, &h4, &node_offsets, &val_in);
 
-            let bg_act1    = bg_5!(&gemm_layout, &u_act1, &act_in, &w_act1, &b_act1, &act_h);
-            let bg_val1    = bg_5!(&gemm_layout, &u_val1, &val_in, &w_val1, &b_val1, &val_h);
-            let bg_act2    = bg_5!(&gemm_layout, &u_act2, &act_h,  &w_act2, &b_act2, &act_o);
-            let bg_val2    = bg_5!(&gemm_layout, &u_val2, &val_h,  &w_val2, &b_val2, &val_o);
+            let bg_act1   = bg_5!(&heads_layout, &uniforms, &act_in, &w_act1, &b_act1, &act_h);
+            let bg_val1   = bg_5!(&heads_layout, &uniforms, &val_in, &w_val1, &b_val1, &val_h);
+            let bg_act2   = bg_5!(&heads_layout, &uniforms, &act_h,  &w_act2, &b_act2, &act_o);
+            let bg_val2   = bg_5!(&heads_layout, &uniforms, &val_h,  &w_val2, &b_val2, &val_o);
 
             GpuSlot {
                 h0, csr_offsets, csr_targets, act_node_u, act_feat, node_offsets,
-                act_o, val_o, staging_act, staging_val,
-                u_agg1, u_gemm_s1, u_gemm_n1, u_comb1,
-                u_agg2, u_gemm_s2, u_gemm_n2, u_comb2,
-                u_agg3, u_gemm_s3, u_gemm_n3, u_comb3,
-                u_agg4, u_gemm_s4, u_gemm_n4, u_comb4,
-                u_gather, u_pool, u_act1, u_val1, u_act2, u_val2,
-                bg_agg1, bg_gemm_s1, bg_gemm_n1, bg_comb1,
-                bg_agg2, bg_gemm_s2, bg_gemm_n2, bg_comb2,
-                bg_agg3, bg_gemm_s3, bg_gemm_n3, bg_comb3,
-                bg_agg4, bg_gemm_s4, bg_gemm_n4, bg_comb4,
+                act_o, val_o, staging_act, staging_val, uniforms,
+                bg_agg1, bg_fused1,
+                bg_agg2, bg_fused2,
+                bg_agg3, bg_fused3,
+                bg_agg4, bg_fused4,
                 bg_gather, bg_pool, bg_act1, bg_val1, bg_act2, bg_val2,
             }
         };
@@ -655,11 +829,11 @@ impl GpuNNExecutor {
 
         Self {
             device, queue,
-            gemm_pipeline,
-            agg_pipeline,
-            combine_pipeline,
-            gather_pipeline,
-            pool_pipeline,
+            agg_l1_pipeline, agg_ln_pipeline,
+            fused_l1_pipeline, fused_ln_pipeline,
+            gather_pipeline, pool_pipeline,
+            act1_pipeline, act2_pipeline,
+            val1_pipeline, val2_pipeline,
             slots,
             w_self1, b_self1, w_neigh1, b_neigh1,
             w_self2, b_self2, w_neigh2, b_neigh2,
@@ -695,7 +869,6 @@ impl GpuNNExecutor {
         self.update_weights_from_model(model);
     }
 
-    /// Submit async GPU command encoder vào Slot chỉ định với ZERO ALLOCATIONS (Pre-baked Pipelines)
     pub fn forward_batch_gpu_async_slot(&self, slot_idx: usize, observations: &[&GraphObservation]) -> Option<PendingGpuResult> {
         let batch = observations.len();
         if batch == 0 { return None; }
@@ -722,9 +895,6 @@ impl GpuNNExecutor {
             return None;
         }
 
-        // Build mảng GPU song song bằng Rayon (Tối ưu 3C): phần tính nặng (dựng feature,
-        // degree, tìm node index của action, ...) chạy song song trên từng obs độc lập,
-        // rồi ghép (splice) vào mảng bằng offset đã biết trước.
         let mut h0: Vec<f32> = Vec::with_capacity(total_nodes * NODE_FEAT_DIM);
         let mut csr_offsets: Vec<u32> = Vec::with_capacity(total_nodes + 1);
         let mut csr_targets: Vec<u32> = Vec::with_capacity(total_nodes * 6);
@@ -737,36 +907,23 @@ impl GpuNNExecutor {
             .enumerate()
             .map(|(i, obs)| {
                 let n = obs.node_features.len();
-
-                // h0: node features flattened
                 let h0_seg: Vec<f32> = obs.node_features.iter().flatten().copied().collect();
 
-                // degrees theo local node index
                 let mut degrees = vec![0u32; n];
                 for &(u, v) in &obs.edge_index {
-                    if u < n && v < n {
-                        degrees[u] += 1;
-                    }
+                    if u < n && v < n { degrees[u] += 1; }
                 }
 
-                // csr row-pointers cục bộ (bắt đầu từ 0)
                 let mut csr_off_seg = Vec::with_capacity(n + 1);
                 let mut acc = 0u32;
                 csr_off_seg.push(0u32);
-                for d in &degrees {
-                    acc += d;
-                    csr_off_seg.push(acc);
-                }
+                for d in &degrees { acc += d; csr_off_seg.push(acc); }
 
-                // csr targets cục bộ (global node base được cộng sau khi splice)
-                let mut csr_targets_seg: Vec<u32> = Vec::new();
+                let mut csr_targets_seg = Vec::new();
                 for &(u, v) in &obs.edge_index {
-                    if u < n && v < n {
-                        csr_targets_seg.push(v as u32);
-                    }
+                    if u < n && v < n { csr_targets_seg.push(v as u32); }
                 }
 
-                // action node index (local) + action features
                 let mut act_u_seg = Vec::with_capacity(obs.valid_actions.len());
                 let mut act_feat_seg = Vec::with_capacity(obs.valid_actions.len() * ACTION_FEAT_DIM);
                 for (a_idx, act) in obs.valid_actions.iter().enumerate() {
@@ -779,32 +936,20 @@ impl GpuNNExecutor {
                         act_feat_seg.extend_from_slice(&[0.0f32; ACTION_FEAT_DIM]);
                     }
                 }
-
                 (i, h0_seg, csr_off_seg, csr_targets_seg, act_u_seg, act_feat_seg)
             })
             .collect();
 
-        // Ghép theo thứ tự (index i) vào các mảng phẳng
         for (i, h0_seg, csr_off_seg, csr_targets_seg, act_u_seg, act_feat_seg) in per_obs {
             h0.extend_from_slice(&h0_seg);
-
             let base = *csr_offsets.last().unwrap();
-            for &o in &csr_off_seg[1..] {
-                csr_offsets.push(base + o);
-            }
-
+            for &o in &csr_off_seg[1..] { csr_offsets.push(base + o); }
             let off = node_offsets[i];
-            for t in csr_targets_seg {
-                csr_targets.push(t + off);
-            }
-
-            for u in act_u_seg {
-                act_node_u.push(u + off);
-            }
+            for t in csr_targets_seg { csr_targets.push(t + off); }
+            for u in act_u_seg { act_node_u.push(u + off); }
             act_feat.extend_from_slice(&act_feat_seg);
         }
 
-        // 1. Zero-Allocation Fast Memcpy to Persistent GPU Buffers
         self.queue.write_buffer(&slot.h0, 0, bytemuck::cast_slice(&h0));
         self.queue.write_buffer(&slot.csr_offsets, 0, bytemuck::cast_slice(&csr_offsets));
         self.queue.write_buffer(&slot.csr_targets, 0, bytemuck::cast_slice(&csr_targets));
@@ -812,112 +957,60 @@ impl GpuNNExecutor {
         self.queue.write_buffer(&slot.act_feat, 0, bytemuck::cast_slice(&act_feat));
         self.queue.write_buffer(&slot.node_offsets, 0, bytemuck::cast_slice(&node_offsets));
 
-        // 2. Uniform Dimensions
         let tn = total_nodes as u32;
         let ta = total_actions as u32;
         let b = batch as u32;
         let hd = HIDDEN_DIM as u32;
+        let nfd = NODE_FEAT_DIM as u32;
+        let afd = ACTION_FEAT_DIM as u32;
 
-        self.queue.write_buffer(&slot.u_agg1, 0, bytemuck::bytes_of(&AggCsrDims { n_nodes: tn, dim: NODE_FEAT_DIM as u32, _p1: 0, _p2: 0 }));
-        self.queue.write_buffer(&slot.u_gemm_s1, 0, bytemuck::bytes_of(&GemmDims { m: tn, k: NODE_FEAT_DIM as u32, n: hd, relu: 0 }));
-        self.queue.write_buffer(&slot.u_gemm_n1, 0, bytemuck::bytes_of(&GemmDims { m: tn, k: NODE_FEAT_DIM as u32, n: hd, relu: 0 }));
-        self.queue.write_buffer(&slot.u_comb1, 0, bytemuck::bytes_of(&CombineDims { n_nodes: tn, dim: hd, residual: 0, _p1: 0 }));
+        let all_uniforms = AllUniforms {
+            total_nodes: tn, total_actions: ta, batch: b, hidden_dim: hd,
+            node_feat_dim: nfd, action_dim: afd, _pad0: 0, _pad1: 0,
+        };
+        self.queue.write_buffer(&slot.uniforms, 0, bytemuck::bytes_of(&all_uniforms));
 
-        self.queue.write_buffer(&slot.u_agg2, 0, bytemuck::bytes_of(&AggCsrDims { n_nodes: tn, dim: hd, _p1: 0, _p2: 0 }));
-        self.queue.write_buffer(&slot.u_gemm_s2, 0, bytemuck::bytes_of(&GemmDims { m: tn, k: hd, n: hd, relu: 0 }));
-        self.queue.write_buffer(&slot.u_gemm_n2, 0, bytemuck::bytes_of(&GemmDims { m: tn, k: hd, n: hd, relu: 0 }));
-        self.queue.write_buffer(&slot.u_comb2, 0, bytemuck::bytes_of(&CombineDims { n_nodes: tn, dim: hd, residual: 1, _p1: 0 }));
+        let wg_d = (hd + 15) / 16;
+        let wg_n = (tn + 15) / 16;
+        let wg_a = (ta + 15) / 16;
+        let wg_b = (b + 15) / 16;
 
-        self.queue.write_buffer(&slot.u_agg3, 0, bytemuck::bytes_of(&AggCsrDims { n_nodes: tn, dim: hd, _p1: 0, _p2: 0 }));
-        self.queue.write_buffer(&slot.u_gemm_s3, 0, bytemuck::bytes_of(&GemmDims { m: tn, k: hd, n: hd, relu: 0 }));
-        self.queue.write_buffer(&slot.u_gemm_n3, 0, bytemuck::bytes_of(&GemmDims { m: tn, k: hd, n: hd, relu: 0 }));
-        self.queue.write_buffer(&slot.u_comb3, 0, bytemuck::bytes_of(&CombineDims { n_nodes: tn, dim: hd, residual: 1, _p1: 0 }));
-
-        self.queue.write_buffer(&slot.u_agg4, 0, bytemuck::bytes_of(&AggCsrDims { n_nodes: tn, dim: hd, _p1: 0, _p2: 0 }));
-        self.queue.write_buffer(&slot.u_gemm_s4, 0, bytemuck::bytes_of(&GemmDims { m: tn, k: hd, n: hd, relu: 0 }));
-        self.queue.write_buffer(&slot.u_gemm_n4, 0, bytemuck::bytes_of(&GemmDims { m: tn, k: hd, n: hd, relu: 0 }));
-        self.queue.write_buffer(&slot.u_comb4, 0, bytemuck::bytes_of(&CombineDims { n_nodes: tn, dim: hd, residual: 1, _p1: 0 }));
-
-        self.queue.write_buffer(&slot.u_gather, 0, bytemuck::bytes_of(&GatherDims { total_actions: ta, hidden_dim: hd, action_dim: ACTION_FEAT_DIM as u32, _p3: 0 }));
-        self.queue.write_buffer(&slot.u_pool, 0, bytemuck::bytes_of(&PoolDims { batch: b, hidden_dim: hd, _p2: 0, _p3: 0 }));
-
-        self.queue.write_buffer(&slot.u_act1, 0, bytemuck::bytes_of(&GemmDims { m: ta, k: ACT_IN_DIM as u32, n: hd, relu: 1 }));
-        self.queue.write_buffer(&slot.u_val1, 0, bytemuck::bytes_of(&GemmDims { m: b,  k: hd, n: hd, relu: 1 }));
-        self.queue.write_buffer(&slot.u_act2, 0, bytemuck::bytes_of(&GemmDims { m: ta, k: hd, n: 1,  relu: 0 }));
-        self.queue.write_buffer(&slot.u_val2, 0, bytemuck::bytes_of(&GemmDims { m: b,  k: hd, n: 1,  relu: 0 }));
-
-        let wg_d = || (hd + 15) / 16;
-
-        // 3. One Single Command Encoder and Compute Pass Execution
         let mut enc = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_compute_pass(&Default::default());
 
-            // Layer 1
-            pass.set_pipeline(&self.agg_pipeline);
+            pass.set_pipeline(&self.agg_l1_pipeline);
             pass.set_bind_group(0, &slot.bg_agg1, &[]);
-            pass.dispatch_workgroups((tn + 15) / 16, ((NODE_FEAT_DIM as u32) + 15) / 16, 1);
+            pass.dispatch_workgroups(wg_n, (nfd + 15) / 16, 1);
 
-            pass.set_pipeline(&self.gemm_pipeline);
-            pass.set_bind_group(0, &slot.bg_gemm_s1, &[]);
-            pass.dispatch_workgroups((tn + 15) / 16, wg_d(), 1);
+            pass.set_pipeline(&self.fused_l1_pipeline);
+            pass.set_bind_group(0, &slot.bg_fused1, &[]);
+            pass.dispatch_workgroups(wg_n, wg_d, 1);
 
-            pass.set_bind_group(0, &slot.bg_gemm_n1, &[]);
-            pass.dispatch_workgroups((tn + 15) / 16, wg_d(), 1);
-
-            pass.set_pipeline(&self.combine_pipeline);
-            pass.set_bind_group(0, &slot.bg_comb1, &[]);
-            pass.dispatch_workgroups((tn + 15) / 16, wg_d(), 1);
-
-            // Layer 2
-            pass.set_pipeline(&self.agg_pipeline);
+            pass.set_pipeline(&self.agg_ln_pipeline);
             pass.set_bind_group(0, &slot.bg_agg2, &[]);
-            pass.dispatch_workgroups((tn + 15) / 16, wg_d(), 1);
+            pass.dispatch_workgroups(wg_n, wg_d, 1);
 
-            pass.set_pipeline(&self.gemm_pipeline);
-            pass.set_bind_group(0, &slot.bg_gemm_s2, &[]);
-            pass.dispatch_workgroups((tn + 15) / 16, wg_d(), 1);
+            pass.set_pipeline(&self.fused_ln_pipeline);
+            pass.set_bind_group(0, &slot.bg_fused2, &[]);
+            pass.dispatch_workgroups(wg_n, wg_d, 1);
 
-            pass.set_bind_group(0, &slot.bg_gemm_n2, &[]);
-            pass.dispatch_workgroups((tn + 15) / 16, wg_d(), 1);
-
-            pass.set_pipeline(&self.combine_pipeline);
-            pass.set_bind_group(0, &slot.bg_comb2, &[]);
-            pass.dispatch_workgroups((tn + 15) / 16, wg_d(), 1);
-
-            // Layer 3
-            pass.set_pipeline(&self.agg_pipeline);
+            pass.set_pipeline(&self.agg_ln_pipeline);
             pass.set_bind_group(0, &slot.bg_agg3, &[]);
-            pass.dispatch_workgroups((tn + 15) / 16, wg_d(), 1);
+            pass.dispatch_workgroups(wg_n, wg_d, 1);
 
-            pass.set_pipeline(&self.gemm_pipeline);
-            pass.set_bind_group(0, &slot.bg_gemm_s3, &[]);
-            pass.dispatch_workgroups((tn + 15) / 16, wg_d(), 1);
+            pass.set_pipeline(&self.fused_ln_pipeline);
+            pass.set_bind_group(0, &slot.bg_fused3, &[]);
+            pass.dispatch_workgroups(wg_n, wg_d, 1);
 
-            pass.set_bind_group(0, &slot.bg_gemm_n3, &[]);
-            pass.dispatch_workgroups((tn + 15) / 16, wg_d(), 1);
-
-            pass.set_pipeline(&self.combine_pipeline);
-            pass.set_bind_group(0, &slot.bg_comb3, &[]);
-            pass.dispatch_workgroups((tn + 15) / 16, wg_d(), 1);
-
-            // Layer 4
-            pass.set_pipeline(&self.agg_pipeline);
+            pass.set_pipeline(&self.agg_ln_pipeline);
             pass.set_bind_group(0, &slot.bg_agg4, &[]);
-            pass.dispatch_workgroups((tn + 15) / 16, wg_d(), 1);
+            pass.dispatch_workgroups(wg_n, wg_d, 1);
 
-            pass.set_pipeline(&self.gemm_pipeline);
-            pass.set_bind_group(0, &slot.bg_gemm_s4, &[]);
-            pass.dispatch_workgroups((tn + 15) / 16, wg_d(), 1);
+            pass.set_pipeline(&self.fused_ln_pipeline);
+            pass.set_bind_group(0, &slot.bg_fused4, &[]);
+            pass.dispatch_workgroups(wg_n, wg_d, 1);
 
-            pass.set_bind_group(0, &slot.bg_gemm_n4, &[]);
-            pass.dispatch_workgroups((tn + 15) / 16, wg_d(), 1);
-
-            pass.set_pipeline(&self.combine_pipeline);
-            pass.set_bind_group(0, &slot.bg_comb4, &[]);
-            pass.dispatch_workgroups((tn + 15) / 16, wg_d(), 1);
-
-            // Gather & Pool
             pass.set_pipeline(&self.gather_pipeline);
             pass.set_bind_group(0, &slot.bg_gather, &[]);
             pass.dispatch_workgroups((ta + 63) / 64, 1, 1);
@@ -926,45 +1019,39 @@ impl GpuNNExecutor {
             pass.set_bind_group(0, &slot.bg_pool, &[]);
             pass.dispatch_workgroups((b + 63) / 64, 1, 1);
 
-            // Head MLPs
-            pass.set_pipeline(&self.gemm_pipeline);
+            pass.set_pipeline(&self.act1_pipeline);
             pass.set_bind_group(0, &slot.bg_act1, &[]);
-            pass.dispatch_workgroups((ta + 15) / 16, wg_d(), 1);
+            pass.dispatch_workgroups(wg_a, wg_d, 1);
 
+            pass.set_pipeline(&self.val1_pipeline);
             pass.set_bind_group(0, &slot.bg_val1, &[]);
-            pass.dispatch_workgroups((b + 15) / 16, wg_d(), 1);
+            pass.dispatch_workgroups(wg_b, wg_d, 1);
 
+            pass.set_pipeline(&self.act2_pipeline);
             pass.set_bind_group(0, &slot.bg_act2, &[]);
-            pass.dispatch_workgroups((ta + 15) / 16, 1, 1);
+            pass.dispatch_workgroups(wg_a, 1, 1);
 
+            pass.set_pipeline(&self.val2_pipeline);
             pass.set_bind_group(0, &slot.bg_val2, &[]);
-            pass.dispatch_workgroups((b + 15) / 16, 1, 1);
+            pass.dispatch_workgroups(wg_b, 1, 1);
         }
 
         enc.copy_buffer_to_buffer(&slot.act_o, 0, &slot.staging_act, 0, (total_actions * 4) as u64);
         enc.copy_buffer_to_buffer(&slot.val_o, 0, &slot.staging_val, 0, (batch * 4) as u64);
         self.queue.submit(Some(enc.finish()));
 
-        let slice_act = slot.staging_act.slice(..);
         let (tx_act, rx_act) = crossbeam_channel::bounded(1);
-        slice_act.map_async(wgpu::MapMode::Read, move |r| { let _ = tx_act.send(r); });
-
-        let slice_val = slot.staging_val.slice(..);
+        slot.staging_act.slice(..).map_async(wgpu::MapMode::Read, move |r| { let _ = tx_act.send(r); });
         let (tx_val, rx_val) = crossbeam_channel::bounded(1);
-        slice_val.map_async(wgpu::MapMode::Read, move |r| { let _ = tx_val.send(r); });
+        slot.staging_val.slice(..).map_async(wgpu::MapMode::Read, move |r| { let _ = tx_val.send(r); });
 
         Some(PendingGpuResult {
             staging_act: Arc::clone(&slot.staging_act),
             staging_val: Arc::clone(&slot.staging_val),
-            rx_act,
-            rx_val,
-            batch,
-            action_offsets,
-            action_counts,
+            rx_act, rx_val, batch, action_offsets, action_counts,
         })
     }
 
-    /// Forward Pass Synchronous (Bọc lấy async handle và chờ kết quả ngay lập tức)
     pub fn forward_batch_gpu(&self, observations: &[&GraphObservation]) -> Vec<(Vec<f32>, f32)> {
         if let Some(pending) = self.forward_batch_gpu_async_slot(0, observations) {
             pending.wait(&self.device)

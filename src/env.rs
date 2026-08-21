@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashMap as HashMap;
 use crate::board::{Board, get_neighbor_pos};
 use crate::game_config::GroupType;
 use crate::generator::TileGenerator;
@@ -207,6 +207,7 @@ impl DorfromantikEnv {
     /// Kiểm tra NHANH xem có ít nhất 1 placement hợp lệ hay không (chỉ để biết đã hết nước đi).
     /// Dừng ngay khi tìm được nước đi hợp lệ đầu tiên -> cực kỳ nhanh với board thưa.
     /// Cùng kết quả boolean với `!get_valid_actions().is_empty()`, nhưng không dựng toàn bộ Vec.
+    #[allow(dead_code)]
     fn has_valid_action(&self) -> bool {
         let Some(current_tile) = self.current_tile() else {
             return false;
