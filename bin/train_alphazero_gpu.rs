@@ -1,6 +1,4 @@
-use dorfromantik_remake::alphazero::{
-    AlphaZeroPipeline, AlphaZeroTrainerConfig, GameMatchRecord,
-};
+use dorfromantik_remake::alphazero::{AlphaZeroPipeline, AlphaZeroTrainerConfig, GameMatchRecord};
 use dorfromantik_remake::gpu_engine::GpuEngine;
 use dorfromantik_remake::gpu_nn::GpuNNExecutor;
 use dorfromantik_remake::mcts::MCTSConfig;
@@ -231,18 +229,11 @@ fn main() {
         .filter(|&e| e > 0)
         .unwrap_or(2);
 
-    // 6. Iteration tối đa (iter_max, mặc định usize::MAX)
-    let iter_max = args
-        .get(6)
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(usize::MAX);
+    // Iteration tối đa: Mặc định usize::MAX (chạy liên tục không giới hạn)
+    let iter_max = usize::MAX;
 
-    // 7. Cờ bật exploration theo entropy (mặc định 1 - BẬT)
-    let explore_by_entropy = args
-        .get(7)
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(1)
-        != 0;
+    // Cờ exploration theo entropy từng turn: Mặc định BẬT (true)
+    let explore_by_entropy = true;
 
     let lr = 0.0003;
 
