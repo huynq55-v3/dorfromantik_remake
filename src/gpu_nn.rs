@@ -798,7 +798,9 @@ impl GpuNNExecutor {
                 csr_targets.push(t + off);
             }
 
-            act_node_u.extend_from_slice(&act_u_seg);
+            for u in act_u_seg {
+                act_node_u.push(u + off);
+            }
             act_feat.extend_from_slice(&act_feat_seg);
         }
 
