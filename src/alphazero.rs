@@ -834,8 +834,8 @@ impl AlphaZeroPipeline {
         // Số lượng sample train mỗi iteration bằng đúng 1/5 dung lượng Replay Buffer (Buffer Refresh Ratio = 20%)
         let target_samples = self.replay_buffer.capacity / 5;
         let m = target_samples.min(buf_len);
-        let num_batches = (m / self.config.batch_size).max(1);
         let total_epochs = self.config.train_epochs_per_iter;
+        let num_batches = (m + self.config.batch_size - 1) / self.config.batch_size;
         let train_start = std::time::Instant::now();
         println!(
             "[Train] Bắt đầu: {} epochs × {} batches (batch_size={}) | train trên {} samples (buffer {}/{}) với PER...",
@@ -851,9 +851,7 @@ impl AlphaZeroPipeline {
             let epoch_batches = if epoch_indices.is_empty() {
                 0
             } else {
-                (epoch_indices.len() / self.config.batch_size)
-                    .min(num_batches)
-                    .max(1)
+                (epoch_indices.len() + self.config.batch_size - 1) / self.config.batch_size
             };
             use std::io::Write;
             print!("[Train Epoch {}/{}] ", epoch + 1, total_epochs);
@@ -870,6 +868,7 @@ impl AlphaZeroPipeline {
                 let val_coeff = self.config.value_loss_coeff;
                 let buffer_ref = &self.replay_buffer.buffer;
 
+                let actual_len = indices.len() as f32;
                 let (mb_grads, (mb_pi_loss, mb_val_loss)) = indices
                     .into_par_iter()
                     .map(|idx| {
@@ -935,9 +934,8 @@ impl AlphaZeroPipeline {
                         },
                     );
 
-                let mb_len = self.config.batch_size as f32;
                 let mut scaled_grads = mb_grads;
-                scaled_grads.scale_assign(1.0 / mb_len);
+                scaled_grads.scale_assign(1.0 / actual_len);
                 scaled_grads.clip_grad_norm(1.0);
 
                 // Cập nhật trọng số mạng bằng Adam Optimizer
@@ -949,8 +947,8 @@ impl AlphaZeroPipeline {
                     let _ = std::io::stdout().flush();
                 }
 
-                total_policy_loss += mb_pi_loss / mb_len;
-                total_value_loss += mb_val_loss / mb_len;
+                total_policy_loss += mb_pi_loss / actual_len;
+                total_value_loss += mb_val_loss / actual_len;
                 step_count += 1;
             }
             let elapsed = train_start.elapsed();

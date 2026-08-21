@@ -84,8 +84,8 @@ fn fast_train_step(pipeline: &mut AlphaZeroPipeline) -> (f32, f32, f32) {
     // Số lượng sample train mỗi iteration bằng đúng 1/5 dung lượng Replay Buffer (Buffer Refresh Ratio = 20%)
     let target_samples = pipeline.replay_buffer.capacity / 5;
     let m = target_samples.min(buf_len);
-    let num_batches = (m / pipeline.config.batch_size).max(1);
     let total_epochs = pipeline.config.train_epochs_per_iter;
+    let num_batches = (m + pipeline.config.batch_size - 1) / pipeline.config.batch_size;
     println!(
         "[Train GPU] Bắt đầu: {} epochs × {} batches (batch_size={}) | train trên {} samples (buffer {}/{}) với Disjoint Batched Backprop...",
         total_epochs, num_batches, pipeline.config.batch_size, m, buf_len, pipeline.replay_buffer.capacity
@@ -103,9 +103,7 @@ fn fast_train_step(pipeline: &mut AlphaZeroPipeline) -> (f32, f32, f32) {
         let epoch_batches = if epoch_indices.is_empty() {
             0
         } else {
-            (epoch_indices.len() / pipeline.config.batch_size)
-                .min(num_batches)
-                .max(1)
+            (epoch_indices.len() + pipeline.config.batch_size - 1) / pipeline.config.batch_size
         };
 
         use std::io::Write;
@@ -149,17 +147,17 @@ fn fast_train_step(pipeline: &mut AlphaZeroPipeline) -> (f32, f32, f32) {
                     },
                 );
 
-            let mb_len = pipeline.config.batch_size as f32;
+            let actual_len = indices.len() as f32;
             let mut scaled_grads = mb_grads;
-            scaled_grads.scale_assign(1.0 / mb_len);
+            scaled_grads.scale_assign(1.0 / actual_len);
             scaled_grads.clip_grad_norm(1.0);
 
             pipeline
                 .model
                 .update_weights_adam(&scaled_grads, pipeline.config.lr);
 
-            total_policy_loss += mb_pi_loss / mb_len;
-            total_value_loss += mb_val_loss / mb_len;
+            total_policy_loss += mb_pi_loss / actual_len;
+            total_value_loss += mb_val_loss / actual_len;
             step_count += 1;
 
             if (batch + 1) % 4 == 0 || (batch + 1) == epoch_batches {
