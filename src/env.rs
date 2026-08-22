@@ -538,7 +538,7 @@ impl DorfromantikEnv {
                         let mut perfect_matches = 0;
                         let mut matching_count = 0;
                         let mut mismatching_count = 0;
-                        let mut quest_adj = 0.0f32;
+                        let quest_adj = 0.0f32;
                         let mut act_feat = [0.0f32; 16];
 
                         for dir in 0..6 {
@@ -558,11 +558,8 @@ impl DorfromantikEnv {
                                     mismatching_count += 1;
                                 }
 
-                                if let GeneratedTile::Quest { quest_data, .. } = &n_tile.tile {
-                                    if !n_tile.quest_finalized && Some(quest_data.primary_group_type()) == c_edge.to_group_type() {
-                                        quest_adj = 1.0;
-                                    }
-                                }
+                                // [Option A: Pure Tabula Rasa] Bỏ heuristic nhị phân quest_adj, để GNN tự học
+                                // cấu trúc liên thông cụm và quest qua 4 tầng Message Passing.
                             }
                         }
 
