@@ -33,28 +33,12 @@ name = "train_alphazero_gpu"
 path = "bin/train_alphazero_gpu.rs"
 
 [[bin]]
-name = "evolve_heuristic"
-path = "bin/evolve_heuristic.rs"
-
-[[bin]]
-name = "gen_dataset_real_score"
-path = "bin/gen_dataset_real_score.rs"
-
-[[bin]]
-name = "train_nnue_real_score"
-path = "bin/train_nnue_real_score.rs"
-
-[[bin]]
-name = "play_nnue_beam"
-path = "bin/play_nnue_beam.rs"
-
-[[bin]]
-name = "play_pure_beam_search"
-path = "bin/play_pure_beam_search.rs"
-
-[[bin]]
 name = "inspect_buffer"
 path = "bin/inspect_buffer.rs"
+
+[[bin]]
+name = "inspect_game_replay"
+path = "bin/inspect_game_replay.rs"
 
 [profile.release]
 opt-level = 3
