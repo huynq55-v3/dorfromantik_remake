@@ -59,20 +59,22 @@ pub struct MCTSConfig {
 }
 
 impl MCTSConfig {
-    /// Quyết định (add_dirichlet, temperature) cho 1 turn dựa trên prior normalized entropy `prior_e`.
+    /// Quyết định (effective_eps, temperature) cho 1 turn dựa trên prior normalized entropy `prior_e`.
     /// `prior_e` ∈ [0,1]: 0 = one-hot (tự tin), 1 = uniform (bối rối).
-    /// Chiều: tự tin → mạnh explore; bối rối → nhẹ explore (exploit).
-    /// Khi `explore_by_entropy = false`: giữ nguyên hành vi cũ (dùng các tham số gọi truyền vào).
-    pub fn entropy_explore(&self, prior_e: f32) -> (bool, f32) {
+    /// Dùng đường cong Smooth Soft-Exponent (gamma = 2.0):
+    ///   strength = (1.0 - prior_e)^2
+    ///   effective_eps = dirichlet_eps * strength
+    ///   temp = temp_low + (temp_high - temp_low) * strength
+    /// Giúp chuyển tiếp mượt mà, không giật cục, bảo vệ an toàn vùng trung gian và nước đi bắt buộc.
+    pub fn entropy_explore(&self, prior_e: f32) -> (f32, f32) {
         if !self.explore_by_entropy {
-            return (false, 0.2);
+            return (0.0, self.temp_low);
         }
-        // prior_e=0 (tự tin) → strength=1; prior_e=1 (bối rối) → strength=0
-        let strength = (1.0 - prior_e).clamp(0.0, 1.0);
-        let mut rng = rand::thread_rng();
-        let add_noise = rng.gen::<f32>() < strength;
+        // Smooth Soft-Exponent curve (gamma = 2.0)
+        let strength = (1.0 - prior_e).clamp(0.0, 1.0).powi(2);
+        let effective_eps = self.dirichlet_eps * strength;
         let temp = self.temp_low + (self.temp_high - self.temp_low) * strength;
-        (add_noise, temp)
+        (effective_eps, temp)
     }
 }
 
@@ -196,23 +198,22 @@ impl MCTSSearch {
         let sum_exp: f32 = exps.iter().sum::<f32>().max(1e-8);
         let mut priors: Vec<f32> = exps.iter().map(|e| e / sum_exp).collect();
 
-        // Nếu bật explore_by_entropy: MCTS tự quyết định chen noise + temperature từ prior entropy
-        // (thay cho việc caller truyền add_dirichlet/temperature cứng nhắc). Chỉ áp dụng một cách
-        // tự động khi caller đang yêu cầu exploration (add_dirichlet=true); còn eval (false, temp 0)
-        // luôn giữ greedy để đánh giá ổn định.
-        let (add_noise, temperature) = if self.config.explore_by_entropy && add_dirichlet && num_actions > 1 {
+        // Nếu bật explore_by_entropy: MCTS tự quyết định độ mạnh noise (effective_eps) + temperature
+        // từ prior entropy theo đường cong Smooth Soft-Exponent (gamma = 2.0).
+        let (effective_eps, temperature) = if self.config.explore_by_entropy && add_dirichlet && num_actions > 1 {
             let prior_e = Self::normalized_entropy(&priors);
             self.config.entropy_explore(prior_e)
+        } else if add_dirichlet && num_actions > 1 {
+            (self.config.dirichlet_eps, temperature)
         } else {
-            (add_dirichlet, temperature)
+            (0.0, temperature)
         };
 
-        if add_noise && num_actions > 1 {
+        if effective_eps > 1e-5 && num_actions > 1 {
             let alpha = Self::get_adaptive_dirichlet_alpha(num_actions, self.config.dirichlet_alpha);
             let noise = Self::sample_dirichlet(num_actions, alpha);
-            let eps = self.config.dirichlet_eps;
             for i in 0..num_actions {
-                priors[i] = (1.0 - eps) * priors[i] + eps * noise[i];
+                priors[i] = (1.0 - effective_eps) * priors[i] + effective_eps * noise[i];
             }
         }
 
@@ -447,22 +448,22 @@ impl MCTSSearch {
             let sum_exp: f32 = exps.iter().sum::<f32>().max(1e-8);
             let mut priors: Vec<f32> = exps.iter().map(|e| e / sum_exp).collect();
 
-            // Quyết định noise + nhiệt độ theo prior entropy (per-env), nếu bật explore_by_entropy
-            // và caller đang yêu cầu exploration (add_dirichlet=true). Eval/refresh (false) luôn greedy.
-            let (add_noise, this_temp) = if self.config.explore_by_entropy && add_dirichlet && num_actions > 1 {
+            // Quyết định noise (effective_eps) + nhiệt độ theo prior entropy (per-env), nếu bật explore_by_entropy
+            let (effective_eps, this_temp) = if self.config.explore_by_entropy && add_dirichlet && num_actions > 1 {
                 let prior_e = Self::normalized_entropy(&priors);
                 self.config.entropy_explore(prior_e)
+            } else if add_dirichlet && num_actions > 1 {
+                (self.config.dirichlet_eps, temperature)
             } else {
-                (add_dirichlet, temperature)
+                (0.0, temperature)
             };
             root_temps[i] = this_temp;
 
-            if add_noise && num_actions > 1 {
+            if effective_eps > 1e-5 && num_actions > 1 {
                 let alpha = Self::get_adaptive_dirichlet_alpha(num_actions, self.config.dirichlet_alpha);
                 let noise = Self::sample_dirichlet(num_actions, alpha);
-                let eps = self.config.dirichlet_eps;
                 for a in 0..num_actions {
-                    priors[a] = (1.0 - eps) * priors[a] + eps * noise[a];
+                    priors[a] = (1.0 - effective_eps) * priors[a] + effective_eps * noise[a];
                 }
             }
 
@@ -815,21 +816,21 @@ impl MCTSSearch {
         let sum_exp: f32 = exps.iter().sum::<f32>().max(1e-8);
         let mut priors: Vec<f32> = exps.iter().map(|e| e / sum_exp).collect();
 
-        // Quyết định noise + nhiệt độ theo prior entropy, nếu bật explore_by_entropy
-        // và caller đang yêu cầu exploration (add_dirichlet=true). Eval/replay (false) luôn greedy.
-        let (add_noise, temperature) = if self.config.explore_by_entropy && add_dirichlet && num_actions > 1 {
+        // Quyết định noise (effective_eps) + nhiệt độ theo prior entropy, nếu bật explore_by_entropy
+        let (effective_eps, temperature) = if self.config.explore_by_entropy && add_dirichlet && num_actions > 1 {
             let prior_e = Self::normalized_entropy(&priors);
             self.config.entropy_explore(prior_e)
+        } else if add_dirichlet && num_actions > 1 {
+            (self.config.dirichlet_eps, temperature)
         } else {
-            (add_dirichlet, temperature)
+            (0.0, temperature)
         };
 
-        if add_noise && num_actions > 1 {
+        if effective_eps > 1e-5 && num_actions > 1 {
             let alpha = Self::get_adaptive_dirichlet_alpha(num_actions, self.config.dirichlet_alpha);
             let noise = Self::sample_dirichlet(num_actions, alpha);
-            let eps = self.config.dirichlet_eps;
             for a in 0..num_actions {
-                priors[a] = (1.0 - eps) * priors[a] + eps * noise[a];
+                priors[a] = (1.0 - effective_eps) * priors[a] + effective_eps * noise[a];
             }
         }
 
@@ -1402,36 +1403,34 @@ mod tests {
 
     #[test]
     fn test_entropy_explore_direction() {
-        // Tự tin (prior_e=0) → explore mạnh: temp cao (~temp_high), hay chen noise
+        // Tự tin (prior_e=0) → explore mạnh: temp cao (=temp_high), max noise (effective_eps = dirichlet_eps = 0.25)
         let cfg = MCTSConfig {
             explore_by_entropy: true,
             temp_high: 1.0,
             temp_low: 0.2,
+            dirichlet_eps: 0.25,
             ..MCTSConfig::default()
         };
-        let mut noise_count = 0;
-        let mut temp_sum = 0.0;
-        for _ in 0..2000 {
-            let (add, t) = cfg.entropy_explore(0.0);
-            if add { noise_count += 1; }
-            temp_sum += t;
-        }
-        // prior_e=0 → strength=1 → temp = temp_high = 1.0
-        assert!((temp_sum / 2000.0 - 1.0).abs() < 0.01);
-        // strength=1 → luôn chen noise
-        assert_eq!(noise_count, 2000);
+        let (eps_0, t_0) = cfg.entropy_explore(0.0);
+        assert!((eps_0 - 0.25).abs() < 1e-6, "prior_e=0 → effective_eps = 0.25");
+        assert!((t_0 - 1.0).abs() < 1e-6, "prior_e=0 → temp = temp_high = 1.0");
 
-        // Bối rối (prior_e=1) → exploit: temp thấp (~temp_low), ít/không noise
-        let (add2, t2) = cfg.entropy_explore(1.0);
-        assert!(!add2, "prior bối rối → không chen noise (strength=0)");
-        assert!((t2 - 0.2).abs() < 1e-6, "prior bối rối → temp = temp_low");
+        // Trung gian (prior_e=0.5) → soft strength = (0.5)^2 = 0.25 → eps = 0.0625, temp = 0.2 + 0.8*0.25 = 0.40
+        let (eps_mid, t_mid) = cfg.entropy_explore(0.5);
+        assert!((eps_mid - 0.0625).abs() < 1e-6, "prior_e=0.5 → effective_eps = 0.0625");
+        assert!((t_mid - 0.40).abs() < 1e-6, "prior_e=0.5 → temp = 0.40");
 
-        // Tắt explore_by_entropy → luôn (false, temp_low), không đổi theo entropy
+        // Bối rối (prior_e=1) → exploit: temp thấp (=temp_low), không noise (effective_eps = 0.0)
+        let (eps_1, t_1) = cfg.entropy_explore(1.0);
+        assert!((eps_1 - 0.0).abs() < 1e-6, "prior_e=1.0 → effective_eps = 0.0");
+        assert!((t_1 - 0.2).abs() < 1e-6, "prior_e=1.0 → temp = temp_low = 0.2");
+
+        // Tắt explore_by_entropy → luôn (0.0, temp_low)
         let cfg_off = MCTSConfig::default();
         assert!(!cfg_off.explore_by_entropy);
-        let (add3, t3) = cfg_off.entropy_explore(0.0);
-        assert!(!add3);
-        assert_eq!(t3, 0.2);
+        let (eps_off, t_off) = cfg_off.entropy_explore(0.0);
+        assert_eq!(eps_off, 0.0);
+        assert_eq!(t_off, 0.2);
     }
 
     #[test]
