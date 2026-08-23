@@ -153,7 +153,7 @@ impl Board {
     pub fn reference_group_count(&self, group_type: GroupType) -> usize {
         let mut max_count = 0;
         for group in self.groups.values() {
-            if group.group_type == group_type && !group.is_closed {
+            if group.group_type == group_type && group.open_edge_count > 0 && !group.is_closed {
                 let count = match group_type {
                     GroupType::Forest | GroupType::Village | GroupType::Agriculture => group.total_element_count,
                     _ => group.total_segment_count,
@@ -262,6 +262,7 @@ impl Board {
             if let Some(&gid) = self.edge_to_group.get(&(neighbor_pos, neighbor_dir)) {
                 if let Some(group) = self.groups.get_mut(&gid) {
                     group.open_edge_count = group.open_edge_count.saturating_sub(1);
+                    group.is_closed = group.open_edge_count == 0;
                 }
             }
         }
@@ -339,7 +340,7 @@ impl Board {
                     total_element_count: element_count,
                     total_segment_count: segment_count,
                     member_tiles: members,
-                    is_closed: false,
+                    is_closed: new_seg_open_edges == 0,
                     open_edge_count: new_seg_open_edges,
                 };
                 self.groups.insert(gid, group);
@@ -360,6 +361,7 @@ impl Board {
                     main_group.total_segment_count += segment_count;
                     // Cộng cạnh mở mới (cạnh neighbor đã được trừ ở place_tile)
                     main_group.open_edge_count += new_seg_open_edges;
+                    main_group.is_closed = main_group.open_edge_count == 0;
                 }
 
                 for &other_gid in &group_ids_vec[1..] {
@@ -378,6 +380,7 @@ impl Board {
                             main_group.total_element_count += other_group.total_element_count;
                             main_group.total_segment_count += other_group.total_segment_count;
                             main_group.open_edge_count += other_group.open_edge_count;
+                            main_group.is_closed = main_group.open_edge_count == 0;
                         }
                     }
                 }
@@ -1325,5 +1328,7 @@ mod tests {
         // Tất cả các cạnh của cụm {A, B} đều đã bị bao kín hoàn toàn -> open_edge_count == 0!
         assert_eq!(board.count_group_open_edges((0, 0), GroupType::Forest), 0);
         assert_eq!(board.count_group_open_edges((0, 1), GroupType::Forest), 0);
+        // Khi cụm đã đóng kín, reference_group_count cho Forest phải trả về 0
+        assert_eq!(board.reference_group_count(GroupType::Forest), 0);
     }
 }

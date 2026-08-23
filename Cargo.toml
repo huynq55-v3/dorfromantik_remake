@@ -40,6 +40,11 @@ path = "bin/inspect_buffer.rs"
 name = "inspect_game_replay"
 path = "bin/inspect_game_replay.rs"
 
+[[bin]]
+name = "inspect_quest_tiles"
+path = "bin/inspect_quest_tiles.rs"
+
+
 [profile.release]
 opt-level = 3
 lto = "thin"
